@@ -97,3 +97,36 @@ Append a section to this file under "## Session Log" with:
 - WAL fsync cost vs throughput — for Phase 1 we fsync per insert (correctness > throughput). Revisit when we benchmark.
 - HNSW does not natively persist — we rebuild from WAL on every startup. For very large WALs we'll need periodic snapshots (Phase 2 or later).
 - HNSW `max_elements=100_000` is a hint; doesn't hard-cap. We'll need an eviction policy before this matters.
+
+### 2026-04-30 — Mission 3: Write-ahead log
+**Built:**
+- New `src/wal.rs`: `Wal { file: tokio::fs::File, path: PathBuf }` + `WalEntry { uuid, embedding, response, query_text }`. `Wal::open` uses `OpenOptions::new().create(true).append(true)`. `Wal::append` serializes JSON, writes line + `\n`, then `file.sync_data().await` (fsync per insert). `Wal::replay` streams the file via `BufReader::lines()`, parses each line, **skips** corrupt lines with `tracing::warn!` (line number + error), returns empty vec for missing/empty file.
+- `index.rs` refactor: factored core insert into private `insert_with_uuid(uuid, embedding, response, query_text)`; public `insert` now lives behind `#[cfg(test)]` and just generates a UUID + delegates; new `replay_entry(WalEntry)` takes the persisted UUID (so UUIDs are stable across restarts). Added `dimension() -> Option<usize>` getter so the handler can validate before WAL append.
+- `state.rs`: `AppState { node_id, index: Arc<RwLock<SemanticIndex>>, wal: Arc<Mutex<Wal>> }`. Used `tokio::sync::Mutex` for the WAL — appends are exclusive; brief hold makes a full Mutex appropriate.
+- `main.rs` startup sequence: read `FERROCACHE_WAL_PATH` (default `./ferrocache.wal`), `Wal::replay`, build fresh `SemanticIndex`, fold replayed entries via `index.replay_entry`, log replayed count. Then `Wal::open` for appends. Then build router and serve.
+- `server.rs` `/insert`: acquire WAL Mutex → peek dim via index read lock → if mismatch, 400 with `{error}` (no WAL pollution) → generate UUID → build `WalEntry` → `wal.append` (fsync) → `index.write().await.replay_entry(entry)` → 200. WAL Mutex serializes inserters end-to-end so dim cannot change between peek and write. WAL append failure → 500, no index mutation.
+- 17/17 tests pass (5 index, 4 WAL, 8 server). New WAL tests: append→replay roundtrip; corrupt-line skip (mixed valid/garbage); missing file → empty; empty file → empty. New server test `test_insert_persists_via_wal`: HTTP insert → drop AppState → `Wal::replay` → fresh index → `replay_entry` → query hits with original response.
+- Smoke test passed end-to-end: insert via curl → kill process → restart → replay logs `count=1` → /query returns `{hit:true, response:"smoked", similarity:1.0}` and /health reports `entry_count:1`.
+
+**Key decisions:**
+- Validate dimension *before* WAL append, not after — keeps the WAL free of lines that would only get rejected on replay. Done under the WAL Mutex so the validation can't race.
+- WAL Mutex held for the entire insert critical section. Single-writer Phase 1; revisit when concurrent inserts matter (could move to per-shard WALs in Phase 2).
+- `insert` (UUID-generating) on `SemanticIndex` is now `#[cfg(test)]` only — production path is WAL-first via `replay_entry`. Avoids two divergent insert paths in production code.
+- `BufReader::lines()` for replay: streams instead of slurping the whole file. Whitespace-only lines are skipped silently; only malformed JSON triggers the warn.
+- WAL `path` field is currently unused at runtime (`#[allow(dead_code)]`) but kept for future log lines / snapshot rotation.
+- Decision deferred: WAL fsync per write is the conservative correctness choice. Group-commit/batched fsync stays unbuilt until we have a real benchmark.
+
+**API deviations from the brief:**
+- `AppState::new()` now takes `(SemanticIndex, Wal)` rather than constructing them internally — tests need to inject a temp WAL path, and main.rs needs to replay before building the state. The `Default` impl was dropped (no longer makes sense without I/O).
+- The handler uses `replay_entry` (not the spec's "insert into HNSW") to add to the index after WAL append. Same effect, but via the UUID-preserving path so the in-memory entry's UUID matches the WAL line.
+- Spec said "if WAL append fails → 500, do NOT insert into index" — implemented exactly. Also added a 500 path if `replay_entry` somehow fails after WAL append (shouldn't happen due to upfront dim check, but the error handling is there).
+
+**Next session (Mission 4) should start with:**
+- Likely targets: config file (TOML or JSON for HNSW params, port, WAL path); structured request validation (max embedding size, max response size); per-route metrics (counter for hits/misses, histogram for query latency).
+- If moving toward Phase 2 instead: introduce `chitchat` for gossip, define a node bootstrap config, and decide on the consistent-hashing scheme key (per `Claude.md`: hash first 8 bytes of embedding as u64).
+- WAL maintenance: even before clustering, consider snapshot+truncate so WAL doesn't grow unbounded across long-running deployments.
+
+**Open questions / blockers:**
+- Replay is single-threaded and rebuilds HNSW from scratch — at large WAL sizes this becomes the dominant startup cost. Snapshotting required before this matters in practice.
+- WAL has no checksum per line. A torn write at the tail (partial line during a crash mid-fsync) would currently parse as invalid JSON and be dropped with a warn — acceptable for now since the client wouldn't have seen a 200 for that insert.
+- Concurrency: the WAL Mutex serializes inserts but not against /query. /query takes the index read lock and is unaffected. Reads during a write hold are blocked only while we hold the index write lock (very brief).

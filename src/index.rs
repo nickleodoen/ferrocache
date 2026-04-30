@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
+use crate::wal::WalEntry;
+
 #[allow(dead_code)]
 pub struct CacheEntry {
     pub uuid: String,
@@ -49,12 +51,29 @@ impl SemanticIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn insert(
         &mut self,
         embedding: Vec<f32>,
         response: String,
         query_text: String,
     ) -> Result<String> {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        self.insert_with_uuid(uuid.clone(), embedding, response, query_text)?;
+        Ok(uuid)
+    }
+
+    pub fn replay_entry(&mut self, entry: WalEntry) -> Result<()> {
+        self.insert_with_uuid(entry.uuid, entry.embedding, entry.response, entry.query_text)
+    }
+
+    fn insert_with_uuid(
+        &mut self,
+        uuid: String,
+        embedding: Vec<f32>,
+        response: String,
+        query_text: String,
+    ) -> Result<()> {
         match self.dimension {
             None => self.dimension = Some(embedding.len()),
             Some(d) if d != embedding.len() => {
@@ -69,21 +88,20 @@ impl SemanticIndex {
 
         let id = self.next_id;
         self.next_id += 1;
-        let uuid = uuid::Uuid::new_v4().to_string();
 
         self.hnsw.insert((&embedding, id));
 
         self.entries.insert(
             id,
             CacheEntry {
-                uuid: uuid.clone(),
+                uuid,
                 embedding,
                 response,
                 query_text,
             },
         );
 
-        Ok(uuid)
+        Ok(())
     }
 
     pub fn query(&self, embedding: &[f32], threshold: f32) -> Result<Option<QueryHit>> {
@@ -123,6 +141,10 @@ impl SemanticIndex {
 
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn dimension(&self) -> Option<usize> {
+        self.dimension
     }
 }
 
