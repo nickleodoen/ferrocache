@@ -9,10 +9,13 @@ pub struct QueryRequest {
 #[derive(Debug, Serialize)]
 pub struct QueryResponse {
     pub hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct InsertRequest {
     pub embedding: Vec<f32>,
     pub response: String,
@@ -30,4 +33,9 @@ pub struct HealthResponse {
     pub status: String,
     pub node_id: String,
     pub entry_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
 }

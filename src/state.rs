@@ -1,16 +1,19 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+
+use tokio::sync::RwLock;
+
+use crate::index::SemanticIndex;
 
 pub struct AppState {
     pub node_id: String,
-    pub entry_count: Arc<AtomicU64>,
+    pub index: Arc<RwLock<SemanticIndex>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             node_id: uuid::Uuid::new_v4().to_string(),
-            entry_count: Arc::new(AtomicU64::new(0)),
+            index: Arc::new(RwLock::new(SemanticIndex::new())),
         }
     }
 }

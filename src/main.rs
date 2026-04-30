@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
+mod index;
 mod models;
 mod server;
 mod state;
