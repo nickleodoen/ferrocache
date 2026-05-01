@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,12 +13,15 @@ use crate::ring::HashRing;
 
 const RING_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const CLUSTER_ID: &str = "ferrocache";
+const API_ADDR_KEY: &str = "api_addr";
 
 pub struct ClusterState {
     #[allow(dead_code)] // kept alive so the gossip task isn't dropped
     chitchat_handle: Arc<ChitchatHandle>,
     ring: Arc<RwLock<HashRing>>,
+    addrs: Arc<RwLock<HashMap<String, String>>>,
     self_node_id: String,
+    self_api_addr: String,
     gossip_addr: SocketAddr,
 }
 
@@ -47,7 +50,8 @@ impl ClusterState {
             extra_liveness_predicate: None,
         };
 
-        let handle = spawn_chitchat(chitchat_config, Vec::new(), &UdpTransport)
+        let initial_kvs = vec![(API_ADDR_KEY.to_string(), config.api_addr.clone())];
+        let handle = spawn_chitchat(chitchat_config, initial_kvs, &UdpTransport)
             .await
             .context("spawn_chitchat failed")?;
         let handle = Arc::new(handle);
@@ -56,12 +60,24 @@ impl ClusterState {
         ring.add_node(node_id);
         let ring = Arc::new(RwLock::new(ring));
 
-        spawn_ring_reconciler(handle.clone(), ring.clone(), node_id.to_string());
+        let mut addrs = HashMap::new();
+        addrs.insert(node_id.to_string(), config.api_addr.clone());
+        let addrs = Arc::new(RwLock::new(addrs));
+
+        spawn_ring_reconciler(
+            handle.clone(),
+            ring.clone(),
+            addrs.clone(),
+            node_id.to_string(),
+            config.api_addr.clone(),
+        );
 
         Ok(Self {
             chitchat_handle: handle,
             ring,
+            addrs,
             self_node_id: node_id.to_string(),
+            self_api_addr: config.api_addr.clone(),
             gossip_addr,
         })
     }
@@ -74,22 +90,39 @@ impl ClusterState {
         self.gossip_addr
     }
 
-    // M6 will route through these.
-    #[allow(dead_code)]
-    pub async fn get_target_node(&self, embedding: &[f32]) -> Option<String> {
-        self.ring
+    pub async fn get_target_addr(&self, embedding: &[f32]) -> Option<(String, String)> {
+        let node_id = self
+            .ring
             .read()
             .await
-            .get_node_for_embedding(embedding)
-            .map(|s| s.to_string())
+            .get_node_for_embedding(embedding)?
+            .to_string();
+        let addr = self.addrs.read().await.get(&node_id).cloned()?;
+        Some((node_id, addr))
     }
 
-    #[allow(dead_code)]
-    pub async fn is_local(&self, embedding: &[f32]) -> bool {
-        match self.get_target_node(embedding).await {
-            Some(target) => target == self.self_node_id,
-            None => true,
-        }
+    pub async fn get_replica_addrs(
+        &self,
+        embedding: &[f32],
+        replication_factor: usize,
+    ) -> Vec<(String, String)> {
+        let node_ids = self
+            .ring
+            .read()
+            .await
+            .get_n_nodes_for_embedding(embedding, replication_factor);
+        let addrs = self.addrs.read().await;
+        node_ids
+            .into_iter()
+            .filter_map(|id| {
+                let addr = if id == self.self_node_id {
+                    Some(self.self_api_addr.clone())
+                } else {
+                    addrs.get(&id).cloned()
+                };
+                addr.map(|a| (id, a))
+            })
+            .collect()
     }
 
     pub async fn live_nodes(&self) -> Vec<String> {
@@ -104,7 +137,9 @@ impl ClusterState {
 fn spawn_ring_reconciler(
     handle: Arc<ChitchatHandle>,
     ring: Arc<RwLock<HashRing>>,
+    addrs: Arc<RwLock<HashMap<String, String>>>,
     self_node_id: String,
+    self_api_addr: String,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RING_RECONCILE_INTERVAL);
@@ -112,15 +147,23 @@ fn spawn_ring_reconciler(
         loop {
             interval.tick().await;
 
-            let live: BTreeSet<String> = handle
+            // Snapshot live members + their api_addrs from chitchat.
+            let snapshot: HashMap<String, String> = handle
                 .with_chitchat(|cc| {
-                    let mut s: BTreeSet<String> =
-                        cc.live_nodes().map(|id| id.node_id.clone()).collect();
-                    s.insert(cc.self_chitchat_id().node_id.clone());
-                    s
+                    let mut m = HashMap::new();
+                    for chat_id in cc.live_nodes() {
+                        if let Some(state) = cc.node_state(chat_id)
+                            && let Some(addr) = state.get(API_ADDR_KEY)
+                        {
+                            m.insert(chat_id.node_id.clone(), addr.to_string());
+                        }
+                    }
+                    m.insert(self_node_id.clone(), self_api_addr.clone());
+                    m
                 })
                 .await;
 
+            let live: BTreeSet<String> = snapshot.keys().cloned().collect();
             let current: BTreeSet<String> = ring.read().await.nodes().into_iter().collect();
             let added: Vec<String> = live.difference(&current).cloned().collect();
             let removed: Vec<String> = current
@@ -129,20 +172,97 @@ fn spawn_ring_reconciler(
                 .cloned()
                 .collect();
 
+            // Always update the addrs map (peers may have re-advertised).
+            {
+                let mut a = addrs.write().await;
+                for (id, addr) in &snapshot {
+                    a.insert(id.clone(), addr.clone());
+                }
+                for id in &removed {
+                    a.remove(id);
+                }
+            }
+
             if added.is_empty() && removed.is_empty() {
                 continue;
             }
 
-            let mut w = ring.write().await;
-            for n in &added {
-                w.add_node(n);
+            {
+                let mut w = ring.write().await;
+                for n in &added {
+                    w.add_node(n);
+                }
+                for n in &removed {
+                    w.remove_node(n);
+                }
             }
-            for n in &removed {
-                w.remove_node(n);
-            }
-            drop(w);
 
             tracing::info!(?added, ?removed, "ring updated");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the routing-side data structures directly. The chitchat handle
+    /// isn't needed for replica lookups, so tests bypass `ClusterState::new`
+    /// (which would require a UDP socket + gossip handshake) and exercise
+    /// the lookup logic against the raw maps.
+    type SharedRing = Arc<RwLock<HashRing>>;
+    type SharedAddrs = Arc<RwLock<HashMap<String, String>>>;
+
+    fn ring_and_addrs(
+        self_id: &str,
+        self_addr: &str,
+        peers: &[(&str, &str)],
+    ) -> (SharedRing, SharedAddrs) {
+        let mut ring = HashRing::new(64);
+        let mut addrs = HashMap::new();
+        ring.add_node(self_id);
+        addrs.insert(self_id.to_string(), self_addr.to_string());
+        for (id, addr) in peers {
+            ring.add_node(id);
+            addrs.insert((*id).to_string(), (*addr).to_string());
+        }
+        (Arc::new(RwLock::new(ring)), Arc::new(RwLock::new(addrs)))
+    }
+
+    async fn replica_lookup(
+        ring: &SharedRing,
+        addrs: &SharedAddrs,
+        embedding: &[f32],
+        n: usize,
+    ) -> Vec<(String, String)> {
+        let ids = ring.read().await.get_n_nodes_for_embedding(embedding, n);
+        let a = addrs.read().await;
+        ids.into_iter()
+            .filter_map(|id| a.get(&id).cloned().map(|addr| (id, addr)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_get_replica_addrs_deduplicates() {
+        let (ring, addrs) = ring_and_addrs("A", "127.0.0.1:1", &[("B", "127.0.0.1:2")]);
+        let result = replica_lookup(&ring, &addrs, &[0.5_f32, 0.5], 2).await;
+        assert_eq!(result.len(), 2);
+        let ids: BTreeSet<&str> = result.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "distinct node_ids: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_get_replica_addrs_wraps_around() {
+        let (ring, addrs) = ring_and_addrs(
+            "A",
+            "127.0.0.1:1",
+            &[("B", "127.0.0.1:2"), ("C", "127.0.0.1:3")],
+        );
+        for k in 0..30u64 {
+            let emb = [k as f32 * 0.7, (k as f32) * -0.3];
+            let result = replica_lookup(&ring, &addrs, &emb, 2).await;
+            assert_eq!(result.len(), 2, "k={k}");
+            assert_ne!(result[0].0, result[1].0);
+        }
+    }
 }

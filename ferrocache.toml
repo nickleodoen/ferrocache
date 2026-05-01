@@ -16,5 +16,7 @@
 # [cluster]
 # enabled = false
 # gossip_addr = "0.0.0.0:4000"
+# api_addr = "0.0.0.0:3000"     # the HTTP addr peers reach to forward requests
 # seed_nodes = []
 # virtual_nodes = 64
+# replication_factor = 2

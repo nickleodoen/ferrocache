@@ -17,8 +17,10 @@ pub struct FerrocacheConfig {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub gossip_addr: String,
+    pub api_addr: String,
     pub seed_nodes: Vec<String>,
     pub virtual_nodes: usize,
+    pub replication_factor: usize,
 }
 
 impl Default for ClusterConfig {
@@ -26,8 +28,10 @@ impl Default for ClusterConfig {
         Self {
             enabled: false,
             gossip_addr: "0.0.0.0:4000".to_string(),
+            api_addr: "0.0.0.0:3000".to_string(),
             seed_nodes: Vec::new(),
             virtual_nodes: 64,
+            replication_factor: 2,
         }
     }
 }
@@ -87,10 +91,15 @@ impl FerrocacheConfig {
             )?
             .set_default("cluster.enabled", defaults.cluster.enabled)?
             .set_default("cluster.gossip_addr", defaults.cluster.gossip_addr.clone())?
+            .set_default("cluster.api_addr", defaults.cluster.api_addr.clone())?
             .set_default("cluster.seed_nodes", Vec::<String>::new())?
             .set_default(
                 "cluster.virtual_nodes",
                 defaults.cluster.virtual_nodes as i64,
+            )?
+            .set_default(
+                "cluster.replication_factor",
+                defaults.cluster.replication_factor as i64,
             )?
             .add_source(File::with_name("ferrocache").required(false))
             .add_source(Environment::with_prefix("FERROCACHE").separator("__"))
@@ -119,7 +128,9 @@ mod tests {
         assert!((c.hnsw.default_threshold - 0.92).abs() < 1e-6);
         assert!(!c.cluster.enabled);
         assert_eq!(c.cluster.gossip_addr, "0.0.0.0:4000");
+        assert_eq!(c.cluster.api_addr, "0.0.0.0:3000");
         assert!(c.cluster.seed_nodes.is_empty());
         assert_eq!(c.cluster.virtual_nodes, 64);
+        assert_eq!(c.cluster.replication_factor, 2);
     }
 }

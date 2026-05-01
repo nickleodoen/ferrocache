@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 
 use crate::models::{
     ClusterStatusResponse, ErrorResponse, HealthResponse, InsertRequest, InsertResponse,
@@ -17,6 +18,18 @@ use crate::wal::WalEntry;
 
 pub const MAX_EMBEDDING_DIM: usize = 4096;
 pub const MAX_RESPONSE_BYTES: usize = 102_400;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LocalParam {
+    #[serde(default)]
+    pub local: Option<bool>,
+}
+
+impl LocalParam {
+    fn is_local(&self) -> bool {
+        self.local.unwrap_or(false)
+    }
+}
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -50,6 +63,7 @@ fn validate_embedding(embedding: &[f32]) -> Result<(), String> {
 
 async fn query_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<LocalParam>,
     Json(req): Json<QueryRequest>,
 ) -> Response {
     if let Err(msg) = validate_embedding(&req.embedding) {
@@ -62,6 +76,36 @@ async fn query_handler(
         ));
     }
 
+    if !params.is_local()
+        && let Some(cluster) = &state.cluster
+        && let Some((target_id, target_addr)) = cluster.get_target_addr(&req.embedding).await
+        && target_id != cluster.self_node_id()
+    {
+        return forward_query(&state, &target_id, &target_addr, &req).await;
+    }
+
+    process_query_locally(&state, req).await
+}
+
+async fn forward_query(
+    state: &Arc<AppState>,
+    target_id: &str,
+    target_addr: &str,
+    req: &QueryRequest,
+) -> Response {
+    let Some(router) = &state.router else {
+        return bad_gateway(format!("no router configured to reach {target_id}"));
+    };
+    match router.forward_query(target_addr, req).await {
+        Ok(resp) => {
+            tracing::info!(target = %target_id, "query forwarded");
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(e) => bad_gateway(format!("failed to reach node {target_id}: {e}")),
+    }
+}
+
+async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Response {
     let dim = req.embedding.len();
     let index = state.index.read().await;
     match index.query(&req.embedding, req.threshold) {
@@ -95,8 +139,15 @@ async fn query_handler(
     }
 }
 
+fn bad_gateway(msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    tracing::warn!(error = %msg, "peer unreachable");
+    (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: msg })).into_response()
+}
+
 async fn insert_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<LocalParam>,
     Json(req): Json<InsertRequest>,
 ) -> Response {
     if let Err(msg) = validate_embedding(&req.embedding) {
@@ -110,48 +161,43 @@ async fn insert_handler(
         ));
     }
 
-    let dim = req.embedding.len();
-    let mut wal = state.wal.lock().await;
-
-    if let Some(existing) = state.index.read().await.dimension()
-        && existing != dim
-    {
-        return bad_request(format!(
-            "dimension mismatch: expected {existing}, got {dim}"
-        ));
+    if params.is_local() || state.cluster.is_none() {
+        return process_insert_locally(&state, req).await;
     }
 
+    // Cluster-aware path: coordinate replication.
+    let cluster = state.cluster.as_ref().expect("cluster present");
+    let replicas = cluster
+        .get_replica_addrs(&req.embedding, state.replication_factor)
+        .await;
+
+    if replicas.is_empty() {
+        return process_insert_locally(&state, req).await;
+    }
+
+    // Coordinator stamps the UUID so all replicas store the same id.
     let uuid = uuid::Uuid::new_v4().to_string();
-    let entry = WalEntry {
-        uuid: uuid.clone(),
-        embedding: req.embedding,
-        response: req.response,
-        query_text: req.query_text,
+    let mut req_with_uuid = req;
+    req_with_uuid.uuid = Some(uuid.clone());
+
+    let self_id = cluster.self_node_id();
+    let self_in_replica_set = replicas.iter().any(|(id, _)| id == self_id);
+
+    if self_in_replica_set && let Err(resp) = local_insert_inner(&state, &req_with_uuid).await {
+        return resp;
+    }
+
+    let Some(router) = &state.router else {
+        return bad_gateway("no router configured for replication");
     };
 
-    if let Err(e) = wal.append(&entry).await {
-        tracing::error!(error = %e, "WAL append failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("WAL append failed: {e}"),
-            }),
-        )
-            .into_response();
+    for (peer_id, peer_addr) in replicas.iter().filter(|(id, _)| id != self_id) {
+        if let Err(e) = router.forward_insert(peer_addr, &req_with_uuid).await {
+            return bad_gateway(format!("replica {peer_id} failed: {e}"));
+        }
     }
 
-    if let Err(e) = state.index.write().await.replay_entry(entry) {
-        tracing::error!(error = %e, "index insert failed after WAL append");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    tracing::info!(id = %uuid, dim, "inserted");
+    tracing::info!(id = %uuid, replicas = replicas.len(), "insert replicated");
     (
         StatusCode::OK,
         Json(InsertResponse {
@@ -160,6 +206,73 @@ async fn insert_handler(
         }),
     )
         .into_response()
+}
+
+async fn process_insert_locally(state: &Arc<AppState>, req: InsertRequest) -> Response {
+    match local_insert_inner(state, &req).await {
+        Ok(uuid) => (
+            StatusCode::OK,
+            Json(InsertResponse {
+                id: uuid,
+                status: "ok".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Performs the WAL-first local insert. Returns the UUID actually stored.
+async fn local_insert_inner(
+    state: &Arc<AppState>,
+    req: &InsertRequest,
+) -> Result<String, Response> {
+    let dim = req.embedding.len();
+    let mut wal = state.wal.lock().await;
+
+    if let Some(existing) = state.index.read().await.dimension()
+        && existing != dim
+    {
+        return Err(bad_request(format!(
+            "dimension mismatch: expected {existing}, got {dim}"
+        )));
+    }
+
+    let uuid = req
+        .uuid
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let entry = WalEntry {
+        uuid: uuid.clone(),
+        embedding: req.embedding.clone(),
+        response: req.response.clone(),
+        query_text: req.query_text.clone(),
+    };
+
+    if let Err(e) = wal.append(&entry).await {
+        tracing::error!(error = %e, "WAL append failed");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("WAL append failed: {e}"),
+            }),
+        )
+            .into_response());
+    }
+
+    if let Err(e) = state.index.write().await.replay_entry(entry) {
+        tracing::error!(error = %e, "index insert failed after WAL append");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response());
+    }
+
+    tracing::info!(id = %uuid, dim, "inserted");
+    Ok(uuid)
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -231,6 +344,8 @@ mod tests {
             wal_path.to_string_lossy().into_owned(),
             hnsw,
             None,
+            None,
+            1,
         ))
     }
 
@@ -496,6 +611,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response.into_body()).await;
         assert!(body["error"].as_str().unwrap().contains("threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_local_query_param_bypasses_routing() {
+        let (app, _, _dir) = test_app().await;
+        // Insert one entry first so we have something to (locally) query.
+        let insert_payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "local-only",
+            "query_text": "q"
+        });
+        let response = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", insert_payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query_payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.9
+        });
+        let response = app
+            .oneshot(post_json("/query?local=true", query_payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["response"], "local-only");
+    }
+
+    #[tokio::test]
+    async fn test_local_insert_param_bypasses_routing() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [0.5_f32, 0.5, 0.5],
+            "response": "r",
+            "query_text": "q"
+        });
+        let response = app
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert!(body["id"].is_string());
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_provided_uuid() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [0.5_f32, 0.5, 0.5],
+            "response": "r",
+            "query_text": "q",
+            "uuid": "my-fixed-uuid"
+        });
+        let response = app
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["id"], "my-fixed-uuid");
     }
 
     #[tokio::test]

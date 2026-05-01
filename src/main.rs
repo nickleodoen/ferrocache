@@ -8,6 +8,7 @@ mod config;
 mod index;
 mod models;
 mod ring;
+mod router;
 mod server;
 mod state;
 mod wal;
@@ -15,6 +16,7 @@ mod wal;
 use crate::cluster::ClusterState;
 use crate::config::FerrocacheConfig;
 use crate::index::SemanticIndex;
+use crate::router::ClusterRouter;
 use crate::state::AppState;
 use crate::wal::Wal;
 
@@ -52,19 +54,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("WAL open failed")?;
 
-    let cluster = if config.cluster.enabled {
+    let (cluster, router) = if config.cluster.enabled {
         let cs = ClusterState::new(&node_id, &config.cluster)
             .await
             .context("cluster init failed")?;
         tracing::info!(
             gossip_addr = %cs.gossip_addr(),
+            api_addr = %config.cluster.api_addr,
             seeds = ?config.cluster.seed_nodes,
+            replication_factor = config.cluster.replication_factor,
             "cluster enabled"
         );
-        Some(Arc::new(cs))
+        (Some(Arc::new(cs)), Some(Arc::new(ClusterRouter::new())))
     } else {
         tracing::info!("cluster disabled — running in single-node mode");
-        None
+        (None, None)
     };
 
     let addr = format!("0.0.0.0:{}", config.port);
@@ -75,6 +79,8 @@ async fn main() -> anyhow::Result<()> {
         config.wal_path.clone(),
         config.hnsw.clone(),
         cluster,
+        router,
+        config.cluster.replication_factor.max(1),
     ));
     let app = server::build_router(state.clone());
 

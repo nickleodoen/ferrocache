@@ -68,6 +68,31 @@ impl HashRing {
         self.get_node(key)
     }
 
+    /// Walk the ring clockwise from `key`, collect up to `n` distinct
+    /// physical nodes. Wraps around. Order matches walk order.
+    pub fn get_n_nodes(&self, key: u64, n: usize) -> Vec<String> {
+        if self.ring.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        let mut seen = std::collections::HashSet::new();
+        let walker = self.ring.range(key..).chain(self.ring.range(..key));
+        for (_, node) in walker {
+            if seen.insert(node.clone()) {
+                out.push(node.clone());
+                if out.len() == n {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn get_n_nodes_for_embedding(&self, embedding: &[f32], n: usize) -> Vec<String> {
+        let key = embedding_to_key(embedding);
+        self.get_n_nodes(key, n)
+    }
+
     pub fn nodes(&self) -> Vec<String> {
         let mut seen = std::collections::BTreeSet::new();
         for n in self.ring.values() {
@@ -163,6 +188,30 @@ mod tests {
         let v3 = [0.5_f32, 0.5, 0.5, 0.25];
         assert_eq!(embedding_to_key(&v1), embedding_to_key(&v2));
         assert_ne!(embedding_to_key(&v1), embedding_to_key(&v3));
+    }
+
+    #[test]
+    fn test_get_n_nodes_distinct() {
+        let mut r = HashRing::new(64);
+        r.add_node("A");
+        r.add_node("B");
+        let walked = r.get_n_nodes(0, 2);
+        assert_eq!(walked.len(), 2);
+        assert_ne!(walked[0], walked[1]);
+    }
+
+    #[test]
+    fn test_get_n_nodes_wraps() {
+        let mut r = HashRing::new(64);
+        r.add_node("A");
+        r.add_node("B");
+        r.add_node("C");
+        for k in 0..30u64 {
+            let key = fnv1a_hash(format!("k-{k}").as_bytes());
+            let walked = r.get_n_nodes(key, 2);
+            assert_eq!(walked.len(), 2);
+            assert_ne!(walked[0], walked[1]);
+        }
     }
 
     #[test]

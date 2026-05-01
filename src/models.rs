@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub embedding: Vec<f32>,
     pub threshold: f32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17,14 +17,19 @@ pub struct QueryResponse {
     pub similarity: Option<f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsertRequest {
     pub embedding: Vec<f32>,
     pub response: String,
     pub query_text: String,
+    /// When set on a `local=true` request, the receiving node uses this UUID
+    /// instead of generating a new one. Used by the coordinator so all
+    /// replicas store the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsertResponse {
     pub id: String,
     pub status: String,
