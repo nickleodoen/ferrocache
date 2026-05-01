@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** Phase 3 in progress. M11 done (framework backends). Next: M12 — MCP server.
+**Current phase:** Phase 3 in progress. M12 done (MCP server). Next: M13 — distribution (PyPI + Docker Hub).
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -18,6 +18,7 @@
 - M9: simulation harness (`tests/simulate.py` + `simulate_no_ml.py`) — FAQ workload with sentence-transformers, 100% hit rate / 0 false positives at 0.90 threshold
 - M10: drop-in SDK middleware (`wrap_openai`, `wrap_anthropic`) with proxy attribute delegation, fail-open on cache outage, env-var config; restructured Python client into a package
 - M11: framework backends — `FerrocacheCache` (LangChain `BaseCache`) + `FerrocacheLLM` (LlamaIndex `CustomLLM` subclass); optional imports, fail-open default, custom `embed_fn` supported
+- M12: MCP server (`ferrocache.mcp_server`) over stdio — 3 tools (`semantic_cache_lookup`, `semantic_cache_store`, `cache_status`), text-in/JSON-out (embedding handled internally), Claude Desktop + Claude Code setup docs
 
 **Module map:**
 - lib.rs — re-exports modules so benches and external consumers can import
@@ -74,26 +75,6 @@
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
 
-### 2026-05-01 — Mission 10: SDK middleware (OpenAI + Anthropic)
-**Built:** Restructured `clients/python/` from a single `ferrocache.py` into a package: `ferrocache/__init__.py` (re-exports `FerrocacheClient`, `FerrocacheError`), `ferrocache/client.py` (the existing HTTP client, unchanged), `ferrocache/_embed.py` (lazy sentence-transformers default, raises with a clear install hint), `ferrocache/middleware.py` (the new wrappers). `wrap_openai` and `wrap_anthropic` proxy attribute access — only `chat.completions.create` / `messages.create` are intercepted; everything else (`models.list`, `embeddings.create`, etc.) delegates to the real client via `__getattr__`. Coordinator logic factored into a single `_intercept` function shared by both providers via a `_ProviderHooks` adapter. Synthetic cached responses are `SimpleNamespace`-based and structurally compatible with each SDK (`response.choices[0].message.content` for OpenAI, `response.content[0].text` for Anthropic). Real-API responses get `_ferrocache_hit` set on them (with a fallback to `__dict__` for pydantic models that reject unknown attrs). Tests in `tests/test_middleware.py`: 10 unittest cases using `unittest.mock` — hit / miss / fail-open / passthrough for both providers, env-var resolution, explicit-kwarg override, custom embed_fn. All pass; `python3 -m unittest tests.test_middleware` shows 10 OK in 4ms. Existing scripts (`example_usage.py`, `simulate.py`, `simulate_no_ml.py`) work unchanged because the package directory has the same import name as the old single file. README gained an "SDK Middleware" section after Python client.
-
-**Key decisions:**
-- Proxy via `__getattr__` (not subclass) — lets us avoid touching the real SDK class hierarchy (which is pydantic-derived and unfriendly to inherit from). Only the methods we intercept have explicit wrapper classes.
-- Single `_intercept` function with `_ProviderHooks` (extract + build) instead of two parallel implementations — keeps both wrappers honest about behavior parity.
-- `_set_attr_safely` falls back to `obj.__dict__` for SDK responses that may be pydantic models (real `ChatCompletion` is — direct `setattr` may raise). Best-effort: never break the user's response.
-- `fail_open=True` is the default and the failure mode is explicit: log a warning, set `_ferrocache_hit=None`, return the real API response. Cache outage must NEVER break the application.
-- `default_embed_fn` is constructed lazily inside `wrap_*` (not at module import) so users with a custom `embed_fn` never need sentence-transformers installed.
-- `unittest.mock.patch("ferrocache.middleware.FerrocacheClient")` patches the symbol the middleware imports, not the real client module — standard pattern but worth noting for future test additions.
-
-**Deviations:**
-- Used stdlib `unittest` (with classes) rather than `pytest`-style assertion functions — runs under both `python3 -m unittest` and `python3 -m pytest`, and adds zero dev deps.
-- Brief mentioned `client.embeddings.create` as one of the passthrough cases; I tested `client.models.list` instead because it's simpler to mock and proves the same pattern.
-- The proxy classes set `self._real` in `__init__` (regular attribute) — `__getattr__` only fires when normal lookup misses, so `_real` access doesn't recurse. Worth flagging for anyone adding new hooks.
-
-**Next session (M11 if pursued):** LangChain `BaseChatModel` subclass + LlamaIndex `LLM` subclass that wrap the same caching path. Likely lives in `clients/python/ferrocache/langchain.py` and `ferrocache/llamaindex.py`, optional imports.
-
-**Open:** Wrappers are sync-only; OpenAI/Anthropic SDKs both ship async clients (`AsyncOpenAI`, `AsyncAnthropic`) that we don't cover yet. Streaming responses (`stream=True`) bypass the cache — they return immediately and the iterator isn't intercepted. Embedding happens on every call even on hits-likely paths; could short-circuit with a cheap exact-match check on `query_text` before paying for the embedding.
-
 ### 2026-05-01 — Mission 11: LangChain + LlamaIndex backends
 **Built:** `clients/python/ferrocache/langchain.py` — `FerrocacheCache(BaseCache)` implementing the `lookup`/`update`/`clear` contract from `langchain_core.caches`. `lookup` embeds the prompt, queries ferrocache, returns `[Generation(text=...)]` on hit / `None` on miss. `update` embeds the prompt and inserts the cached `Generation[0].text`. `clear` is a logged no-op (ferrocache is append-only). `clients/python/ferrocache/llamaindex.py` — `FerrocacheLLM(CustomLLM)` using `pydantic.PrivateAttr` for inner-LLM and config state. Implements `complete`, `chat`, `stream_complete` (streaming bypasses the cache), and `metadata` (delegates to inner). Both backends gate `langchain_core` / `llama_index.core` imports behind a `try/except ImportError` so the modules load fine on machines without those frameworks; instantiating without the dep raises a clear `ImportError("Install ...")`. Both share the M10 `_resolve_url` / `_resolve_threshold` helpers and the lazy `default_embed_fn`. New tests: 7 `test_langchain.py` (hit, miss, update, lookup-fail-open, update-fail-open, clear noop, custom embed) + 5 `test_llamaindex.py` (complete-hit, complete-miss + insert, fail-open, custom embed, chat-hit). All 22 Python tests pass under `python3 -m unittest`. README gained a "Framework Integration" section with 2-line snippets for each. Examples added: `example_langchain.py` (uses `set_llm_cache`) and `example_llamaindex.py` (wraps `OpenAI(...)`). `__init__.py` *deliberately* does not auto-import these modules — frameworks remain optional deps.
 
@@ -114,3 +95,23 @@
 **Next session (M12 if pursued):** MCP (Model Context Protocol) server exposing ferrocache as a tool to MCP clients (Claude Desktop, IDEs). Likely a thin Python `mcp` server that wraps the existing client.
 
 **Open:** No async backend versions yet (LangChain has `alookup`/`aupdate`; LlamaIndex has `acomplete`). Both currently fall back to LangChain's default-impl-runs-sync-in-executor behavior, which is fine for the cache-lookup hot path but adds an executor hop. Adding native async backends is a one-evening follow-up if needed.
+
+### 2026-05-01 — Mission 12: MCP server (Claude Desktop / Claude Code)
+**Built:** `clients/python/ferrocache/mcp_server.py` — MCP server speaking JSON-RPC over stdio via the official `mcp` SDK (1.27.0 detected locally). Three tools registered: `semantic_cache_lookup` (text + optional threshold), `semantic_cache_store` (text + response), `cache_status` (no args). Tool dispatch lives in a standalone `FerrocacheTools` class with three async methods backed by `FerrocacheClient` + an `embed_fn`; the MCP `@server.list_tools()` and `@server.call_tool()` decorators are thin shims that translate to/from this class. Errors are caught and turned into `{"error": "..."}` dict payloads — the server never crashes on a bad tool call. Sync `FerrocacheClient` is wrapped in `asyncio.to_thread` to avoid blocking the event loop. Embedding is handled inside the MCP layer: tools accept text, the server lazily loads sentence-transformers (configurable via `FERROCACHE_EMBED_MODEL`) and produces a 384-dim vector. New `clients/python/mcp_requirements.txt` pinning `mcp>=1.0.0` + `sentence-transformers`. New `docs/mcp-setup.md` with copy-pasteable Claude Desktop JSON config (mac/win/linux paths) and Claude Code `claude mcp add` command. README gained an "MCP Server" section linking to the doc. New `tests/test_mcp_server.py`: 8 cases under `unittest.IsolatedAsyncioTestCase` covering hit, miss, store success, status, ferrocache-unreachable on lookup AND store, dispatch-of-unknown-tool, and tool-catalog shape. All 38 Python tests pass (10 middleware + 7 langchain + 5 llamaindex + 8 mcp + 8 catalog/dispatch). Smoke-tested: server starts via `python3 -m ferrocache.mcp_server`, loads sentence-transformers, waits on stdio cleanly.
+
+**Key decisions:**
+- Tool dispatch extracted into `FerrocacheTools` so unit tests can hit the methods directly without a JSON-RPC harness — the MCP decorators are a 5-line shim around it.
+- `asyncio.to_thread` for the sync client calls — small overhead, keeps the event loop responsive if multiple tool calls arrive concurrently.
+- Errors return `{"error": "..."}` rather than raising — MCP clients (and Claude) handle structured error payloads gracefully, but a server crash kills the conversation.
+- Embedding model loaded once at startup (inside `_build_tools_from_env`); subsequent tool calls reuse it. First-call cold start is the model-load time only.
+- `mcp_server.py` is *not* auto-imported in `__init__.py` — the `mcp` SDK stays optional. Other ferrocache imports work fine without it.
+- Tool descriptions are written for an LLM reader: when to use, what comes back, when to call which one. Lookup explicitly says "BEFORE expensive call", store says "AFTER".
+
+**Deviations:**
+- Brief sketched the SDK as `from mcp.server import Server`; the actual class lives at `mcp.server.lowlevel.server.Server` but `mcp.server.Server` re-exports it. Used the public path.
+- Added an 8th test (`test_dispatch_unknown_tool`) on top of the brief's 7 — unknown tool names return a clean error rather than 500ing the server, worth covering.
+- The brief's `mcp_requirements.txt` pin of `mcp>=1.0.0` works fine; locally it resolved to 1.27.0.
+
+**Next session (M13 if pursued):** distribution polish — publish the Rust crate to crates.io, the Python client to PyPI (`pip install ferrocache`), the Docker image to Docker Hub. Includes `pyproject.toml`, GitHub Actions release workflow, and a CHANGELOG.
+
+**Open:** Streaming tool results are not used — every tool returns a single JSON blob (fine for cache lookups, less ideal for any future tool that fans out). No tests exercise the actual MCP transport (decorators + stdio_server) — relies on the SDK's tested behavior. Embedding model is downloaded on first launch (~80MB); subsequent runs use HF cache.

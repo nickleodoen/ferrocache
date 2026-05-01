@@ -264,6 +264,23 @@ Both backends accept `embed_fn`, `cache_url`, `threshold`, and `fail_open` kwarg
 
 See `clients/python/example_langchain.py` and `example_llamaindex.py` for runnable demos.
 
+## MCP Server (Claude Desktop / Claude Code)
+
+ferrocache ships an MCP server that exposes semantic caching as tools for any MCP-capable agent. Tools accept text — the MCP layer embeds locally before talking to ferrocache.
+
+```bash
+pip install -r clients/python/mcp_requirements.txt
+python3 -m ferrocache.mcp_server      # speaks JSON-RPC over stdio
+```
+
+| Tool                     | What it does                                              |
+|--------------------------|-----------------------------------------------------------|
+| `semantic_cache_lookup`  | Search for a cached response by query text                |
+| `semantic_cache_store`   | Store a query-response pair                               |
+| `cache_status`           | Server health + entry count                               |
+
+Full setup (Claude Desktop / Claude Code config snippets, env vars, troubleshooting): see [`docs/mcp-setup.md`](docs/mcp-setup.md).
+
 ## Development
 
 ```bash
