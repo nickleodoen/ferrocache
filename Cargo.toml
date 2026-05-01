@@ -13,6 +13,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 hnsw_rs = "0.3"
+config = "0.14"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

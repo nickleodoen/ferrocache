@@ -3,19 +3,16 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
+use crate::config::HnswConfig;
 use crate::wal::WalEntry;
 
-#[allow(dead_code)]
 pub struct CacheEntry {
     pub uuid: String,
-    pub embedding: Vec<f32>,
     pub response: String,
-    pub query_text: String,
 }
 
 #[derive(Debug)]
 pub struct QueryHit {
-    #[allow(dead_code)]
     pub id: String,
     pub response: String,
     pub similarity: f32,
@@ -26,21 +23,16 @@ pub struct SemanticIndex {
     entries: HashMap<usize, CacheEntry>,
     next_id: usize,
     dimension: Option<usize>,
+    ef_search: usize,
 }
 
-const HNSW_MAX_NB_CONNECTION: usize = 16;
-const HNSW_MAX_ELEMENTS: usize = 100_000;
-const HNSW_MAX_LAYER: usize = 16;
-const HNSW_EF_CONSTRUCTION: usize = 200;
-const HNSW_EF_SEARCH: usize = 32;
-
 impl SemanticIndex {
-    pub fn new() -> Self {
+    pub fn new(cfg: &HnswConfig) -> Self {
         let hnsw = Hnsw::<f32, DistCosine>::new(
-            HNSW_MAX_NB_CONNECTION,
-            HNSW_MAX_ELEMENTS,
-            HNSW_MAX_LAYER,
-            HNSW_EF_CONSTRUCTION,
+            cfg.max_nb_connection,
+            cfg.max_elements,
+            cfg.max_layer,
+            cfg.ef_construction,
             DistCosine,
         );
         Self {
@@ -48,6 +40,7 @@ impl SemanticIndex {
             entries: HashMap::new(),
             next_id: 0,
             dimension: None,
+            ef_search: cfg.ef_search,
         }
     }
 
@@ -64,7 +57,12 @@ impl SemanticIndex {
     }
 
     pub fn replay_entry(&mut self, entry: WalEntry) -> Result<()> {
-        self.insert_with_uuid(entry.uuid, entry.embedding, entry.response, entry.query_text)
+        self.insert_with_uuid(
+            entry.uuid,
+            entry.embedding,
+            entry.response,
+            entry.query_text,
+        )
     }
 
     fn insert_with_uuid(
@@ -72,7 +70,7 @@ impl SemanticIndex {
         uuid: String,
         embedding: Vec<f32>,
         response: String,
-        query_text: String,
+        _query_text: String,
     ) -> Result<()> {
         match self.dimension {
             None => self.dimension = Some(embedding.len()),
@@ -91,15 +89,7 @@ impl SemanticIndex {
 
         self.hnsw.insert((&embedding, id));
 
-        self.entries.insert(
-            id,
-            CacheEntry {
-                uuid,
-                embedding,
-                response,
-                query_text,
-            },
-        );
+        self.entries.insert(id, CacheEntry { uuid, response });
 
         Ok(())
     }
@@ -117,7 +107,7 @@ impl SemanticIndex {
             return Ok(None);
         }
 
-        let neighbours = self.hnsw.search(embedding, 1, HNSW_EF_SEARCH);
+        let neighbours = self.hnsw.search(embedding, 1, self.ef_search);
         let Some(n) = neighbours.first() else {
             return Ok(None);
         };
@@ -148,19 +138,17 @@ impl SemanticIndex {
     }
 }
 
-impl Default for SemanticIndex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_index() -> SemanticIndex {
+        SemanticIndex::new(&HnswConfig::default())
+    }
+
     #[test]
     fn test_insert_and_query_hit() {
-        let mut idx = SemanticIndex::new();
+        let mut idx = test_index();
         let v = vec![1.0_f32, 0.0, 0.0];
         let uuid = idx
             .insert(v.clone(), "cached-response".to_string(), "q".to_string())
@@ -175,20 +163,16 @@ mod tests {
 
     #[test]
     fn test_query_miss_below_threshold() {
-        let mut idx = SemanticIndex::new();
-        idx.insert(
-            vec![1.0_f32, 0.0, 0.0],
-            "r".to_string(),
-            "q".to_string(),
-        )
-        .unwrap();
+        let mut idx = test_index();
+        idx.insert(vec![1.0_f32, 0.0, 0.0], "r".to_string(), "q".to_string())
+            .unwrap();
         let result = idx.query(&[0.0_f32, 0.0, 1.0], 0.99).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_dimension_mismatch_insert() {
-        let mut idx = SemanticIndex::new();
+        let mut idx = test_index();
         idx.insert(vec![1.0, 2.0, 3.0], "r".into(), "q".into())
             .unwrap();
         let err = idx
@@ -199,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_dimension_mismatch_query() {
-        let mut idx = SemanticIndex::new();
+        let mut idx = test_index();
         idx.insert(vec![1.0, 2.0, 3.0], "r".into(), "q".into())
             .unwrap();
         let err = idx.query(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.5).unwrap_err();
@@ -208,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_entry_count() {
-        let mut idx = SemanticIndex::new();
+        let mut idx = test_index();
         idx.insert(vec![1.0, 0.0, 0.0], "a".into(), "qa".into())
             .unwrap();
         idx.insert(vec![0.0, 1.0, 0.0], "b".into(), "qb".into())

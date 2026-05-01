@@ -10,6 +10,8 @@ pub struct QueryRequest {
 pub struct QueryResponse {
     pub hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity: Option<f32>,
@@ -38,4 +40,19 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatsResponse {
+    pub entry_count: u64,
+    pub wal_path: String,
+    pub hnsw: StatsHnsw,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatsHnsw {
+    pub max_nb_connection: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+    pub dimension: Option<usize>,
 }

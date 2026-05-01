@@ -10,22 +10,57 @@ use axum::{
 
 use crate::models::{
     ErrorResponse, HealthResponse, InsertRequest, InsertResponse, QueryRequest, QueryResponse,
+    StatsHnsw, StatsResponse,
 };
 use crate::state::AppState;
 use crate::wal::WalEntry;
+
+pub const MAX_EMBEDDING_DIM: usize = 4096;
+pub const MAX_RESPONSE_BYTES: usize = 102_400;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/query", post(query_handler))
         .route("/insert", post(insert_handler))
         .route("/health", get(health_handler))
+        .route("/stats", get(stats_handler))
         .with_state(state)
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    tracing::warn!(error = %msg, "request rejected");
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response()
+}
+
+fn validate_embedding(embedding: &[f32]) -> Result<(), String> {
+    if embedding.is_empty() {
+        return Err("embedding must not be empty".to_string());
+    }
+    if embedding.len() > MAX_EMBEDDING_DIM {
+        return Err(format!(
+            "embedding dimension {} exceeds max {}",
+            embedding.len(),
+            MAX_EMBEDDING_DIM
+        ));
+    }
+    Ok(())
 }
 
 async fn query_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryRequest>,
 ) -> Response {
+    if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if !(0.0..=1.0).contains(&req.threshold) {
+        return bad_request(format!(
+            "threshold {} out of range [0.0, 1.0]",
+            req.threshold
+        ));
+    }
+
     let dim = req.embedding.len();
     let index = state.index.read().await;
     match index.query(&req.embedding, req.threshold) {
@@ -35,6 +70,7 @@ async fn query_handler(
                 StatusCode::OK,
                 Json(QueryResponse {
                     hit: true,
+                    id: Some(hit.id),
                     response: Some(hit.response),
                     similarity: Some(hit.similarity),
                 }),
@@ -47,22 +83,14 @@ async fn query_handler(
                 StatusCode::OK,
                 Json(QueryResponse {
                     hit: false,
+                    id: None,
                     response: None,
                     similarity: None,
                 }),
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "query failed");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
+        Err(e) => bad_request(e.to_string()),
     }
 }
 
@@ -70,19 +98,26 @@ async fn insert_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InsertRequest>,
 ) -> Response {
-    let dim = req.embedding.len();
+    if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if req.response.len() > MAX_RESPONSE_BYTES {
+        return bad_request(format!(
+            "response size {} exceeds max {}",
+            req.response.len(),
+            MAX_RESPONSE_BYTES
+        ));
+    }
 
-    // Hold the WAL mutex for the whole critical section: this serializes
-    // inserters so dimension cannot change between our peek and our index write.
+    let dim = req.embedding.len();
     let mut wal = state.wal.lock().await;
 
-    // Validate dimension up-front to avoid persisting WAL lines we'd reject anyway.
     if let Some(existing) = state.index.read().await.dimension()
         && existing != dim
     {
-        let msg = format!("dimension mismatch: expected {existing}, got {dim}");
-        tracing::warn!(error = %msg, "insert rejected");
-        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response();
+        return bad_request(format!(
+            "dimension mismatch: expected {existing}, got {dim}"
+        ));
     }
 
     let uuid = uuid::Uuid::new_v4().to_string();
@@ -105,7 +140,6 @@ async fn insert_handler(
     }
 
     if let Err(e) = state.index.write().await.replay_entry(entry) {
-        // Should not happen — dimension already validated under the WAL lock.
         tracing::error!(error = %e, "index insert failed after WAL append");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -136,9 +170,24 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
     })
 }
 
+async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
+    let index = state.index.read().await;
+    Json(StatsResponse {
+        entry_count: index.entry_count() as u64,
+        wal_path: state.wal_path.clone(),
+        hnsw: StatsHnsw {
+            max_nb_connection: state.hnsw_config.max_nb_connection,
+            ef_construction: state.hnsw_config.ef_construction,
+            ef_search: state.hnsw_config.ef_search,
+            dimension: index.dimension(),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HnswConfig;
     use crate::index::SemanticIndex;
     use crate::wal::Wal;
     use axum::body::Body;
@@ -148,18 +197,23 @@ mod tests {
     use std::path::PathBuf;
     use tower::ServiceExt;
 
+    async fn build_state(wal_path: PathBuf) -> Arc<AppState> {
+        let hnsw = HnswConfig::default();
+        let wal = Wal::open(&wal_path).await.unwrap();
+        Arc::new(AppState::new(
+            "test-node".to_string(),
+            SemanticIndex::new(&hnsw),
+            wal,
+            wal_path.to_string_lossy().into_owned(),
+            hnsw,
+        ))
+    }
+
     async fn test_app() -> (Router, Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
-        let wal = Wal::open(&path).await.unwrap();
-        let state = Arc::new(AppState::new(SemanticIndex::new(), wal));
+        let state = build_state(path).await;
         (build_router(state.clone()), state, dir)
-    }
-
-    async fn test_app_with_wal_path(path: PathBuf) -> (Router, Arc<AppState>) {
-        let wal = Wal::open(&path).await.unwrap();
-        let state = Arc::new(AppState::new(SemanticIndex::new(), wal));
-        (build_router(state.clone()), state)
     }
 
     async fn body_json(body: Body) -> Value {
@@ -188,7 +242,6 @@ mod tests {
     async fn test_health_returns_ok() {
         let (app, _, _dir) = test_app().await;
         let response = app.oneshot(get("/health")).await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert_eq!(body["status"], "ok");
@@ -203,7 +256,6 @@ mod tests {
             "query_text": "hi"
         });
         let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert!(body["id"].is_string());
@@ -219,7 +271,6 @@ mod tests {
             "threshold": 0.9
         });
         let response = app.oneshot(post_json("/query", payload)).await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert_eq!(body["hit"], false);
@@ -233,7 +284,6 @@ mod tests {
             "response": "hello",
             "query_text": "hi"
         });
-
         for _ in 0..2 {
             let response = app
                 .clone()
@@ -242,7 +292,6 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-
         let response = app.oneshot(get("/health")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
@@ -263,12 +312,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let query_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "threshold": 0.90
         });
-        let response = app.oneshot(post_json("/query", query_payload)).await.unwrap();
+        let response = app
+            .oneshot(post_json("/query", query_payload))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert_eq!(body["hit"], true);
@@ -291,12 +342,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let query_payload = json!({
             "embedding": [0.0_f32, 0.0, 1.0],
             "threshold": 0.99
         });
-        let response = app.oneshot(post_json("/query", query_payload)).await.unwrap();
+        let response = app
+            .oneshot(post_json("/query", query_payload))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
         assert_eq!(body["hit"], false);
@@ -316,7 +369,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let second = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "response": "r",
@@ -325,7 +377,12 @@ mod tests {
         let response = app.oneshot(post_json("/insert", second)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response.into_body()).await;
-        assert!(body["error"].as_str().unwrap().contains("dimension mismatch"));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("dimension mismatch")
+        );
     }
 
     #[tokio::test]
@@ -333,9 +390,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("persist.wal");
 
-        // Run an insert through the HTTP layer.
         {
-            let (app, state) = test_app_with_wal_path(wal_path.clone()).await;
+            let state = build_state(wal_path.clone()).await;
+            let app = build_router(state.clone());
             let payload = json!({
                 "embedding": [1.0_f32, 0.0, 0.0],
                 "response": "persisted answer",
@@ -343,22 +400,90 @@ mod tests {
             });
             let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            // Drop the AppState (and its WAL handle) before replaying.
             drop(state);
         }
 
-        // Simulate restart: replay WAL into a fresh index.
         let entries = Wal::replay(&wal_path).await.unwrap();
         assert_eq!(entries.len(), 1);
-        let mut fresh = SemanticIndex::new();
+        let mut fresh = SemanticIndex::new(&HnswConfig::default());
         for entry in entries {
             fresh.replay_entry(entry).unwrap();
         }
-
         let hit = fresh
             .query(&[1.0_f32, 0.0, 0.0], 0.90)
             .unwrap()
             .expect("should hit after replay");
         assert_eq!(hit.response, "persisted answer");
+    }
+
+    #[tokio::test]
+    async fn test_insert_empty_embedding() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [],
+            "response": "r",
+            "query_text": "q"
+        });
+        let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn test_insert_oversized_embedding() {
+        let (app, _, _dir) = test_app().await;
+        let big: Vec<f32> = vec![0.1; 5000];
+        let payload = json!({
+            "embedding": big,
+            "response": "r",
+            "query_text": "q"
+        });
+        let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("exceeds max"));
+    }
+
+    #[tokio::test]
+    async fn test_insert_oversized_response() {
+        let (app, _, _dir) = test_app().await;
+        let big_resp = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let payload = json!({
+            "embedding": [0.1f32, 0.2, 0.3],
+            "response": big_resp,
+            "query_text": "q"
+        });
+        let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("response size"));
+    }
+
+    #[tokio::test]
+    async fn test_query_threshold_out_of_range() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [0.1f32, 0.2, 0.3],
+            "threshold": 1.5
+        });
+        let response = app.oneshot(post_json("/query", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_stats_endpoint() {
+        let (app, _, _dir) = test_app().await;
+        let response = app.oneshot(get("/stats")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["entry_count"], 0);
+        assert!(body["wal_path"].is_string());
+        assert_eq!(body["hnsw"]["max_nb_connection"], 16);
+        assert_eq!(body["hnsw"]["ef_construction"], 200);
+        assert_eq!(body["hnsw"]["ef_search"], 32);
+        assert!(body["hnsw"]["dimension"].is_null());
     }
 }

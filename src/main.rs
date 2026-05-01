@@ -1,15 +1,16 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
+mod config;
 mod index;
 mod models;
 mod server;
 mod state;
 mod wal;
 
+use crate::config::FerrocacheConfig;
 use crate::index::SemanticIndex;
 use crate::state::AppState;
 use crate::wal::Wal;
@@ -17,23 +18,24 @@ use crate::wal::Wal;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
-    let port: u16 = std::env::var("FERROCACHE_PORT")
-        .ok()
-        .map(|s| s.parse())
-        .transpose()
-        .context("FERROCACHE_PORT must be a valid u16")?
-        .unwrap_or(3000);
+    let config = FerrocacheConfig::load().context("config load failed")?;
+    tracing::info!(?config, "loaded config");
 
-    let wal_path: PathBuf = std::env::var("FERROCACHE_WAL_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./ferrocache.wal"));
-    tracing::info!(path = %wal_path.display(), "WAL path");
+    let node_id = config
+        .node_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let entries = Wal::replay(&wal_path).await.context("WAL replay failed")?;
-    let mut index = SemanticIndex::new();
+    tracing::info!(path = %config.wal_path, "WAL path");
+    let entries = Wal::replay(&config.wal_path)
+        .await
+        .context("WAL replay failed")?;
+    let mut index = SemanticIndex::new(&config.hnsw);
     let mut replayed = 0usize;
     for entry in entries {
         match index.replay_entry(entry) {
@@ -43,10 +45,18 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(count = replayed, "WAL replay complete");
 
-    let wal = Wal::open(&wal_path).await.context("WAL open failed")?;
+    let wal = Wal::open(&config.wal_path)
+        .await
+        .context("WAL open failed")?;
 
-    let addr = format!("0.0.0.0:{port}");
-    let state = Arc::new(AppState::new(index, wal));
+    let addr = format!("0.0.0.0:{}", config.port);
+    let state = Arc::new(AppState::new(
+        node_id,
+        index,
+        wal,
+        config.wal_path.clone(),
+        config.hnsw.clone(),
+    ));
     let app = server::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -55,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(node_id = %state.node_id, %addr, "ferrocache listening");
 
-    axum::serve(listener, app).await.context("axum server failed")?;
+    axum::serve(listener, app)
+        .await
+        .context("axum server failed")?;
 
     Ok(())
 }

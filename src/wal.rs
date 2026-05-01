@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,20 +15,18 @@ pub struct WalEntry {
 
 pub struct Wal {
     file: File,
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl Wal {
-    pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .await
             .with_context(|| format!("failed to open WAL at {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok(Self { file })
     }
 
     pub async fn append(&mut self, entry: &WalEntry) -> Result<()> {
