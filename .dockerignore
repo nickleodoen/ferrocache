@@ -1,0 +1,11 @@
+target/
+.git/
+*.wal
+ferrocache.wal
+docker-compose.yml
+Dockerfile
+.dockerignore
+tests/cluster_integration.sh
+Makefile
+CLAUDE.md
+README.md

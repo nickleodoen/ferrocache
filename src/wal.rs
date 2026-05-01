@@ -20,6 +20,13 @@ pub struct Wal {
 impl Wal {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create WAL parent dir {}", parent.display()))?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)

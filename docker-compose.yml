@@ -1,0 +1,72 @@
+services:
+  node1:
+    build: .
+    container_name: ferrocache-node1
+    environment:
+      FERROCACHE_PORT: "3000"
+      FERROCACHE_NODE_ID: "node1"
+      FERROCACHE_WAL_PATH: "/data/ferrocache.wal"
+      FERROCACHE_CLUSTER__ENABLED: "true"
+      FERROCACHE_CLUSTER__GOSSIP_ADDR: "0.0.0.0:4000"
+      FERROCACHE_CLUSTER__API_ADDR: "node1:3000"
+      FERROCACHE_CLUSTER__SEED_NODES: "node2:4000,node3:4000"
+      FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
+      FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      RUST_LOG: "info"
+    ports:
+      - "3001:3000"
+    volumes:
+      - node1-data:/data
+    networks:
+      - fc-net
+
+  node2:
+    build: .
+    container_name: ferrocache-node2
+    environment:
+      FERROCACHE_PORT: "3000"
+      FERROCACHE_NODE_ID: "node2"
+      FERROCACHE_WAL_PATH: "/data/ferrocache.wal"
+      FERROCACHE_CLUSTER__ENABLED: "true"
+      FERROCACHE_CLUSTER__GOSSIP_ADDR: "0.0.0.0:4000"
+      FERROCACHE_CLUSTER__API_ADDR: "node2:3000"
+      FERROCACHE_CLUSTER__SEED_NODES: "node1:4000,node3:4000"
+      FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
+      FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      RUST_LOG: "info"
+    ports:
+      - "3002:3000"
+    volumes:
+      - node2-data:/data
+    networks:
+      - fc-net
+
+  node3:
+    build: .
+    container_name: ferrocache-node3
+    environment:
+      FERROCACHE_PORT: "3000"
+      FERROCACHE_NODE_ID: "node3"
+      FERROCACHE_WAL_PATH: "/data/ferrocache.wal"
+      FERROCACHE_CLUSTER__ENABLED: "true"
+      FERROCACHE_CLUSTER__GOSSIP_ADDR: "0.0.0.0:4000"
+      FERROCACHE_CLUSTER__API_ADDR: "node3:3000"
+      FERROCACHE_CLUSTER__SEED_NODES: "node1:4000,node2:4000"
+      FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
+      FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      RUST_LOG: "info"
+    ports:
+      - "3003:3000"
+    volumes:
+      - node3-data:/data
+    networks:
+      - fc-net
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  fc-net:
+    driver: bridge

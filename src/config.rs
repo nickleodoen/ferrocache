@@ -102,7 +102,16 @@ impl FerrocacheConfig {
                 defaults.cluster.replication_factor as i64,
             )?
             .add_source(File::with_name("ferrocache").required(false))
-            .add_source(Environment::with_prefix("FERROCACHE").separator("__"))
+            .add_source(
+                // FERROCACHE_PORT → port; FERROCACHE_CLUSTER__ENABLED → cluster.enabled.
+                // try_parsing must be true for bool/int/list coercion from env strings.
+                Environment::with_prefix("FERROCACHE")
+                    .prefix_separator("_")
+                    .separator("__")
+                    .try_parsing(true)
+                    .list_separator(",")
+                    .with_list_parse_key("cluster.seed_nodes"),
+            )
             .build()
             .context("failed to build config")?;
         cfg.try_deserialize()

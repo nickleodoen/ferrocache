@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** Phase 2 in progress. M5 + M6 done (ring + gossip + routing + replication). Next: M7 — Docker / multi-node integration testing.
+**Current phase:** Phase 2 complete. Next: Phase 3 — polish (README, benchmarks, Python client, CI).
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -13,14 +13,15 @@
 - M4: config crate (TOML + env merge), request validation (4096 dim, 100KB resp, threshold range), /stats endpoint, dead-code cleanup
 - M5: consistent hash ring (FNV-1a, 64 vnodes default) + chitchat gossip discovery, /cluster/status endpoint, single-node fallback
 - M6: cluster-aware /query routing + /insert synchronous replication, `?local=true` loop-prevention param, UUID stamping by coordinator
+- M7: Dockerfile, docker-compose 3-node cluster, bash integration tests; fixed env-var prefix-separator bug (FERROCACHE_PORT was being skipped silently)
 
 **Module map:**
 - main.rs — entry, tracing init, config load, WAL replay, optional cluster init, serve
 - server.rs — router, handlers, request validation, routing/replication coordination, tests
 - index.rs — SemanticIndex (hnsw_rs wrapper + HashMap side-table), replay_entry
-- wal.rs — Wal (append w/ fsync), WalEntry, replay
+- wal.rs — Wal (append w/ fsync, mkdir -p parent), WalEntry, replay
 - models.rs — request/response DTOs (InsertRequest carries optional `uuid`)
-- config.rs — FerrocacheConfig, HnswConfig, ClusterConfig (gossip_addr, api_addr, replication_factor)
+- config.rs — FerrocacheConfig, HnswConfig, ClusterConfig (gossip_addr, api_addr, replication_factor, seed_nodes)
 - state.rs — AppState { node_id, index, wal, wal_path, hnsw_config, cluster, router, replication_factor }
 - ring.rs — HashRing (BTreeMap<u64, node_id>, FNV-1a, virtual nodes, get_n_nodes for replica walk)
 - cluster.rs — ClusterState wrapping chitchat; reconciler syncs ring + node_id→api_addr map from gossip KV
@@ -35,7 +36,7 @@
 - Side-table: HashMap<usize, CacheEntry> keyed by hnsw internal id; UUID inside CacheEntry
 - WAL is source of truth; production insert path is WAL-first then replay_entry
 - insert() (UUID-generating) is #[cfg(test)] only; production uses replay_entry
-- Config priority: env vars (FERROCACHE_ prefix, `__` separator) > ferrocache.toml > defaults
+- Config priority: env vars (FERROCACHE_ prefix, `_` prefix-sep, `__` section-sep, `,` list-sep) > ferrocache.toml > defaults
 - tokio::sync::RwLock for index, tokio::sync::Mutex for WAL
 - Validation limits (server.rs constants): MAX_EMBEDDING_DIM=4096, MAX_RESPONSE_BYTES=102_400
 - Threshold accepted range on /query: 0.0..=1.0
@@ -46,6 +47,9 @@
 - Routing: `?local=true` skips ring lookup (used by forwarded requests + debugging); coordinator stamps UUID before fan-out
 - Replication: synchronous, primary-or-coordinator + (replication_factor-1) replicas; any replica failure → 502
 - Forward failures return 502 (BAD_GATEWAY) to distinguish "peer failed" from local 500
+- Docker runtime image needs `libgomp1` (hnsw_rs → rayon → OpenMP)
+- `seed_nodes` is parsed from a comma-separated env string via config-rs `list_separator(",")`+`with_list_parse_key`
+- `Wal::open` mkdir's parent dir so containers can mount an empty `/data` volume
 
 **Non-negotiable constraints:**
 - No auth/TLS until Phase 3
@@ -61,36 +65,34 @@
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
 
-### 2026-05-01 — Mission 5: Hash ring + gossip discovery
-**Built:** New `src/ring.rs`: `HashRing { ring: BTreeMap<u64, String>, virtual_nodes }` with FNV-1a hashing. `add_node`/`remove_node` insert/remove `virtual_nodes` virtual positions per physical node. `get_node(key)` does the standard "first ≥ key, wrap around" lookup. `embedding_to_key` reads first 2 f32s big-endian into a `u64`. New `src/cluster.rs`: `ClusterState` wraps `chitchat::ChitchatHandle`, holds `Arc<RwLock<HashRing>>`. `new()` builds `ChitchatId` (node_id, unix-time generation, gossip addr) + `ChitchatConfig` and calls `spawn_chitchat(cfg, [], &UdpTransport)`. Background `tokio::spawn` reconciler ticks every 2s: reads chitchat live nodes via `handle.with_chitchat(|cc| cc.live_nodes()...)`, diffs against current ring, applies adds/removes, logs changes. `ClusterConfig { enabled, gossip_addr, seed_nodes, virtual_nodes }` added to `FerrocacheConfig` with `enabled=false` default — single-node mode untouched. New `GET /cluster/status` returns clustered or single-mode JSON. `AppState` gained `cluster: Option<Arc<ClusterState>>`. 31/31 tests pass; clippy + fmt clean.
-
-**Key decisions:**
-- FNV-1a (not SipHash/DefaultHasher) so hash positions are identical across processes/machines.
-- Self always added to local ring up-front; reconciler never removes self.
-- Reconciler only writes the ring when something actually changed (cheap idle path).
-- `chitchat_handle` kept in `Arc<ChitchatHandle>` and held in `ClusterState` so dropping shuts gossip down cleanly.
-
-**Deviations:** chitchat is at **0.10.1**, not 0.8 as briefed. `ChitchatConfig` requires more fields than the brief implied (`cluster_id`, `marked_for_deletion_grace_period`, etc.); filled with sane defaults. Initial `test_two_nodes_distribute` failed because `0u64.to_be_bytes()..99u64.to_be_bytes()` clusters under FNV (only LSB varies); switched to `format!("key-{k}")` inputs.
-
-**Open:** No real cluster integration test yet — chitchat needs UDP and two processes; tests cover ring + single-mode handler. `cluster_id` is hard-coded.
-
 ### 2026-05-01 — Mission 6: Routing + replication
-**Built:** New `src/router.rs`: `ClusterRouter { client: reqwest::Client }` (5s timeout, reusable). `forward_query(addr, &QueryRequest)` POSTs `http://{addr}/query?local=true` and decodes; non-2xx becomes an error. `forward_insert(addr, &InsertRequest)` symmetric. New tests spin up an in-process axum mock on `127.0.0.1:0`, assert the `?local=true` query param is forwarded, assert `uuid` round-trips through `InsertRequest`. `HashRing::get_n_nodes(key, n)` walks BTreeMap clockwise (with wrap via chained `range(..key)`), collects up to `n` distinct physical nodes via a `HashSet` dedupe — used for replica selection. `ClusterState` now also tracks `addrs: Arc<RwLock<HashMap<node_id, api_addr>>>`. Each node advertises its API addr via chitchat by passing `vec![("api_addr", config.api_addr)]` as the `initial_key_values` arg to `spawn_chitchat`. Reconciler reads peers' KV via `cc.node_state(chat_id).get("api_addr")` and updates the map alongside the ring. `ClusterState::get_target_addr` and `get_replica_addrs(emb, n)` expose `(node_id, api_addr)` tuples. `ClusterConfig` gained `api_addr` (default `0.0.0.0:3000`) and `replication_factor` (default 2). `InsertRequest` gained `uuid: Option<String>` (skipped when `None`); when present on a `local=true` insert, that UUID is used instead of generating a new one. Server handlers now take `Query<LocalParam>`: `/query` routes to the embedding's owner (or local if self/disabled/`local=true`), `/insert` fetches the replica set, locally inserts if self is a replica, then synchronously forwards to each non-self replica via `ClusterRouter`; any forward failure → 502. `AppState::new` grew `router: Option<Arc<ClusterRouter>>` and `replication_factor: usize`. 40/40 tests pass; clippy + fmt clean.
+**Built:** New `src/router.rs`: `ClusterRouter { client: reqwest::Client }` (5s timeout, reusable). `forward_query(addr, &QueryRequest)` POSTs `http://{addr}/query?local=true` and decodes; non-2xx → error. `forward_insert(addr, &InsertRequest)` symmetric. Tests spin up an in-process axum mock on `127.0.0.1:0` and assert `?local=true` is forwarded + `uuid` round-trips. `HashRing::get_n_nodes(key, n)` walks BTreeMap clockwise (chained `range(..key)` for wrap), dedupes via `HashSet`. `ClusterState` tracks `addrs: HashMap<node_id, api_addr>`; each node advertises its API addr by passing `vec![("api_addr", config.api_addr)]` as `initial_key_values` to `spawn_chitchat`; reconciler reads peers via `cc.node_state(chat_id).get("api_addr")`. New `get_target_addr` and `get_replica_addrs(emb, n)` return `(node_id, api_addr)` tuples. `ClusterConfig` gained `api_addr` (default `0.0.0.0:3000`) and `replication_factor` (default 2). `InsertRequest` gained `uuid: Option<String>`. Server `/insert` and `/query` now take `Query<LocalParam>`: route to owner via `forward_query` when not local, or fan out to replicas synchronously after stamping UUID on the request body. 40/40 tests pass.
 
 **Key decisions:**
-- Coordinator stamps the UUID before fan-out (mutates `req.uuid = Some(...)`) so replica WALs all store the same id — UUID stability across the cluster matches the WAL's UUID stability across restarts.
-- Synchronous all-or-nothing replication: any replica failure → 502 to client. No partial-write recovery; that's an anti-entropy/M-later problem.
-- `local=true` is read both for the loop-prevention case (forwarded) and the diagnostic case (curl a specific node). Same code path either way.
-- 502 on forward failure (vs 500 for local errors): distinguishes "peer down" from "I'm broken" — operationally important.
-- Replica set comes from `get_n_nodes_for_embedding(emb, factor)`. If self is in the set, we skip the network hop for our own write — avoids spending a request on `localhost`.
-- Cluster-disabled path (`cluster.is_none()`) takes the same `process_insert_locally` codepath that `local=true` does. Phase 1 behavior unchanged.
+- Coordinator stamps the UUID before fan-out so all replicas store the same id (cluster-wide UUID stability mirrors WAL UUID stability across restarts).
+- Synchronous all-or-nothing replication: any replica failure → 502. Anti-entropy is a separate problem.
+- `local=true` serves both loop-prevention (forwarded) and diagnostic (curl a specific node) cases via the same code path.
+- 502 vs 500 distinguishes "peer down" from "I'm broken" — operationally important.
+- If self is in the replica set, skip the network hop for our own write (avoid spending a request on `localhost`).
+
+**Deviations:** `HashRing::get_n_nodes` takes `u64` (not embedding); thin `_for_embedding` wrapper. `local_insert_inner` returns `Result<String, Response>` so coordinator can read the UUID without re-parsing. `#[allow(clippy::too_many_arguments)]` on `AppState::new` (8 args) — explicit DI is clearer than a builder.
+
+**Open:** No retry/timeout tuning beyond reqwest's 5s default. Replication > live nodes silently degrades.
+
+### 2026-05-01 — Mission 7: Docker + docker-compose 3-node cluster + integration tests
+**Built:** Multi-stage `Dockerfile` (Rust 1.94-bookworm builder → debian:bookworm-slim runtime with `ca-certificates`, `libgomp1`, `curl`); `mkdir -p /data` in the runtime image. `docker-compose.yml` with `node1`/`node2`/`node3`, each on host ports 3001/3002/3003, named volumes for WAL persistence, full-mesh seed nodes via Docker DNS (`nodeX:4000`). `tests/cluster_integration.sh` exercises 18 assertions via `curl`+`jq`: convergence (3/3 ring), cross-node read-after-write, routing-aware queries from node3 for an embedding inserted on node2, health, and `local=true` scoping (insert local-only on node1, hit on node1, miss on node2). Added `Makefile` with `cluster-up`/`cluster-down`/`cluster-test`/`clean` targets, `.dockerignore`. `Wal::open` now mkdir's the parent dir so empty `/data` volumes work without a Dockerfile-side `touch`. **Outcome:** 40 unit tests pass, `docker compose build` succeeds, all 18 integration assertions pass with cluster converging in 1 second.
+
+**Key decisions:**
+- Comma-separated `seed_nodes` (not JSON array) — cleaner under config-rs's env-var parsing than fighting JSON encoding inside an env string.
+- Used `Rust 1.94-bookworm` to match the host's compiler version (also needed: edition=2024 needs ≥1.85). `libgomp1` in the runtime image because hnsw_rs pulls in rayon → OpenMP.
+- `Wal::open` mkdir-p logic stays in the WAL module (single-responsibility) rather than dockerfile RUN — also makes the binary friendlier on bare-metal first-run.
+- `.dockerignore` excludes `target/` (massive), `*.wal`, `tests/`, `Makefile`, etc. — keeps build context tiny and reproducible.
 
 **Deviations:**
-- `HashRing::get_n_nodes` takes a raw `u64` key (not an embedding); a thin `get_n_nodes_for_embedding` wraps it. Mirrors the `get_node`/`get_node_for_embedding` split from M5 — the raw-key form is more testable and the embedding form is what callers want.
-- `local_insert_inner` returns `Result<String, Response>` rather than producing a full `Response` — the coordinator path needs the UUID (for the client-facing reply), the single-node path just unwraps it. Avoids a pointless re-parse.
-- Added `#[allow(clippy::too_many_arguments)]` on `AppState::new` (8 args) — explicit DI is clearer than wrapping in a builder for what is effectively config.
-- Type aliases (`SharedRing`, `SharedAddrs`) added to silence `clippy::type_complexity` in cluster tests.
+- **Real bug found and fixed:** `config` crate's env source defaults `prefix_separator` to the same value as `separator`. We had `separator("__")`, so the prefix pattern became `ferrocache__`, which `FERROCACHE_PORT` (single underscore) doesn't match — every single env var was silently dropped. First docker-compose run came up in single-node mode with random UUIDs and `wal_path=./ferrocache.wal` despite all the `FERROCACHE_*` env vars. Fix: `.prefix_separator("_")` explicitly. Also added `.try_parsing(true)` (required for bool/int coercion AND for list_separator to fire). This was a latent bug present since M4; the unit-test `set_default` chain hid it because defaults never went through the env source.
+- Brief suggested JSON-array env vars (`'["node2:4000"]'`); switched to comma-separated.
+- Brief suggested Rust 1.78; used 1.94 for edition=2024 support.
 
-**Next session (M7):** docker-compose with 3 ferrocache nodes, seed-node bootstrapping, an integration test harness that spins up the cluster and verifies (a) writes replicate to N nodes, (b) reads route to the right shard, (c) killing a node and querying through a survivor still works.
+**Next session (Phase 3 / M8):** README with quickstart + architecture diagram, criterion benchmarks (insert+query latency, p50/p99 under load), Python client (sync + async), GitHub Actions CI (cargo test + cargo clippy + cluster-integration on a runner with Docker).
 
-**Open:** No retry/timeout tuning beyond the 5s reqwest default. No backpressure if a slow replica blocks the coordinator. `replication_factor > number_of_live_nodes` silently degrades to fewer replicas (`get_n_nodes` returns what it can) — could surface a warning when the ring is short. Chitchat KV propagation latency (~1–2s) means newly-joined nodes are briefly addressless and will be skipped until their `api_addr` propagates; acceptable for now.
+**Open:** Integration script doesn't exercise node-failure / partition / re-join. WAL grows unbounded — no compaction or snapshot yet. No metrics endpoint; logs only. `cluster_id` still hardcoded to "ferrocache". Container healthchecks not wired (compose just starts and we sleep; real prod would use HEALTHCHECK on `/health`).
