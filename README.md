@@ -146,6 +146,33 @@ Measured on Apple Silicon via `cargo bench`. Numbers are wall-clock per operatio
 
 Reproduce with `cargo bench`. HTML reports land in `target/criterion/`.
 
+## Simulation
+
+`tests/simulate.py` runs a realistic FAQ workload — 15 seed questions, 3 semantic variations each, plus 10 unrelated queries — against a live ferrocache. Embeddings are computed locally with `all-MiniLM-L6-v2`; no API keys.
+
+```bash
+cargo run --release      # in another terminal
+make simulate            # pip-installs sentence-transformers + runs the script
+```
+
+Sample output (Apple Silicon, single node, threshold 0.90):
+
+```
+Cache Performance
+  Hit rate:           100.0% (45/45 expected-hit queries matched)
+  False misses:       0 (variations too different at threshold 0.9)
+  True misses:        10/10 (unrelated queries correctly missed)
+
+Latency (ferrocache only, excludes embedding time)
+  Insert:             p50=5.0ms  p99=11.5ms   mean=5.6ms
+  Query (hit):        p50=0.9ms  p99=1.2ms   mean=0.9ms
+  Query (miss):       p50=1.0ms  p99=3.2ms   mean=1.3ms
+```
+
+The hit rate depends on `--threshold`; lowering it surfaces more variations as hits at the cost of false positives. Latency numbers exclude embedding time so you can see ferrocache round-trip vs the model. Drop the `--url` flag at `localhost:3001` to point at the Docker cluster (`make simulate-cluster`).
+
+For machines without PyTorch, `make simulate-no-ml` runs the same shape of workload with random unit vectors — hit rate is meaningless but latency is accurate. Zero external Python deps.
+
 ## Python client
 
 A zero-dependency stdlib-only client lives in `clients/python/`.
