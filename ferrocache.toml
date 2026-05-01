@@ -12,3 +12,9 @@
 # ef_construction = 200
 # ef_search = 32
 # default_threshold = 0.92
+
+# [cluster]
+# enabled = false
+# gossip_addr = "0.0.0.0:4000"
+# seed_nodes = []
+# virtual_nodes = 64

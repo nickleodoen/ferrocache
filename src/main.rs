@@ -3,13 +3,16 @@ use std::sync::Arc;
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
+mod cluster;
 mod config;
 mod index;
 mod models;
+mod ring;
 mod server;
 mod state;
 mod wal;
 
+use crate::cluster::ClusterState;
 use crate::config::FerrocacheConfig;
 use crate::index::SemanticIndex;
 use crate::state::AppState;
@@ -49,6 +52,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("WAL open failed")?;
 
+    let cluster = if config.cluster.enabled {
+        let cs = ClusterState::new(&node_id, &config.cluster)
+            .await
+            .context("cluster init failed")?;
+        tracing::info!(
+            gossip_addr = %cs.gossip_addr(),
+            seeds = ?config.cluster.seed_nodes,
+            "cluster enabled"
+        );
+        Some(Arc::new(cs))
+    } else {
+        tracing::info!("cluster disabled — running in single-node mode");
+        None
+    };
+
     let addr = format!("0.0.0.0:{}", config.port);
     let state = Arc::new(AppState::new(
         node_id,
@@ -56,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         wal,
         config.wal_path.clone(),
         config.hnsw.clone(),
+        cluster,
     ));
     let app = server::build_router(state.clone());
 

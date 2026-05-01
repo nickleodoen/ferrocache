@@ -9,6 +9,27 @@ pub struct FerrocacheConfig {
     pub node_id: Option<String>,
     pub wal_path: String,
     pub hnsw: HnswConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    pub gossip_addr: String,
+    pub seed_nodes: Vec<String>,
+    pub virtual_nodes: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gossip_addr: "0.0.0.0:4000".to_string(),
+            seed_nodes: Vec::new(),
+            virtual_nodes: 64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -28,6 +49,7 @@ impl Default for FerrocacheConfig {
             node_id: None,
             wal_path: "./ferrocache.wal".to_string(),
             hnsw: HnswConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -63,6 +85,13 @@ impl FerrocacheConfig {
                 "hnsw.default_threshold",
                 defaults.hnsw.default_threshold as f64,
             )?
+            .set_default("cluster.enabled", defaults.cluster.enabled)?
+            .set_default("cluster.gossip_addr", defaults.cluster.gossip_addr.clone())?
+            .set_default("cluster.seed_nodes", Vec::<String>::new())?
+            .set_default(
+                "cluster.virtual_nodes",
+                defaults.cluster.virtual_nodes as i64,
+            )?
             .add_source(File::with_name("ferrocache").required(false))
             .add_source(Environment::with_prefix("FERROCACHE").separator("__"))
             .build()
@@ -88,5 +117,9 @@ mod tests {
         assert_eq!(c.hnsw.ef_construction, 200);
         assert_eq!(c.hnsw.ef_search, 32);
         assert!((c.hnsw.default_threshold - 0.92).abs() < 1e-6);
+        assert!(!c.cluster.enabled);
+        assert_eq!(c.cluster.gossip_addr, "0.0.0.0:4000");
+        assert!(c.cluster.seed_nodes.is_empty());
+        assert_eq!(c.cluster.virtual_nodes, 64);
     }
 }

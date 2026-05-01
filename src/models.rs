@@ -56,3 +56,13 @@ pub struct StatsHnsw {
     pub ef_search: usize,
     pub dimension: Option<usize>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct ClusterStatusResponse {
+    pub mode: &'static str,
+    pub self_node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gossip_addr: Option<String>,
+    pub nodes: Vec<String>,
+    pub node_count: usize,
+}

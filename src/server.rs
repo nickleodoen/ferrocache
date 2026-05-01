@@ -9,8 +9,8 @@ use axum::{
 };
 
 use crate::models::{
-    ErrorResponse, HealthResponse, InsertRequest, InsertResponse, QueryRequest, QueryResponse,
-    StatsHnsw, StatsResponse,
+    ClusterStatusResponse, ErrorResponse, HealthResponse, InsertRequest, InsertResponse,
+    QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
 };
 use crate::state::AppState;
 use crate::wal::WalEntry;
@@ -24,6 +24,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/insert", post(insert_handler))
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
+        .route("/cluster/status", get(cluster_status_handler))
         .with_state(state)
 }
 
@@ -170,6 +171,29 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
     })
 }
 
+async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<ClusterStatusResponse> {
+    match &state.cluster {
+        Some(cluster) => {
+            let nodes = cluster.live_nodes().await;
+            let node_count = cluster.ring_node_count().await;
+            Json(ClusterStatusResponse {
+                mode: "clustered",
+                self_node_id: cluster.self_node_id().to_string(),
+                gossip_addr: Some(cluster.gossip_addr().to_string()),
+                nodes,
+                node_count,
+            })
+        }
+        None => Json(ClusterStatusResponse {
+            mode: "single",
+            self_node_id: state.node_id.clone(),
+            gossip_addr: None,
+            nodes: vec![state.node_id.clone()],
+            node_count: 1,
+        }),
+    }
+}
+
 async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
     let index = state.index.read().await;
     Json(StatsResponse {
@@ -206,6 +230,7 @@ mod tests {
             wal,
             wal_path.to_string_lossy().into_owned(),
             hnsw,
+            None,
         ))
     }
 
@@ -471,6 +496,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response.into_body()).await;
         assert!(body["error"].as_str().unwrap().contains("threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_cluster_status_single_mode() {
+        let (app, _, _dir) = test_app().await;
+        let response = app.oneshot(get("/cluster/status")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["mode"], "single");
+        assert_eq!(body["self_node_id"], "test-node");
+        assert_eq!(body["node_count"], 1);
+        let nodes = body["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0], "test-node");
     }
 
     #[tokio::test]

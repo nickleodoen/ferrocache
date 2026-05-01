@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
+use crate::cluster::ClusterState;
 use crate::config::HnswConfig;
 use crate::index::SemanticIndex;
 use crate::wal::Wal;
@@ -12,6 +13,7 @@ pub struct AppState {
     pub wal: Arc<Mutex<Wal>>,
     pub wal_path: String,
     pub hnsw_config: HnswConfig,
+    pub cluster: Option<Arc<ClusterState>>,
 }
 
 impl AppState {
@@ -21,6 +23,7 @@ impl AppState {
         wal: Wal,
         wal_path: String,
         hnsw_config: HnswConfig,
+        cluster: Option<Arc<ClusterState>>,
     ) -> Self {
         Self {
             node_id,
@@ -28,6 +31,7 @@ impl AppState {
             wal: Arc::new(Mutex::new(wal)),
             wal_path,
             hnsw_config,
+            cluster,
         }
     }
 }
