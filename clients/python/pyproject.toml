@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ferrocache"
+version = "0.1.0"
+description = "Python client, SDK middleware, and framework integrations for ferrocache — a distributed semantic cache for LLM applications"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Nikhil Yachareni", email = "nikhilram@gmail.com" },
+]
+keywords = ["cache", "llm", "semantic", "embeddings", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/nickleodoen/ferrocache"
+Repository = "https://github.com/nickleodoen/ferrocache"
+Documentation = "https://github.com/nickleodoen/ferrocache#readme"
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+anthropic = ["anthropic>=0.20.0"]
+langchain = ["langchain-core>=0.1.0"]
+llamaindex = ["llama-index-core>=0.10.0"]
+mcp = ["mcp>=1.0.0", "sentence-transformers>=2.2.0"]
+embeddings = ["sentence-transformers>=2.2.0"]
+all = [
+    "openai>=1.0.0",
+    "anthropic>=0.20.0",
+    "langchain-core>=0.1.0",
+    "llama-index-core>=0.10.0",
+    "mcp>=1.0.0",
+    "sentence-transformers>=2.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ferrocache*"]

@@ -1,0 +1,123 @@
+Metadata-Version: 2.4
+Name: ferrocache
+Version: 0.1.0
+Summary: Python client, SDK middleware, and framework integrations for ferrocache — a distributed semantic cache for LLM applications
+Author-email: Nikhil Yachareni <nikhilram@gmail.com>
+License: MIT
+Project-URL: Homepage, https://github.com/nickleodoen/ferrocache
+Project-URL: Repository, https://github.com/nickleodoen/ferrocache
+Project-URL: Documentation, https://github.com/nickleodoen/ferrocache#readme
+Keywords: cache,llm,semantic,embeddings,rag
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: openai
+Requires-Dist: openai>=1.0.0; extra == "openai"
+Provides-Extra: anthropic
+Requires-Dist: anthropic>=0.20.0; extra == "anthropic"
+Provides-Extra: langchain
+Requires-Dist: langchain-core>=0.1.0; extra == "langchain"
+Provides-Extra: llamaindex
+Requires-Dist: llama-index-core>=0.10.0; extra == "llamaindex"
+Provides-Extra: mcp
+Requires-Dist: mcp>=1.0.0; extra == "mcp"
+Requires-Dist: sentence-transformers>=2.2.0; extra == "mcp"
+Provides-Extra: embeddings
+Requires-Dist: sentence-transformers>=2.2.0; extra == "embeddings"
+Provides-Extra: all
+Requires-Dist: openai>=1.0.0; extra == "all"
+Requires-Dist: anthropic>=0.20.0; extra == "all"
+Requires-Dist: langchain-core>=0.1.0; extra == "all"
+Requires-Dist: llama-index-core>=0.10.0; extra == "all"
+Requires-Dist: mcp>=1.0.0; extra == "all"
+Requires-Dist: sentence-transformers>=2.2.0; extra == "all"
+Dynamic: license-file
+
+# ferrocache
+
+Python client, SDK middleware, and framework integrations for [ferrocache](https://github.com/nickleodoen/ferrocache) — a distributed semantic cache for LLM applications written in Rust.
+
+## Install
+
+```bash
+pip install ferrocache                    # base client (zero deps)
+pip install ferrocache[openai]            # + OpenAI middleware
+pip install ferrocache[anthropic]         # + Anthropic middleware
+pip install ferrocache[langchain]         # + LangChain cache backend
+pip install ferrocache[llamaindex]        # + LlamaIndex LLM wrapper
+pip install ferrocache[mcp]               # + MCP server for Claude Desktop
+pip install ferrocache[all]               # everything
+```
+
+## Quick start
+
+```python
+from ferrocache import FerrocacheClient
+
+client = FerrocacheClient("http://localhost:3000")
+client.insert(embedding=[0.1, 0.2, 0.3], response="cached answer", query_text="my query")
+hit = client.query(embedding=[0.1, 0.2, 0.3], threshold=0.92)
+```
+
+## SDK middleware (one-line integration)
+
+```python
+from openai import OpenAI
+from ferrocache.middleware import wrap_openai
+
+client = wrap_openai(OpenAI())  # all chat completions now check cache first
+```
+
+```python
+from anthropic import Anthropic
+from ferrocache.middleware import wrap_anthropic
+
+client = wrap_anthropic(Anthropic())
+```
+
+## Framework integration
+
+```python
+# LangChain
+from langchain.globals import set_llm_cache
+from ferrocache.langchain import FerrocacheCache
+set_llm_cache(FerrocacheCache())
+```
+
+```python
+# LlamaIndex
+from llama_index.llms.openai import OpenAI
+from ferrocache.llamaindex import FerrocacheLLM
+llm = FerrocacheLLM(inner=OpenAI(model="gpt-4o-mini"))
+```
+
+## MCP server (Claude Desktop / Claude Code)
+
+```bash
+pip install ferrocache[mcp]
+python3 -m ferrocache.mcp_server
+```
+
+Three tools — `semantic_cache_lookup`, `semantic_cache_store`, `cache_status` — accept text and embed locally before talking to the cache. See the [setup guide](https://github.com/nickleodoen/ferrocache/blob/main/docs/mcp-setup.md) for Claude Desktop / Claude Code config.
+
+## Configuration
+
+| Env var                  | Default                  | Used by                |
+|--------------------------|--------------------------|------------------------|
+| `FERROCACHE_URL`         | `http://localhost:3000`  | middleware, frameworks |
+| `FERROCACHE_THRESHOLD`   | `0.92`                   | middleware, frameworks |
+| `FERROCACHE_EMBED_MODEL` | `all-MiniLM-L6-v2`       | MCP server             |
+
+All wrappers default to `fail_open=True` — a cache outage falls through to the real call rather than crashing.
+
+See the [main repo](https://github.com/nickleodoen/ferrocache) for the Rust server, benchmarks, and full architecture docs.

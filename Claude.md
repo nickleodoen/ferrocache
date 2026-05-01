@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** Phase 3 in progress. M12 done (MCP server). Next: M13 — distribution (PyPI + Docker Hub).
+**Current phase:** All phases complete (M1–M13). Project is shipped.
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -19,6 +19,7 @@
 - M10: drop-in SDK middleware (`wrap_openai`, `wrap_anthropic`) with proxy attribute delegation, fail-open on cache outage, env-var config; restructured Python client into a package
 - M11: framework backends — `FerrocacheCache` (LangChain `BaseCache`) + `FerrocacheLLM` (LlamaIndex `CustomLLM` subclass); optional imports, fail-open default, custom `embed_fn` supported
 - M12: MCP server (`ferrocache.mcp_server`) over stdio — 3 tools (`semantic_cache_lookup`, `semantic_cache_store`, `cache_status`), text-in/JSON-out (embedding handled internally), Claude Desktop + Claude Code setup docs
+- M13: distribution — `pyproject.toml` with optional extras (`[openai]`, `[anthropic]`, `[langchain]`, `[llamaindex]`, `[mcp]`, `[all]`); base `pip install ferrocache` is zero-deps; root + Python LICENSE; release CI on `v*` tags publishes Docker image to GHCR and Python package to PyPI via OIDC trusted publishing
 
 **Module map:**
 - lib.rs — re-exports modules so benches and external consumers can import
@@ -60,6 +61,7 @@
 - `Wal::open` mkdir's parent dir so containers can mount an empty `/data` volume
 - Crate is library + binary (lib.rs re-exports modules); `cargo build --release --bin ferrocache` for prod images
 - Benchmarks via criterion; Python client uses only stdlib (urllib+json)
+- Python package on PyPI with optional extras; Docker image on GHCR; release CI on version tags
 
 **Non-negotiable constraints:**
 - No auth/TLS until Phase 3
@@ -74,27 +76,6 @@
 - Summarize deleted sessions as one-line entries under "Completed work" above
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
-
-### 2026-05-01 — Mission 11: LangChain + LlamaIndex backends
-**Built:** `clients/python/ferrocache/langchain.py` — `FerrocacheCache(BaseCache)` implementing the `lookup`/`update`/`clear` contract from `langchain_core.caches`. `lookup` embeds the prompt, queries ferrocache, returns `[Generation(text=...)]` on hit / `None` on miss. `update` embeds the prompt and inserts the cached `Generation[0].text`. `clear` is a logged no-op (ferrocache is append-only). `clients/python/ferrocache/llamaindex.py` — `FerrocacheLLM(CustomLLM)` using `pydantic.PrivateAttr` for inner-LLM and config state. Implements `complete`, `chat`, `stream_complete` (streaming bypasses the cache), and `metadata` (delegates to inner). Both backends gate `langchain_core` / `llama_index.core` imports behind a `try/except ImportError` so the modules load fine on machines without those frameworks; instantiating without the dep raises a clear `ImportError("Install ...")`. Both share the M10 `_resolve_url` / `_resolve_threshold` helpers and the lazy `default_embed_fn`. New tests: 7 `test_langchain.py` (hit, miss, update, lookup-fail-open, update-fail-open, clear noop, custom embed) + 5 `test_llamaindex.py` (complete-hit, complete-miss + insert, fail-open, custom embed, chat-hit). All 22 Python tests pass under `python3 -m unittest`. README gained a "Framework Integration" section with 2-line snippets for each. Examples added: `example_langchain.py` (uses `set_llm_cache`) and `example_llamaindex.py` (wraps `OpenAI(...)`). `__init__.py` *deliberately* does not auto-import these modules — frameworks remain optional deps.
-
-**Key decisions:**
-- LangChain side picked the official `BaseCache` interface — drops in via `set_llm_cache` and the user's chain just works.
-- LlamaIndex side subclasses `CustomLLM` rather than implementing a separate cache abstraction — LlamaIndex doesn't have a clean cache-protocol equivalent, and an LLM wrapper composes naturally with query engines, agents, etc.
-- LlamaIndex inner state stored via `PrivateAttr` to avoid pydantic's strict-field rules on the LLM base class — keeping it private also stops it from leaking into model serialization.
-- Streaming bypasses the cache (`stream_complete` delegates raw) — caching a stream means buffering the full response, which defeats streaming's whole point. Documented in the file.
-- Both backends import `_resolve_url` / `_resolve_threshold` from `middleware.py` rather than duplicating the env-var resolution logic — single source of truth.
-- Module-level imports of `langchain_core` / `llama_index.core` use `try/except` with a sentinel; `__init__` raises a clear ImportError if you instantiate without the dep. Skipping the framework module entirely also works (other ferrocache imports keep working).
-- Examples require real API keys — they're demos in `clients/python/`, not tests. Tests use `unittest.mock` exclusively.
-
-**Deviations:**
-- Brief sketched `FerrocacheLLM(OpenAI())` (positional inner). Used `FerrocacheLLM(inner=OpenAI(...))` keyword form instead — pydantic init behaves better and it's clearer at the call-site.
-- LlamaIndex's `ChatMessage.content` accessor varies by version (some releases make it a property that synthesizes from `blocks`); `_last_user_text` defensively handles both `str` and callable forms.
-- Detected `langchain_core 1.3.2` and `llama-index-core 0.14.21` in the local env. Public APIs match the brief's expectations; no shape surprises beyond `ChatMessage.content` accessor.
-
-**Next session (M12 if pursued):** MCP (Model Context Protocol) server exposing ferrocache as a tool to MCP clients (Claude Desktop, IDEs). Likely a thin Python `mcp` server that wraps the existing client.
-
-**Open:** No async backend versions yet (LangChain has `alookup`/`aupdate`; LlamaIndex has `acomplete`). Both currently fall back to LangChain's default-impl-runs-sync-in-executor behavior, which is fine for the cache-lookup hot path but adds an executor hop. Adding native async backends is a one-evening follow-up if needed.
 
 ### 2026-05-01 — Mission 12: MCP server (Claude Desktop / Claude Code)
 **Built:** `clients/python/ferrocache/mcp_server.py` — MCP server speaking JSON-RPC over stdio via the official `mcp` SDK (1.27.0 detected locally). Three tools registered: `semantic_cache_lookup` (text + optional threshold), `semantic_cache_store` (text + response), `cache_status` (no args). Tool dispatch lives in a standalone `FerrocacheTools` class with three async methods backed by `FerrocacheClient` + an `embed_fn`; the MCP `@server.list_tools()` and `@server.call_tool()` decorators are thin shims that translate to/from this class. Errors are caught and turned into `{"error": "..."}` dict payloads — the server never crashes on a bad tool call. Sync `FerrocacheClient` is wrapped in `asyncio.to_thread` to avoid blocking the event loop. Embedding is handled inside the MCP layer: tools accept text, the server lazily loads sentence-transformers (configurable via `FERROCACHE_EMBED_MODEL`) and produces a 384-dim vector. New `clients/python/mcp_requirements.txt` pinning `mcp>=1.0.0` + `sentence-transformers`. New `docs/mcp-setup.md` with copy-pasteable Claude Desktop JSON config (mac/win/linux paths) and Claude Code `claude mcp add` command. README gained an "MCP Server" section linking to the doc. New `tests/test_mcp_server.py`: 8 cases under `unittest.IsolatedAsyncioTestCase` covering hit, miss, store success, status, ferrocache-unreachable on lookup AND store, dispatch-of-unknown-tool, and tool-catalog shape. All 38 Python tests pass (10 middleware + 7 langchain + 5 llamaindex + 8 mcp + 8 catalog/dispatch). Smoke-tested: server starts via `python3 -m ferrocache.mcp_server`, loads sentence-transformers, waits on stdio cleanly.
@@ -115,3 +96,32 @@
 **Next session (M13 if pursued):** distribution polish — publish the Rust crate to crates.io, the Python client to PyPI (`pip install ferrocache`), the Docker image to Docker Hub. Includes `pyproject.toml`, GitHub Actions release workflow, and a CHANGELOG.
 
 **Open:** Streaming tool results are not used — every tool returns a single JSON blob (fine for cache lookups, less ideal for any future tool that fans out). No tests exercise the actual MCP transport (decorators + stdio_server) — relies on the SDK's tested behavior. Embedding model is downloaded on first launch (~80MB); subsequent runs use HF cache.
+
+### 2026-05-01 — Mission 13: Distribution (PyPI + GHCR + release CI)
+**Built:** `clients/python/pyproject.toml` (PEP 621) declaring `ferrocache 0.1.0` with the `setuptools.build_meta` backend, MIT license, Python 3.9-3.13 classifiers, `[project.urls]` pointing at the GitHub repo, and `[project.optional-dependencies]` with seven extras: `[openai]` `[anthropic]` `[langchain]` `[llamaindex]` `[mcp]` `[embeddings]` `[all]`. The base install has zero deps. `[tool.setuptools.packages.find]` picks up `ferrocache` and all submodules under `clients/python/`. PyPI-facing `clients/python/README.md` (concise — install matrix, quick start, framework + MCP snippets, env-var table). `MANIFEST.in` includes README + LICENSE. New MIT `LICENSE` at repo root and copy in `clients/python/`. New `.github/workflows/release.yml` triggered on `v*` tags, two jobs: `docker` (login to GHCR with `GITHUB_TOKEN`, build + push `ghcr.io/nickleodoen/ferrocache:<version>` and `:latest` via `docker/build-push-action@v5` + Buildx) and `pypi` (set up Python 3.12, `python -m build` in `clients/python/`, publish via `pypa/gh-action-pypi-publish` using OIDC trusted publishing — no API token committed; needs to be configured once on pypi.org). Updated root README's Quickstart to lead with `docker run ghcr.io/nickleodoen/ferrocache` and `pip install ferrocache`, plus a full installation matrix.
+
+**Verified:**
+- `python -m build` in `clients/python/` produces `ferrocache-0.1.0.tar.gz` + `ferrocache-0.1.0-py3-none-any.whl` containing all 7 modules (`__init__`, `client`, `_embed`, `middleware`, `langchain`, `llamaindex`, `mcp_server`) + LICENSE in `dist-info/licenses/`.
+- Fresh venv `pip install ferrocache-0.1.0-py3-none-any.whl` installs ferrocache + pip only (zero extra deps). All four base imports succeed: `from ferrocache import FerrocacheClient, FerrocacheError`, `from ferrocache.middleware import wrap_openai, wrap_anthropic`, `from ferrocache.langchain import FerrocacheCache`, `from ferrocache.llamaindex import FerrocacheLLM`.
+- Instantiating `FerrocacheCache()` / `FerrocacheLLM(inner=None)` without the optional dep raises the expected ImportErrors (`"... requires langchain-core. Install it with..."`).
+- `pip install ferrocache[mcp]` from the wheel pulls `mcp 1.27.0` + `sentence-transformers 5.4.1` and `from ferrocache.mcp_server import FerrocacheTools, TOOL_DEFINITIONS` works.
+- Existing test suites still pass: 40 Rust + 30 Python.
+- `release.yml` parses as valid YAML; jobs `docker` + `pypi` declared, `on.push.tags=['v*']` only.
+
+**Key decisions:**
+- Used `setuptools.build_meta` (the standard backend) — the brief's `setuptools.backends._legacy:_Backend` is not a real path; clearly a typo.
+- Base package has *zero* runtime deps — the stdlib HTTP client works on its own. Every framework SDK lives behind an extra. `pip install ferrocache` in CI for a project that only uses the HTTP client takes <1s.
+- PyPI publish via OIDC trusted publishing (no `PYPI_API_TOKEN` secret committed). One-time setup on pypi.org wires the GitHub repo + workflow as a trusted publisher; tokens then come from GitHub OIDC at runtime.
+- Docker tags both `<version>` and `latest` so users can pin or float — same `docker compose` config in this repo can target either.
+- License file lives at repo root AND in `clients/python/` — the wheel's `MANIFEST.in` only sees the latter, but the repo root one is canonical.
+- Did NOT push a tag this mission. Wheel/sdist verified locally; first real publish happens when `git tag v0.1.0 && git push --tags` runs the workflow.
+
+**Deviations:**
+- Brief's build-backend was wrong (`setuptools.backends._legacy:_Backend`); used `setuptools.build_meta`. Confirmed the wheel builds and installs.
+- Brief left author email as a placeholder; used the git-config email `nikhilram@gmail.com`. Likewise `Nikhil Yachareni` from `git config user.name`.
+- Added `docker/setup-buildx-action@v3` step to the release workflow — `docker/build-push-action@v5` runs faster and supports more cache options with Buildx enabled. Not strictly required but standard practice.
+- Skipped TestPyPI; the brief flagged it as optional. Local wheel install in a fresh venv covers the same failure modes.
+
+**Project shipped.** No M14 planned. Future polish (non-blocking): WAL compaction/snapshotting, /metrics endpoint (Prometheus), TLS+auth (Phase 3 constraint deferred), async OpenAI/Anthropic wrappers, native async LangChain/LlamaIndex backends (`alookup`, `acomplete`), node-failure resilience tests.
+
+**Open:** First real publish requires (a) configuring pypi.org trusted publishing for `nickleodoen/ferrocache`, (b) creating the `pypi` GitHub environment, (c) tagging `v0.1.0` and pushing. The Rust crate is *not* on crates.io yet — would need `cargo publish` and a `crates.io` token, which is a separate mission if pursued.

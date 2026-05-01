@@ -1,0 +1,16 @@
+LICENSE
+MANIFEST.in
+README.md
+pyproject.toml
+ferrocache/__init__.py
+ferrocache/_embed.py
+ferrocache/client.py
+ferrocache/langchain.py
+ferrocache/llamaindex.py
+ferrocache/mcp_server.py
+ferrocache/middleware.py
+ferrocache.egg-info/PKG-INFO
+ferrocache.egg-info/SOURCES.txt
+ferrocache.egg-info/dependency_links.txt
+ferrocache.egg-info/requires.txt
+ferrocache.egg-info/top_level.txt

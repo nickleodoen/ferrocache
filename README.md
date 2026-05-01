@@ -15,12 +15,23 @@ ferrocache stores `(embedding, response)` pairs and serves them by approximate-n
 
 ## Quickstart
 
-### Single node
+### Run the cache server
 
 ```bash
-cargo build --release
-./target/release/ferrocache &
+docker run -p 3000:3000 ghcr.io/nickleodoen/ferrocache:latest
+```
 
+Or build from source:
+
+```bash
+git clone https://github.com/nickleodoen/ferrocache && cd ferrocache
+cargo build --release
+./target/release/ferrocache
+```
+
+### Use it
+
+```bash
 # Insert
 curl -s -X POST http://localhost:3000/insert \
   -H 'Content-Type: application/json' \
@@ -31,8 +42,14 @@ curl -s -X POST http://localhost:3000/query \
   -H 'Content-Type: application/json' \
   -d '{"embedding":[1.0,0.0,0.0,0.0],"threshold":0.9}'
 # {"hit":true,"id":"...","response":"42","similarity":1.0}
+```
 
-curl -s http://localhost:3000/health
+### Install the Python client
+
+```bash
+pip install ferrocache              # zero deps
+pip install ferrocache[openai]      # + OpenAI middleware
+pip install ferrocache[all]         # everything (langchain, llamaindex, mcp, ...)
 ```
 
 ### 3-node cluster
@@ -45,6 +62,20 @@ docker compose down -v
 ```
 
 External ports `3001`/`3002`/`3003` map to the three nodes. An insert sent to any node is replicated to `replication_factor` owners along the ring; a query sent to any node is forwarded to the owning shard.
+
+## Installation
+
+| Method                | Command                                                      | What you get                       |
+|-----------------------|--------------------------------------------------------------|------------------------------------|
+| Docker                | `docker run -p 3000:3000 ghcr.io/nickleodoen/ferrocache`     | Rust cache server                  |
+| Cargo                 | `cargo build --release`                                      | Build from source                  |
+| pip (base)            | `pip install ferrocache`                                     | Python client (zero deps)          |
+| pip + OpenAI          | `pip install ferrocache[openai]`                             | + OpenAI middleware                |
+| pip + Anthropic       | `pip install ferrocache[anthropic]`                          | + Anthropic middleware             |
+| pip + LangChain       | `pip install ferrocache[langchain]`                          | + LangChain cache backend          |
+| pip + LlamaIndex      | `pip install ferrocache[llamaindex]`                         | + LlamaIndex wrapper               |
+| pip + MCP             | `pip install ferrocache[mcp]`                                | + Claude Desktop / Code MCP server |
+| pip + all             | `pip install ferrocache[all]`                                | Everything                         |
 
 ## API
 
