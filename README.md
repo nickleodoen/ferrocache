@@ -234,6 +234,36 @@ print(resp.content[0].text, resp._ferrocache_hit)
 
 Pass your own `embed_fn` (any `str -> list[float]`) to skip the sentence-transformers dependency. Cached responses include `_ferrocache_hit=True` and `_ferrocache_similarity=<score>`; misses set `_ferrocache_hit=False`; fail-open sets it to `None`.
 
+## Framework Integration
+
+### LangChain
+
+`FerrocacheCache` implements `langchain_core.caches.BaseCache`, so you enable it globally with one line:
+
+```python
+from langchain.globals import set_llm_cache
+from ferrocache.langchain import FerrocacheCache
+
+set_llm_cache(FerrocacheCache())
+```
+
+Every LLM call in your chain now consults ferrocache first. `clear()` is a no-op (ferrocache is append-only — drop the WAL to reset).
+
+### LlamaIndex
+
+`FerrocacheLLM` subclasses `CustomLLM`, so it can stand in anywhere a LlamaIndex LLM is expected — query engines, agents, retrievers — and consults ferrocache before delegating to the wrapped LLM:
+
+```python
+from llama_index.llms.openai import OpenAI
+from ferrocache.llamaindex import FerrocacheLLM
+
+llm = FerrocacheLLM(inner=OpenAI(model="gpt-4o-mini"))
+```
+
+Both backends accept `embed_fn`, `cache_url`, `threshold`, and `fail_open` kwargs (same semantics as the SDK middleware). Optional deps: `langchain-core` for the LangChain backend, `llama-index-core` for the LlamaIndex one — neither is auto-imported, so users who don't use a framework never need to install it.
+
+See `clients/python/example_langchain.py` and `example_llamaindex.py` for runnable demos.
+
 ## Development
 
 ```bash
