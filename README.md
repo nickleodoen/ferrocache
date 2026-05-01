@@ -188,6 +188,52 @@ print(hit["hit"], hit.get("response"))
 
 Run the demo: `python3 clients/python/example_usage.py` (after starting a node).
 
+## SDK Middleware
+
+Add semantic caching to an existing OpenAI or Anthropic script with one line. The wrapper proxies attribute access — only the chat-completion / message-creation method is intercepted; everything else passes through.
+
+### OpenAI
+
+```python
+from openai import OpenAI
+from ferrocache.middleware import wrap_openai
+
+client = wrap_openai(OpenAI())  # default: localhost:3000, threshold 0.92
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+)
+print(resp.choices[0].message.content, resp._ferrocache_hit)
+```
+
+### Anthropic
+
+```python
+from anthropic import Anthropic
+from ferrocache.middleware import wrap_anthropic
+
+client = wrap_anthropic(Anthropic())
+
+resp = client.messages.create(
+    model="claude-haiku-4-5",
+    max_tokens=512,
+    messages=[{"role": "user", "content": "Briefly: what is HNSW?"}],
+)
+print(resp.content[0].text, resp._ferrocache_hit)
+```
+
+### Configuration
+
+| Argument     | Default                       | Env var                  |
+|--------------|-------------------------------|--------------------------|
+| `cache_url`  | `http://localhost:3000`       | `FERROCACHE_URL`         |
+| `threshold`  | `0.92`                        | `FERROCACHE_THRESHOLD`   |
+| `embed_fn`   | `sentence-transformers` (`all-MiniLM-L6-v2`) | —         |
+| `fail_open`  | `True` — cache outage falls through to the real API | — |
+
+Pass your own `embed_fn` (any `str -> list[float]`) to skip the sentence-transformers dependency. Cached responses include `_ferrocache_hit=True` and `_ferrocache_similarity=<score>`; misses set `_ferrocache_hit=False`; fail-open sets it to `None`.
+
 ## Development
 
 ```bash

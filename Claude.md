@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** Phase 3 in progress. M9 done (simulation harness). Next: M10 — SDK middleware.
+**Current phase:** Phase 3 in progress. M10 done (SDK middleware). Next: M11 — LangChain + LlamaIndex backends.
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -16,6 +16,7 @@
 - M7: Dockerfile + docker-compose 3-node cluster + bash integration tests; fixed env-var `prefix_separator` config bug (latent since M4)
 - M8: README + Mermaid diagram, criterion benchmarks (real numbers), stdlib-only Python client, GitHub Actions CI (check + integration), library/binary split for bench imports
 - M9: simulation harness (`tests/simulate.py` + `simulate_no_ml.py`) — FAQ workload with sentence-transformers, 100% hit rate / 0 false positives at 0.90 threshold
+- M10: drop-in SDK middleware (`wrap_openai`, `wrap_anthropic`) with proxy attribute delegation, fail-open on cache outage, env-var config; restructured Python client into a package
 
 **Module map:**
 - lib.rs — re-exports modules so benches and external consumers can import
@@ -72,32 +73,6 @@
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
 
-### 2026-05-01 — Mission 8: README + benchmarks + Python client + CI
-**Built:** Restructured the crate as `lib.rs` (re-exports all modules) + `main.rs` so benches and the Python tooling can import internals. `benches/cache_bench.rs` (criterion) with 4 benches using deterministic LCG-generated 384-dim unit vectors: `insert_384d`, `query_hit_1k_384d`, `query_miss_1k_384d`, `insert_wal_fsync_384d`. Wrote a full README (~150 lines) with quickstart for single-node + 3-node Docker, API table, config table, Mermaid architecture diagram (request-flow with replicas), design decisions, real benchmark numbers, Python usage snippet, dev/CI commands. `clients/python/ferrocache.py` is a zero-dependency stdlib client (`urllib.request` + `json`) with `insert/query/health/stats/cluster_status` and a `FerrocacheError` exception. `clients/python/example_usage.py` demos a roundtrip — verified live against a running node (insert + exact-match query + cluster_status). `.github/workflows/ci.yml` has two jobs: `check` (fmt → check → test → clippy with rust-cache) and `integration` (depends on check; `docker compose up -d --build` → `sleep 10` → `cluster_integration.sh` → tear down with `if: always()`). Updated `.gitignore` (target, *.wal, __pycache__). Updated `Dockerfile` to also `COPY benches/` and use `--bin ferrocache` so the bench manifest validates without being built.
-
-**Key decisions:**
-- Lib + bin crate split — required so `benches/cache_bench.rs` can `use ferrocache::index::SemanticIndex` etc. Same modules, just exposed via `pub mod` in `lib.rs`. Zero behavior change.
-- Benchmarks use the production `replay_entry` path (since `insert` is `#[cfg(test)]`-gated). Gives realistic numbers.
-- Deterministic LCG-based vectors (no `rand` dep) — stable across runs and machines. Vectors are normalized so cosine distance is meaningful.
-- Python client deliberately stdlib-only — no `pip install` step before the example works. Type hints + `from __future__ import annotations` for 3.9+ compatibility.
-- README's Mermaid diagram uses `flowchart LR` with a subgraph for the cluster + dotted lines to distinguish primary writes from replica fans-out. Renders natively on GitHub.
-- CI runs `fmt --check` first (fastest fail signal), then `check`, then `test`, then `clippy`. The integration job only fires after `check` passes — saves Docker build minutes on a broken commit.
-- Dockerfile now `--bin ferrocache` so cargo doesn't try to validate / build benches in production images.
-
-**Benchmark results captured (Apple Silicon, release):**
-- `insert_384d` ~21.6 µs median (~46k ops/sec, in-memory only)
-- `query_hit_1k_384d` ~152 µs median
-- `query_miss_1k_384d` ~154 µs median
-- `insert_wal_fsync_384d` ~5.1 ms median (fsync-bound on APFS)
-
-**Deviations:**
-- Added `--bin ferrocache` to the Dockerfile build step (M7's `cargo build --release` started failing once `[[bench]]` was declared, because cargo eagerly validates target manifests).
-- Bench file uses `tokio::runtime::Builder::new_current_thread()` rather than spinning up a multi-threaded runtime per iter — single-threaded is enough for `Wal::append + fsync` and avoids spawning thread pools in the hot path.
-
-**Next session (Phase 3 / M9 if pursued):** node-failure resilience tests (kill a replica mid-write, expect 502), WAL compaction/snapshotting, /metrics endpoint (Prometheus or plain JSON counters), TLS+auth, full-text query mode (passing `query_text` through a separate exact-match index). All non-blocking.
-
-**Open:** Coordinator currently fans out to replicas serially — could parallelize with `futures::join_all` for tail latency. No retry on transient peer failures. Benchmarks don't cover concurrent load; criterion handles latency-per-op well but for throughput-under-load we'd want a separate harness (wrk, vegeta).
-
 ### 2026-05-01 — Mission 9: Local DX simulation harness
 **Built:** `tests/simulate.py` — realistic FAQ workload generator (15 hardcoded seed Q&A pairs, 3 programmatic semantic variations each, 10 unrelated queries). Uses `sentence-transformers` with `all-MiniLM-L6-v2` (384-dim) for local embedding — no API keys. Imports the existing `clients/python/ferrocache.py` client via `sys.path` insertion. Tracks insert / hit-query / miss-query / embedding latencies separately, reports p50/p99/mean per category, distinguishes "false misses" (variations rejected) from "false hits" (unrelated matched), and prints a banner-formatted summary. `tests/simulate_no_ml.py` — zero-dependency fallback using stdlib `random.gauss` for unit vectors when PyTorch can't be installed; same shape, latency-only. `tests/requirements.txt` pins only sentence-transformers. Updated `Makefile` with `simulate` (auto-installs deps), `simulate-no-ml`, `simulate-cluster` (points at port 3001). README gained a "Simulation" section between Benchmarks and Python client with a sample output block. **Live verification:** ML simulation against a release build hit 100% (45/45) at threshold 0.90, 10/10 unrelated correctly missed; ferrocache-only latency p50=0.9ms (hit), 1.0ms (miss), 5.0ms (insert+fsync).
 
@@ -115,3 +90,23 @@
 **Next session (M10 if pursued):** SDK middleware — drop-in OpenAI/Anthropic wrappers (`openai` and `anthropic` Python SDKs) that intercept calls, embed the prompt, query ferrocache, and only call the API on miss. Sketch: `from ferrocache.middleware import wrap_openai; client = wrap_openai(OpenAI(), cache_url="http://localhost:3000")`.
 
 **Open:** Simulation runs against a single endpoint — doesn't currently exercise cross-node routing as a *measurement* (it works, but we don't compare hit/miss latency split across nodes). Hardcoded English seed questions; multilingual workloads not covered.
+
+### 2026-05-01 — Mission 10: SDK middleware (OpenAI + Anthropic)
+**Built:** Restructured `clients/python/` from a single `ferrocache.py` into a package: `ferrocache/__init__.py` (re-exports `FerrocacheClient`, `FerrocacheError`), `ferrocache/client.py` (the existing HTTP client, unchanged), `ferrocache/_embed.py` (lazy sentence-transformers default, raises with a clear install hint), `ferrocache/middleware.py` (the new wrappers). `wrap_openai` and `wrap_anthropic` proxy attribute access — only `chat.completions.create` / `messages.create` are intercepted; everything else (`models.list`, `embeddings.create`, etc.) delegates to the real client via `__getattr__`. Coordinator logic factored into a single `_intercept` function shared by both providers via a `_ProviderHooks` adapter. Synthetic cached responses are `SimpleNamespace`-based and structurally compatible with each SDK (`response.choices[0].message.content` for OpenAI, `response.content[0].text` for Anthropic). Real-API responses get `_ferrocache_hit` set on them (with a fallback to `__dict__` for pydantic models that reject unknown attrs). Tests in `tests/test_middleware.py`: 10 unittest cases using `unittest.mock` — hit / miss / fail-open / passthrough for both providers, env-var resolution, explicit-kwarg override, custom embed_fn. All pass; `python3 -m unittest tests.test_middleware` shows 10 OK in 4ms. Existing scripts (`example_usage.py`, `simulate.py`, `simulate_no_ml.py`) work unchanged because the package directory has the same import name as the old single file. README gained an "SDK Middleware" section after Python client.
+
+**Key decisions:**
+- Proxy via `__getattr__` (not subclass) — lets us avoid touching the real SDK class hierarchy (which is pydantic-derived and unfriendly to inherit from). Only the methods we intercept have explicit wrapper classes.
+- Single `_intercept` function with `_ProviderHooks` (extract + build) instead of two parallel implementations — keeps both wrappers honest about behavior parity.
+- `_set_attr_safely` falls back to `obj.__dict__` for SDK responses that may be pydantic models (real `ChatCompletion` is — direct `setattr` may raise). Best-effort: never break the user's response.
+- `fail_open=True` is the default and the failure mode is explicit: log a warning, set `_ferrocache_hit=None`, return the real API response. Cache outage must NEVER break the application.
+- `default_embed_fn` is constructed lazily inside `wrap_*` (not at module import) so users with a custom `embed_fn` never need sentence-transformers installed.
+- `unittest.mock.patch("ferrocache.middleware.FerrocacheClient")` patches the symbol the middleware imports, not the real client module — standard pattern but worth noting for future test additions.
+
+**Deviations:**
+- Used stdlib `unittest` (with classes) rather than `pytest`-style assertion functions — runs under both `python3 -m unittest` and `python3 -m pytest`, and adds zero dev deps.
+- Brief mentioned `client.embeddings.create` as one of the passthrough cases; I tested `client.models.list` instead because it's simpler to mock and proves the same pattern.
+- The proxy classes set `self._real` in `__init__` (regular attribute) — `__getattr__` only fires when normal lookup misses, so `_real` access doesn't recurse. Worth flagging for anyone adding new hooks.
+
+**Next session (M11 if pursued):** LangChain `BaseChatModel` subclass + LlamaIndex `LLM` subclass that wrap the same caching path. Likely lives in `clients/python/ferrocache/langchain.py` and `ferrocache/llamaindex.py`, optional imports.
+
+**Open:** Wrappers are sync-only; OpenAI/Anthropic SDKs both ship async clients (`AsyncOpenAI`, `AsyncAnthropic`) that we don't cover yet. Streaming responses (`stream=True`) bypass the cache — they return immediately and the iterator isn't intercepted. Embedding happens on every call even on hits-likely paths; could short-circuit with a cheap exact-match check on `query_text` before paying for the embedding.
