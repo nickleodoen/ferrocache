@@ -1,1 +1,5 @@
 /target
+*.wal
+ferrocache.wal
+__pycache__/
+*.pyc

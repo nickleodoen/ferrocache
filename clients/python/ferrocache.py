@@ -1,0 +1,82 @@
+"""ferrocache — minimal Python client (stdlib only).
+
+Usage:
+    from ferrocache import FerrocacheClient
+
+    client = FerrocacheClient("http://localhost:3000")
+    result = client.insert(
+        embedding=[0.1, 0.2, 0.3, ...],
+        response="The answer is 42",
+        query_text="What is the meaning of life?",
+    )
+    print(result["id"])
+
+    hit = client.query(embedding=[0.1, 0.2, 0.3, ...], threshold=0.92)
+    if hit["hit"]:
+        print(hit["response"])
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from urllib import error, request
+
+DEFAULT_TIMEOUT = 10.0
+
+
+class FerrocacheError(RuntimeError):
+    """Raised on non-2xx responses or transport errors."""
+
+
+class FerrocacheClient:
+    def __init__(self, base_url: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def insert(
+        self,
+        embedding: list[float],
+        response: str,
+        query_text: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/insert",
+            {"embedding": embedding, "response": response, "query_text": query_text},
+        )
+
+    def query(self, embedding: list[float], threshold: float = 0.92) -> dict[str, Any]:
+        return self._post("/query", {"embedding": embedding, "threshold": threshold})
+
+    def health(self) -> dict[str, Any]:
+        return self._get("/health")
+
+    def stats(self) -> dict[str, Any]:
+        return self._get("/stats")
+
+    def cluster_status(self) -> dict[str, Any]:
+        return self._get("/cluster/status")
+
+    def _get(self, path: str) -> dict[str, Any]:
+        req = request.Request(self.base_url + path, method="GET")
+        return self._send(req)
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            self.base_url + path,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return self._send(req)
+
+    def _send(self, req: request.Request) -> dict[str, Any]:
+        try:
+            with request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise FerrocacheError(f"{e.code} {e.reason}: {body}") from e
+        except error.URLError as e:
+            raise FerrocacheError(f"transport error: {e.reason}") from e

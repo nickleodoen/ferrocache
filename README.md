@@ -1,1 +1,174 @@
 # ferrocache
+
+A distributed semantic caching layer for LLM applications, written in Rust.
+
+ferrocache stores `(embedding, response)` pairs and serves them by approximate-nearest-neighbour lookup, so a paraphrased prompt can hit a cached answer instead of paying for another model call. Unlike GPTCache, it's a single statically-linked binary with built-in clustering (consistent hashing + gossip + replication) and is embedding-model-agnostic — the client computes the embedding, ferrocache stores the float vector.
+
+## Features
+- Sub-200µs query latency on a 1k-entry index (HNSW, 384-dim vectors)
+- Multi-node clustering with consistent hashing and chitchat gossip discovery
+- Synchronous write replication with a configurable replication factor
+- WAL-based durability — entries survive restarts (NDJSON, fsync per insert)
+- Embedding-model-agnostic — works with OpenAI, Anthropic, local models, anything that emits float vectors
+- Single statically-linked binary, deployable as a sidecar
+- Configurable via TOML or environment variables (env wins)
+
+## Quickstart
+
+### Single node
+
+```bash
+cargo build --release
+./target/release/ferrocache &
+
+# Insert
+curl -s -X POST http://localhost:3000/insert \
+  -H 'Content-Type: application/json' \
+  -d '{"embedding":[1.0,0.0,0.0,0.0],"response":"42","query_text":"meaning of life"}'
+
+# Query
+curl -s -X POST http://localhost:3000/query \
+  -H 'Content-Type: application/json' \
+  -d '{"embedding":[1.0,0.0,0.0,0.0],"threshold":0.9}'
+# {"hit":true,"id":"...","response":"42","similarity":1.0}
+
+curl -s http://localhost:3000/health
+```
+
+### 3-node cluster
+
+```bash
+docker compose up -d --build
+sleep 5
+./tests/cluster_integration.sh   # 18 assertions over the live cluster
+docker compose down -v
+```
+
+External ports `3001`/`3002`/`3003` map to the three nodes. An insert sent to any node is replicated to `replication_factor` owners along the ring; a query sent to any node is forwarded to the owning shard.
+
+## API
+
+| Method | Path              | Description                                         |
+|--------|-------------------|-----------------------------------------------------|
+| POST   | `/insert`         | Insert `(embedding, response, query_text)`. Returns `{id, status}`. |
+| POST   | `/query`          | Lookup nearest neighbour. Returns `{hit, id?, response?, similarity?}`. |
+| GET    | `/health`         | `{status, node_id, entry_count}`                    |
+| GET    | `/stats`          | `{entry_count, wal_path, hnsw{...,dimension}}`      |
+| GET    | `/cluster/status` | `{mode, self_node_id, nodes, node_count, gossip_addr?}` |
+
+`POST /insert` and `POST /query` accept `?local=true` to skip ring routing — used by forwarded requests internally and useful for diagnostics.
+
+### Insert
+
+```json
+POST /insert
+{ "embedding": [0.1, 0.2, ...], "response": "the cached answer", "query_text": "the prompt" }
+→ 200 { "id": "<uuid>", "status": "ok" }
+```
+
+### Query
+
+```json
+POST /query
+{ "embedding": [0.1, 0.2, ...], "threshold": 0.92 }
+→ 200 { "hit": true, "id": "<uuid>", "response": "...", "similarity": 0.97 }
+→ 200 { "hit": false }
+```
+
+Errors return `400` for bad input, `502` when a peer is unreachable, `500` for local failures.
+
+## Configuration
+
+All keys default to single-node mode. Override via `ferrocache.toml` in the working directory or `FERROCACHE_*` env vars (env wins). Nested keys use `__` as a section separator; lists are comma-separated.
+
+| Key                           | Type         | Default              | Env var                                |
+|-------------------------------|--------------|----------------------|----------------------------------------|
+| `port`                        | u16          | `3000`               | `FERROCACHE_PORT`                      |
+| `node_id`                     | string?      | random UUID          | `FERROCACHE_NODE_ID`                   |
+| `wal_path`                    | string       | `./ferrocache.wal`   | `FERROCACHE_WAL_PATH`                  |
+| `hnsw.max_nb_connection`      | usize        | `16`                 | `FERROCACHE_HNSW__MAX_NB_CONNECTION`   |
+| `hnsw.max_elements`           | usize        | `100000`             | `FERROCACHE_HNSW__MAX_ELEMENTS`        |
+| `hnsw.ef_construction`        | usize        | `200`                | `FERROCACHE_HNSW__EF_CONSTRUCTION`     |
+| `hnsw.ef_search`              | usize        | `32`                 | `FERROCACHE_HNSW__EF_SEARCH`           |
+| `hnsw.default_threshold`      | f32          | `0.92`               | `FERROCACHE_HNSW__DEFAULT_THRESHOLD`   |
+| `cluster.enabled`             | bool         | `false`              | `FERROCACHE_CLUSTER__ENABLED`          |
+| `cluster.gossip_addr`         | string       | `0.0.0.0:4000`       | `FERROCACHE_CLUSTER__GOSSIP_ADDR`      |
+| `cluster.api_addr`            | string       | `0.0.0.0:3000`       | `FERROCACHE_CLUSTER__API_ADDR`         |
+| `cluster.seed_nodes`          | list<string> | `[]`                 | `FERROCACHE_CLUSTER__SEED_NODES` (CSV) |
+| `cluster.virtual_nodes`       | usize        | `64`                 | `FERROCACHE_CLUSTER__VIRTUAL_NODES`    |
+| `cluster.replication_factor`  | usize        | `2`                  | `FERROCACHE_CLUSTER__REPLICATION_FACTOR` |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client["Client"] -->|"POST /query, /insert"| AnyNode["Any node"]
+    AnyNode -->|"FNV-1a(embedding[0..8]) → ring lookup"| Ring(("Hash Ring"))
+
+    subgraph cluster["3-node cluster (full mesh gossip)"]
+        N1["Node 1<br/>axum + HNSW + WAL"]
+        N2["Node 2<br/>axum + HNSW + WAL"]
+        N3["Node 3<br/>axum + HNSW + WAL"]
+        N1 <-->|"chitchat UDP"| N2
+        N2 <-->|"chitchat UDP"| N3
+        N1 <-->|"chitchat UDP"| N3
+    end
+
+    Ring -->|"query: forward to owner"| N2
+    Ring -->|"insert: fan out to N replicas"| N1
+    Ring -.->|"insert replica"| N3
+```
+
+**Request flow.** A client hits any node. `/query` is forwarded to whichever node owns `FNV-1a(embedding[0..8])` on the ring. `/insert` walks the ring clockwise from that position, picks `replication_factor` distinct physical nodes, and replicates synchronously — the coordinator stamps the UUID, writes to its own WAL+index if it's a replica, then forwards to each remaining replica with `?local=true` (loop prevention). Any replica failure → `502`.
+
+**Data plane.** Each node owns an in-memory `Hnsw<f32, DistCosine>` index plus a `HashMap<usize, CacheEntry>` side-table keyed by the HNSW internal id. The UUID lives inside the entry. WAL is newline-delimited JSON, fsync per insert; on startup, the WAL is replayed before the listener binds, so durable entries reuse their persisted UUIDs.
+
+**Control plane.** Cluster membership is gossiped via [chitchat](https://github.com/quickwit-oss/chitchat) (Quickwit's Scuttlebutt impl). Each node advertises its API address as a chitchat KV under `api_addr`. A 2-second background reconciler diffs `chitchat.live_nodes()` against the local ring, applies adds/removes, and refreshes the `node_id → api_addr` map.
+
+## Design decisions
+
+- **Why not a vector DB.** ferrocache is a *cache*, not a search system. Single-purpose, single binary, no schema, no indexes-per-collection — it sits next to your app like Redis.
+- **Why consistent hashing.** Adding/removing a node only remaps `1/N` of keys instead of every key. FNV-1a (not SipHash) so node positions are identical across processes — required for ring agreement without a coordinator.
+- **Why synchronous replication.** Cache writes are infrequent vs reads; durability simplicity > write throughput for this workload. Async replication would need anti-entropy and read-repair, which is a different project.
+- **Why Rust.** A cache in front of an LLM lives on the latency hot path. We want predictable tail latencies (no GC pauses) and a single static binary that drops onto any host.
+- **Why HNSW over IVF/PQ.** HNSW gives sub-millisecond recall at our scale (≤100k entries per node) without index training. IVF/PQ make sense above ~10M vectors, not here.
+
+## Benchmarks
+
+Measured on Apple Silicon via `cargo bench`. Numbers are wall-clock per operation, 384-dim unit vectors, 1k pre-populated entries where applicable.
+
+| Benchmark               | Latency (median) | Notes                                  |
+|-------------------------|------------------|----------------------------------------|
+| Index insert (384-dim)  | 21.6 µs          | Fresh index per iter, in-memory only   |
+| Query hit (1k entries)  | 152 µs           | HNSW ANN + side-table lookup           |
+| Query miss (1k entries) | 154 µs           | Same path, threshold rejects neighbour |
+| Insert + WAL fsync      | 5.1 ms           | fsync-per-insert dominates (APFS)      |
+
+Reproduce with `cargo bench`. HTML reports land in `target/criterion/`.
+
+## Python client
+
+A zero-dependency stdlib-only client lives in `clients/python/`.
+
+```python
+from ferrocache import FerrocacheClient
+
+client = FerrocacheClient("http://localhost:3000")
+client.insert(embedding=[1.0, 0.0, 0.0, 0.0], response="42", query_text="meaning")
+hit = client.query(embedding=[1.0, 0.0, 0.0, 0.0], threshold=0.9)
+print(hit["hit"], hit.get("response"))
+```
+
+Run the demo: `python3 clients/python/example_usage.py` (after starting a node).
+
+## Development
+
+```bash
+cargo test                        # unit tests (40)
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo bench                       # criterion benchmarks
+make cluster-test                 # docker compose + integration script
+```
+
+CI runs `check`/`test`/`clippy`/`fmt` plus the docker-compose cluster integration on every push (`.github/workflows/ci.yml`).

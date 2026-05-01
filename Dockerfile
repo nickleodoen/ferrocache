@@ -4,7 +4,8 @@ FROM rust:1.94-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release
+COPY benches/ benches/
+RUN cargo build --release --bin ferrocache
 
 FROM debian:bookworm-slim
 RUN apt-get update \

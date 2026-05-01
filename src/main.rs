@@ -3,22 +3,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
-mod cluster;
-mod config;
-mod index;
-mod models;
-mod ring;
-mod router;
-mod server;
-mod state;
-mod wal;
-
-use crate::cluster::ClusterState;
-use crate::config::FerrocacheConfig;
-use crate::index::SemanticIndex;
-use crate::router::ClusterRouter;
-use crate::state::AppState;
-use crate::wal::Wal;
+use ferrocache::cluster::ClusterState;
+use ferrocache::config::FerrocacheConfig;
+use ferrocache::index::SemanticIndex;
+use ferrocache::router::ClusterRouter;
+use ferrocache::server;
+use ferrocache::state::AppState;
+use ferrocache::wal::Wal;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
