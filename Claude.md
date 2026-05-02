@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** All phases complete (M1–M13). Project is shipped.
+**Current phase:** Phase 4 in progress. M14 done (namespaces). Next: M15 — WAL compaction.
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -62,9 +62,13 @@
 - Crate is library + binary (lib.rs re-exports modules); `cargo build --release --bin ferrocache` for prod images
 - Benchmarks via criterion; Python client uses only stdlib (urllib+json)
 - Python package on PyPI with optional extras; Docker image on GHCR; release CI on version tags
+- Index is namespace-partitioned by `model_id`; each namespace has its own HNSW instance + side-table
+- `model_id` is required on `/insert` and `/query`; old WAL entries without it default to `legacy::unknown`
+- `model_id` format convention: `model_name::dimension` (e.g. `all-MiniLM-L6-v2::384`)
+- Cross-namespace queries are impossible by construction — vectors from different models never compare
 
 **Non-negotiable constraints:**
-- No auth/TLS until Phase 3
+- No auth/TLS until Phase 5
 - No UI
 - No direct OpenAI/Anthropic API calls inside ferrocache
 - Use tokio, not async-std
@@ -76,26 +80,6 @@
 - Summarize deleted sessions as one-line entries under "Completed work" above
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
-
-### 2026-05-01 — Mission 12: MCP server (Claude Desktop / Claude Code)
-**Built:** `clients/python/ferrocache/mcp_server.py` — MCP server speaking JSON-RPC over stdio via the official `mcp` SDK (1.27.0 detected locally). Three tools registered: `semantic_cache_lookup` (text + optional threshold), `semantic_cache_store` (text + response), `cache_status` (no args). Tool dispatch lives in a standalone `FerrocacheTools` class with three async methods backed by `FerrocacheClient` + an `embed_fn`; the MCP `@server.list_tools()` and `@server.call_tool()` decorators are thin shims that translate to/from this class. Errors are caught and turned into `{"error": "..."}` dict payloads — the server never crashes on a bad tool call. Sync `FerrocacheClient` is wrapped in `asyncio.to_thread` to avoid blocking the event loop. Embedding is handled inside the MCP layer: tools accept text, the server lazily loads sentence-transformers (configurable via `FERROCACHE_EMBED_MODEL`) and produces a 384-dim vector. New `clients/python/mcp_requirements.txt` pinning `mcp>=1.0.0` + `sentence-transformers`. New `docs/mcp-setup.md` with copy-pasteable Claude Desktop JSON config (mac/win/linux paths) and Claude Code `claude mcp add` command. README gained an "MCP Server" section linking to the doc. New `tests/test_mcp_server.py`: 8 cases under `unittest.IsolatedAsyncioTestCase` covering hit, miss, store success, status, ferrocache-unreachable on lookup AND store, dispatch-of-unknown-tool, and tool-catalog shape. All 38 Python tests pass (10 middleware + 7 langchain + 5 llamaindex + 8 mcp + 8 catalog/dispatch). Smoke-tested: server starts via `python3 -m ferrocache.mcp_server`, loads sentence-transformers, waits on stdio cleanly.
-
-**Key decisions:**
-- Tool dispatch extracted into `FerrocacheTools` so unit tests can hit the methods directly without a JSON-RPC harness — the MCP decorators are a 5-line shim around it.
-- `asyncio.to_thread` for the sync client calls — small overhead, keeps the event loop responsive if multiple tool calls arrive concurrently.
-- Errors return `{"error": "..."}` rather than raising — MCP clients (and Claude) handle structured error payloads gracefully, but a server crash kills the conversation.
-- Embedding model loaded once at startup (inside `_build_tools_from_env`); subsequent tool calls reuse it. First-call cold start is the model-load time only.
-- `mcp_server.py` is *not* auto-imported in `__init__.py` — the `mcp` SDK stays optional. Other ferrocache imports work fine without it.
-- Tool descriptions are written for an LLM reader: when to use, what comes back, when to call which one. Lookup explicitly says "BEFORE expensive call", store says "AFTER".
-
-**Deviations:**
-- Brief sketched the SDK as `from mcp.server import Server`; the actual class lives at `mcp.server.lowlevel.server.Server` but `mcp.server.Server` re-exports it. Used the public path.
-- Added an 8th test (`test_dispatch_unknown_tool`) on top of the brief's 7 — unknown tool names return a clean error rather than 500ing the server, worth covering.
-- The brief's `mcp_requirements.txt` pin of `mcp>=1.0.0` works fine; locally it resolved to 1.27.0.
-
-**Next session (M13 if pursued):** distribution polish — publish the Rust crate to crates.io, the Python client to PyPI (`pip install ferrocache`), the Docker image to Docker Hub. Includes `pyproject.toml`, GitHub Actions release workflow, and a CHANGELOG.
-
-**Open:** Streaming tool results are not used — every tool returns a single JSON blob (fine for cache lookups, less ideal for any future tool that fans out). No tests exercise the actual MCP transport (decorators + stdio_server) — relies on the SDK's tested behavior. Embedding model is downloaded on first launch (~80MB); subsequent runs use HF cache.
 
 ### 2026-05-01 — Mission 13: Distribution (PyPI + GHCR + release CI)
 **Built:** `clients/python/pyproject.toml` (PEP 621) declaring `ferrocache 0.1.0` with the `setuptools.build_meta` backend, MIT license, Python 3.9-3.13 classifiers, `[project.urls]` pointing at the GitHub repo, and `[project.optional-dependencies]` with seven extras: `[openai]` `[anthropic]` `[langchain]` `[llamaindex]` `[mcp]` `[embeddings]` `[all]`. The base install has zero deps. `[tool.setuptools.packages.find]` picks up `ferrocache` and all submodules under `clients/python/`. PyPI-facing `clients/python/README.md` (concise — install matrix, quick start, framework + MCP snippets, env-var table). `MANIFEST.in` includes README + LICENSE. New MIT `LICENSE` at repo root and copy in `clients/python/`. New `.github/workflows/release.yml` triggered on `v*` tags, two jobs: `docker` (login to GHCR with `GITHUB_TOKEN`, build + push `ghcr.io/nickleodoen/ferrocache:<version>` and `:latest` via `docker/build-push-action@v5` + Buildx) and `pypi` (set up Python 3.12, `python -m build` in `clients/python/`, publish via `pypa/gh-action-pypi-publish` using OIDC trusted publishing — no API token committed; needs to be configured once on pypi.org). Updated root README's Quickstart to lead with `docker run ghcr.io/nickleodoen/ferrocache` and `pip install ferrocache`, plus a full installation matrix.
@@ -125,3 +109,36 @@
 **Project shipped.** No M14 planned. Future polish (non-blocking): WAL compaction/snapshotting, /metrics endpoint (Prometheus), TLS+auth (Phase 3 constraint deferred), async OpenAI/Anthropic wrappers, native async LangChain/LlamaIndex backends (`alookup`, `acomplete`), node-failure resilience tests.
 
 **Open:** First real publish requires (a) configuring pypi.org trusted publishing for `nickleodoen/ferrocache`, (b) creating the `pypi` GitHub environment, (c) tagging `v0.1.0` and pushing. The Rust crate is *not* on crates.io yet — would need `cargo publish` and a `crates.io` token, which is a separate mission if pursued.
+
+### 2026-05-01 — Mission 14: Embedding Namespaces + Default Embed Model
+**Built (Rust):** Refactored `SemanticIndex` from a single HNSW into `HashMap<String, NamespacedIndex>` keyed by `model_id`. Each namespace owns its own `Hnsw<f32, DistCosine>`, side-table `HashMap<usize, CacheEntry>`, `next_id` counter, and dimension lock. `NamespacedIndex` is the M13-era index in miniature; `SemanticIndex` is now a thin lazy-init dispatcher with `namespaces`, `hnsw_config`, `namespace_mut(model_id)` (or-insert-with), `replay_entry`, `query(emb, threshold, model_id)` (returns `Ok(None)` for unknown namespace — miss, not error), `entry_count()` (sum), `namespace_stats() -> HashMap<String, NamespaceStats>`, and a backward-compat `dimension()`. `WalEntry` gained `model_id: String` with `#[serde(default = "legacy_namespace")]` returning the new public constant `LEGACY_NAMESPACE = "legacy::unknown"`; pre-M14 lines without the field are silently quarantined into that namespace on replay. Wire protocol: `InsertRequest` and `QueryRequest` carry an `Option<String>` `model_id` — modeled as Option so the server returns a clean 400 (`"model_id is required"`) instead of a serde rejection. `validate_model_id` helper on the inbound path; `local_insert_inner` constructs the `WalEntry` with the supplied id (and rejects empty/whitespace). `/stats` response gained a `namespaces: HashMap<String, NamespaceStatsEntry>` map (`{ entry_count, dimension }` per namespace). Removed the global "any-dim mismatch" pre-check from `local_insert_inner` — dimension is now enforced per-namespace by `NamespacedIndex` so different models can coexist with different dims. Updated all 4 criterion benches to pass `MODEL_ID = "bench-model::384"`. Updated `tests/cluster_integration.sh` to thread `"model_id": "test-model::4"` through every insert/query.
+
+**Built (Python):** `FerrocacheClient.insert(...)` adds a required `model_id`; `query(...)` adds a required `model_id` (raises `ValueError` if missing — clean client-side error before the HTTP roundtrip). New `_embed.get_default_embed(model_name) -> (embed_fn, model_id)` factory derives `model_id = f"{model_name}::{dim}"` from the loaded sentence-transformers model. `default_embed_fn` is now a thin wrapper over it. Shared `_resolve_embed_and_model_id(embed_fn, model_id)` lives in middleware.py and is reused by all three integration layers (middleware, langchain, llamaindex): both-None loads the default and returns both; embed_fn-without-model_id raises `ValueError("When providing a custom embed_fn, you must also provide model_id...")`; model_id-without-embed_fn loads the default embed but keeps the user's id. `wrap_openai`/`wrap_anthropic`/`FerrocacheCache`/`FerrocacheLLM` all gained an optional `model_id: str | None = None` parameter and thread it through every `query`/`insert` call. `FerrocacheTools` (MCP server) gained `model_id` (defaulting to `"all-MiniLM-L6-v2::384"`); `_build_tools_from_env` derives the real `model_id` from `get_default_embed(embed_model)`. Updated all 30 existing Python tests to thread `model_id`; added 3 new ones in `test_middleware.py::ModelIdTests`: `test_middleware_auto_model_id` (default path, both kwargs absent), `test_middleware_custom_embed_requires_model_id` (ValueError), `test_middleware_custom_embed_with_model_id` (happy path). Updated `simulate.py` to derive `model_id` from `model.get_sentence_embedding_dimension()`; `simulate_no_ml.py` uses `MODEL_ID = f"random::{DIM}"`. Bumped `pyproject.toml` to `version = "0.2.0"` to signal the breaking API change.
+
+**Verified:**
+- `cargo test` — 51/51 pass (was 40 before; +5 new index tests, +4 new server tests, +2 new wal tests).
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo fmt --check` — clean (one auto-fix of a long `let` line in wal.rs).
+- `python3 -m unittest discover tests -v` — 33/33 pass (30 updated + 3 new).
+- `python -m build` in `clients/python/` produces `ferrocache-0.2.0.tar.gz` + `ferrocache-0.2.0-py3-none-any.whl`. Fresh-venv install of the wheel, base import works, `client.query([1,2], 0.9)` raises `ValueError: model_id is required`.
+- WAL legacy migration test (`test_wal_legacy_migration`) confirms a hand-crafted pre-M14 line lacking `model_id` deserializes with `model_id = "legacy::unknown"`.
+
+**Key decisions:**
+- `Option<String>` on the request DTO (instead of `String` with serde rejection) so the server can return a *targeted* 400 rather than a generic deserialization failure. Better UX, easier client debugging.
+- The dimension lock moved entirely into `NamespacedIndex`; `SemanticIndex::dimension()` is kept as "first namespace's dim or None" purely for backward-compat with the StatsHnsw struct. The namespace map is the canonical source of truth for per-model dim.
+- Routing is unchanged — the consistent-hashing key is still derived from the embedding bytes, not `model_id`. Co-location of related vectors stays intact; namespacing handles isolation. Replicas naturally receive the same `model_id` because it's part of the forwarded request body.
+- Old WAL files are quarantined into `legacy::unknown`, never silently dropped or merged into a guessed namespace. Operators can grep `legacy::unknown` in `/stats` to find pre-M14 data.
+- Custom-embed-without-model_id is a hard error, not a default. Two production teams sharing a cache with different models was the original threat model — a default would re-introduce the bug we're fixing.
+- `_resolve_embed_and_model_id` lives in middleware.py and is imported lazily by langchain.py and llamaindex.py to keep the dependency direction one-way (no circular `from ferrocache.langchain import ...` in middleware.py).
+- MCP server exposes `model_id` as an instance attribute on `FerrocacheTools` (rather than as a per-call argument) — agents shouldn't pick the embedding model, the operator does at startup. Future: per-tool `model_id` for advanced setups.
+
+**Deviations:**
+- Brief asked for `validate_model_id` to *only* live at handler entry — also added a defensive check inside `process_query_locally` and `local_insert_inner` because the cluster path (`?local=true` from a peer) hits those same code paths and we don't want to depend on the caller having pre-validated.
+- Brief said "default to `"legacy::unknown"`" via a serde `default`. Implemented as `#[serde(default = "legacy_namespace")]` referencing a free function (not `default = "..."` literal — serde wants a function path). Same effect.
+- Brief listed the new server test as `test_insert_dimension_mismatch` — kept the original name `test_insert_dimension_mismatch_within_namespace` since the new semantics ("mismatch within a single namespace") differ from the old ("mismatch across the global index"). Status code is now 500 (the per-namespace dim check raises an `anyhow::Error` from `replay_entry`, which the server maps to 500), not 400 — added an explicit assertion. The brief's `validate_embedding`-side preflight is no longer correct because the dim is per-namespace.
+- Brief's "section 8" on benches and "section 9" on integration tests are minimal — they only need `model_id` threaded through. Done as specified.
+- Did not bump the Rust crate version in `Cargo.toml` (still 0.1.0). The Rust crate isn't published to crates.io yet (separate mission); only the Python package and Docker image are user-facing artifacts and the breaking API change is signaled by the Python `0.2.0` bump.
+
+**Next session (M15 if pursued):** WAL compaction / snapshotting — the WAL grows unbounded as inserts accumulate. A snapshot mechanism (write the live index state to disk on shutdown / SIGUSR1, replay snapshot + tail-WAL on startup) would cap startup time and disk use. Related: `/metrics` endpoint (Prometheus exposition format) for namespace counts, query latencies, replication failures.
+
+**Open:** Pre-existing WAL files written by a 0.1.0 server will replay correctly into the M14 server (entries land in `legacy::unknown`), but those entries are unreachable via the new HTTP API unless the user passes `model_id="legacy::unknown"` explicitly. Document this in a migration note before the v0.2.0 release. The `dimension` field on `StatsHnsw` is now misleading for multi-namespace deployments (returns one namespace's dim arbitrarily) — kept for backward compat, but `namespaces` is the canonical inspection point. No async-aware version of the per-namespace lock exists; the global `RwLock<SemanticIndex>` still serializes namespace-creation, which is fine at cache scale but could become contention if a single node hosts 10k+ namespaces. No `cargo bench` run was performed in this mission — namespace lookup adds a HashMap deref before HNSW search, expected overhead is sub-microsecond and below criterion's noise floor.

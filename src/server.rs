@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::models::{
     ClusterStatusResponse, ErrorResponse, HealthResponse, InsertRequest, InsertResponse,
-    QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
+    NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
 };
 use crate::state::AppState;
 use crate::wal::WalEntry;
@@ -47,6 +47,13 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response()
 }
 
+fn validate_model_id(model_id: Option<&str>) -> Result<&str, String> {
+    match model_id {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err("model_id is required".to_string()),
+    }
+}
+
 fn validate_embedding(embedding: &[f32]) -> Result<(), String> {
     if embedding.is_empty() {
         return Err("embedding must not be empty".to_string());
@@ -67,6 +74,9 @@ async fn query_handler(
     Json(req): Json<QueryRequest>,
 ) -> Response {
     if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if let Err(msg) = validate_model_id(req.model_id.as_deref()) {
         return bad_request(msg);
     }
     if !(0.0..=1.0).contains(&req.threshold) {
@@ -107,8 +117,12 @@ async fn forward_query(
 
 async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Response {
     let dim = req.embedding.len();
+    let model_id = match req.model_id.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return bad_request("model_id is required"),
+    };
     let index = state.index.read().await;
-    match index.query(&req.embedding, req.threshold) {
+    match index.query(&req.embedding, req.threshold, model_id) {
         Ok(Some(hit)) => {
             tracing::info!(hit = true, similarity = hit.similarity, dim, "query");
             (
@@ -151,6 +165,9 @@ async fn insert_handler(
     Json(req): Json<InsertRequest>,
 ) -> Response {
     if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if let Err(msg) = validate_model_id(req.model_id.as_deref()) {
         return bad_request(msg);
     }
     if req.response.len() > MAX_RESPONSE_BYTES {
@@ -228,15 +245,11 @@ async fn local_insert_inner(
     req: &InsertRequest,
 ) -> Result<String, Response> {
     let dim = req.embedding.len();
+    let model_id = match req.model_id.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return Err(bad_request("model_id is required")),
+    };
     let mut wal = state.wal.lock().await;
-
-    if let Some(existing) = state.index.read().await.dimension()
-        && existing != dim
-    {
-        return Err(bad_request(format!(
-            "dimension mismatch: expected {existing}, got {dim}"
-        )));
-    }
 
     let uuid = req
         .uuid
@@ -247,6 +260,7 @@ async fn local_insert_inner(
         embedding: req.embedding.clone(),
         response: req.response.clone(),
         query_text: req.query_text.clone(),
+        model_id,
     };
 
     if let Err(e) = wal.append(&entry).await {
@@ -309,6 +323,19 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
     let index = state.index.read().await;
+    let namespaces = index
+        .namespace_stats()
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                NamespaceStatsEntry {
+                    entry_count: v.entry_count,
+                    dimension: v.dimension,
+                },
+            )
+        })
+        .collect();
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
         wal_path: state.wal_path.clone(),
@@ -318,6 +345,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
             ef_search: state.hnsw_config.ef_search,
             dimension: index.dimension(),
         },
+        namespaces,
     })
 }
 
@@ -387,13 +415,16 @@ mod tests {
         assert_eq!(body["status"], "ok");
     }
 
+    const MID: &str = "test-model::3";
+
     #[tokio::test]
     async fn test_insert_returns_id() {
         let (app, _, _dir) = test_app().await;
         let payload = json!({
             "embedding": [0.1f32, 0.2, 0.3],
             "response": "hello",
-            "query_text": "hi"
+            "query_text": "hi",
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -408,7 +439,8 @@ mod tests {
         let (app, _, _dir) = test_app().await;
         let payload = json!({
             "embedding": [0.1f32, 0.2, 0.3],
-            "threshold": 0.9
+            "threshold": 0.9,
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/query", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -422,7 +454,8 @@ mod tests {
         let payload = json!({
             "embedding": [0.1f32, 0.2, 0.3],
             "response": "hello",
-            "query_text": "hi"
+            "query_text": "hi",
+            "model_id": MID
         });
         for _ in 0..2 {
             let response = app
@@ -444,7 +477,8 @@ mod tests {
         let insert_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "response": "the cached answer",
-            "query_text": "the question"
+            "query_text": "the question",
+            "model_id": MID
         });
         let response = app
             .clone()
@@ -454,7 +488,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let query_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
-            "threshold": 0.90
+            "threshold": 0.90,
+            "model_id": MID
         });
         let response = app
             .oneshot(post_json("/query", query_payload))
@@ -474,7 +509,8 @@ mod tests {
         let insert_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "response": "stored",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app
             .clone()
@@ -484,7 +520,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let query_payload = json!({
             "embedding": [0.0_f32, 0.0, 1.0],
-            "threshold": 0.99
+            "threshold": 0.99,
+            "model_id": MID
         });
         let response = app
             .oneshot(post_json("/query", query_payload))
@@ -496,12 +533,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_dimension_mismatch() {
+    async fn test_insert_dimension_mismatch_within_namespace() {
         let (app, _, _dir) = test_app().await;
         let first = json!({
             "embedding": [1.0_f32, 0.0],
             "response": "r",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": "m::2"
         });
         let response = app
             .clone()
@@ -512,10 +550,11 @@ mod tests {
         let second = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "response": "r",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": "m::2"
         });
         let response = app.oneshot(post_json("/insert", second)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(response.into_body()).await;
         assert!(
             body["error"]
@@ -536,7 +575,8 @@ mod tests {
             let payload = json!({
                 "embedding": [1.0_f32, 0.0, 0.0],
                 "response": "persisted answer",
-                "query_text": "persisted question"
+                "query_text": "persisted question",
+                "model_id": MID
             });
             let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -550,7 +590,7 @@ mod tests {
             fresh.replay_entry(entry).unwrap();
         }
         let hit = fresh
-            .query(&[1.0_f32, 0.0, 0.0], 0.90)
+            .query(&[1.0_f32, 0.0, 0.0], 0.90, MID)
             .unwrap()
             .expect("should hit after replay");
         assert_eq!(hit.response, "persisted answer");
@@ -562,7 +602,8 @@ mod tests {
         let payload = json!({
             "embedding": [],
             "response": "r",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -577,7 +618,8 @@ mod tests {
         let payload = json!({
             "embedding": big,
             "response": "r",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -592,7 +634,8 @@ mod tests {
         let payload = json!({
             "embedding": [0.1f32, 0.2, 0.3],
             "response": big_resp,
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -605,12 +648,97 @@ mod tests {
         let (app, _, _dir) = test_app().await;
         let payload = json!({
             "embedding": [0.1f32, 0.2, 0.3],
-            "threshold": 1.5
+            "threshold": 1.5,
+            "model_id": MID
         });
         let response = app.oneshot(post_json("/query", payload)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response.into_body()).await;
         assert!(body["error"].as_str().unwrap().contains("threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_insert_missing_model_id() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [0.1f32, 0.2, 0.3],
+            "response": "r",
+            "query_text": "q"
+        });
+        let response = app.oneshot(post_json("/insert", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("model_id"));
+    }
+
+    #[tokio::test]
+    async fn test_query_missing_model_id() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [0.1f32, 0.2, 0.3],
+            "threshold": 0.9
+        });
+        let response = app.oneshot(post_json("/query", payload)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("model_id"));
+    }
+
+    #[tokio::test]
+    async fn test_cross_namespace_isolation_http() {
+        let (app, _, _dir) = test_app().await;
+        let insert = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "model-A answer",
+            "query_text": "q",
+            "model_id": "model-A::3"
+        });
+        let response = app
+            .clone()
+            .oneshot(post_json("/insert", insert))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.90,
+            "model_id": "model-B::3"
+        });
+        let response = app.oneshot(post_json("/query", query)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["hit"], false);
+    }
+
+    #[tokio::test]
+    async fn test_stats_shows_namespaces() {
+        let (app, _, _dir) = test_app().await;
+        for (mid, vec) in [
+            ("model-A::3", json!([1.0_f32, 0.0, 0.0])),
+            ("model-B::4", json!([1.0_f32, 0.0, 0.0, 0.0])),
+        ] {
+            let insert = json!({
+                "embedding": vec,
+                "response": "r",
+                "query_text": "q",
+                "model_id": mid
+            });
+            let response = app
+                .clone()
+                .oneshot(post_json("/insert", insert))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = app.oneshot(get("/stats")).await.unwrap();
+        let body = body_json(response.into_body()).await;
+        let ns = body["namespaces"].as_object().unwrap();
+        assert!(ns.contains_key("model-A::3"));
+        assert!(ns.contains_key("model-B::4"));
+        assert_eq!(ns["model-A::3"]["entry_count"], 1);
+        assert_eq!(ns["model-A::3"]["dimension"], 3);
+        assert_eq!(ns["model-B::4"]["dimension"], 4);
     }
 
     #[tokio::test]
@@ -620,7 +748,8 @@ mod tests {
         let insert_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
             "response": "local-only",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app
             .clone()
@@ -631,7 +760,8 @@ mod tests {
 
         let query_payload = json!({
             "embedding": [1.0_f32, 0.0, 0.0],
-            "threshold": 0.9
+            "threshold": 0.9,
+            "model_id": MID
         });
         let response = app
             .oneshot(post_json("/query?local=true", query_payload))
@@ -649,7 +779,8 @@ mod tests {
         let payload = json!({
             "embedding": [0.5_f32, 0.5, 0.5],
             "response": "r",
-            "query_text": "q"
+            "query_text": "q",
+            "model_id": MID
         });
         let response = app
             .oneshot(post_json("/insert?local=true", payload))
@@ -668,6 +799,7 @@ mod tests {
             "embedding": [0.5_f32, 0.5, 0.5],
             "response": "r",
             "query_text": "q",
+            "model_id": MID,
             "uuid": "my-fixed-uuid"
         });
         let response = app
@@ -705,5 +837,7 @@ mod tests {
         assert_eq!(body["hnsw"]["ef_construction"], 200);
         assert_eq!(body["hnsw"]["ef_search"], 32);
         assert!(body["hnsw"]["dimension"].is_null());
+        assert!(body["namespaces"].is_object());
+        assert_eq!(body["namespaces"].as_object().unwrap().len(), 0);
     }
 }

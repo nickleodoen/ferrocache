@@ -39,14 +39,30 @@ class FerrocacheClient:
         embedding: list[float],
         response: str,
         query_text: str,
+        model_id: str,
     ) -> dict[str, Any]:
         return self._post(
             "/insert",
-            {"embedding": embedding, "response": response, "query_text": query_text},
+            {
+                "embedding": embedding,
+                "response": response,
+                "query_text": query_text,
+                "model_id": model_id,
+            },
         )
 
-    def query(self, embedding: list[float], threshold: float = 0.92) -> dict[str, Any]:
-        return self._post("/query", {"embedding": embedding, "threshold": threshold})
+    def query(
+        self,
+        embedding: list[float],
+        threshold: float = 0.92,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not model_id:
+            raise ValueError("model_id is required")
+        return self._post(
+            "/query",
+            {"embedding": embedding, "threshold": threshold, "model_id": model_id},
+        )
 
     def health(self) -> dict[str, Any]:
         return self._get("/health")

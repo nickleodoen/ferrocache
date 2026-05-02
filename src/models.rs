@@ -1,9 +1,16 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub embedding: Vec<f32>,
     pub threshold: f32,
+    /// Required since M14 — queries only search the namespace matching this
+    /// `model_id`. Modeled as `Option` so missing values produce a 400 error
+    /// rather than a serde rejection.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +29,9 @@ pub struct InsertRequest {
     pub embedding: Vec<f32>,
     pub response: String,
     pub query_text: String,
+    /// Required since M14 — namespace partition for the entry.
+    #[serde(default)]
+    pub model_id: Option<String>,
     /// When set on a `local=true` request, the receiving node uses this UUID
     /// instead of generating a new one. Used by the coordinator so all
     /// replicas store the same id.
@@ -52,6 +62,7 @@ pub struct StatsResponse {
     pub entry_count: u64,
     pub wal_path: String,
     pub hnsw: StatsHnsw,
+    pub namespaces: HashMap<String, NamespaceStatsEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +70,12 @@ pub struct StatsHnsw {
     pub max_nb_connection: usize,
     pub ef_construction: usize,
     pub ef_search: usize,
+    pub dimension: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NamespaceStatsEntry {
+    pub entry_count: usize,
     pub dimension: Option<usize>,
 }
 

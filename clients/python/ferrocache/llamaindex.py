@@ -69,6 +69,7 @@ if _HAS_LLAMAINDEX:
         _inner: Any = PrivateAttr()
         _client: FerrocacheClient = PrivateAttr()
         _embed_fn: Callable[[str], list[float]] = PrivateAttr()
+        _model_id: str = PrivateAttr()
         _threshold: float = PrivateAttr()
         _fail_open: bool = PrivateAttr()
 
@@ -78,23 +79,26 @@ if _HAS_LLAMAINDEX:
             embed_fn: Callable[[str], list[float]] | None = None,
             cache_url: str | None = None,
             threshold: float | None = None,
+            model_id: str | None = None,
             fail_open: bool = True,
             **pydantic_kwargs: Any,
         ) -> None:
             super().__init__(**pydantic_kwargs)
 
-            from ferrocache.middleware import _resolve_threshold, _resolve_url
+            from ferrocache.middleware import (
+                _resolve_embed_and_model_id,
+                _resolve_threshold,
+                _resolve_url,
+            )
 
             self._inner = inner
             self._client = FerrocacheClient(_resolve_url(cache_url))
             self._threshold = _resolve_threshold(threshold)
             self._fail_open = fail_open
 
-            if embed_fn is None:
-                from ferrocache._embed import default_embed_fn
-
-                embed_fn = default_embed_fn()
+            embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
             self._embed_fn = embed_fn
+            self._model_id = model_id
 
         @property
         def metadata(self) -> LLMMetadata:
@@ -113,7 +117,11 @@ if _HAS_LLAMAINDEX:
                 log.warning("embed_fn failed: %s", e)
                 return False, "", 0.0
             try:
-                r = self._client.query(embedding=embedding, threshold=self._threshold)
+                r = self._client.query(
+                    embedding=embedding,
+                    threshold=self._threshold,
+                    model_id=self._model_id,
+                )
             except FerrocacheError as e:
                 if not self._fail_open:
                     raise
@@ -126,7 +134,12 @@ if _HAS_LLAMAINDEX:
         def _store(self, prompt: str, text: str) -> None:
             try:
                 embedding = self._embed_fn(prompt)
-                self._client.insert(embedding=embedding, response=text, query_text=prompt)
+                self._client.insert(
+                    embedding=embedding,
+                    response=text,
+                    query_text=prompt,
+                    model_id=self._model_id,
+                )
             except (FerrocacheError, Exception) as e:
                 if not self._fail_open and isinstance(e, FerrocacheError):
                     raise

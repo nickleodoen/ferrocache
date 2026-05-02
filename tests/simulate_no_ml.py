@@ -28,6 +28,7 @@ from ferrocache import FerrocacheClient, FerrocacheError  # noqa: E402
 DIM = 384
 NUM_INSERTS = 50
 NUM_QUERIES = 100
+MODEL_ID = f"random::{DIM}"
 
 
 def random_unit_vector(rng: random.Random) -> list[float]:
@@ -81,7 +82,9 @@ def main() -> int:
     for i in range(args.inserts):
         vec = random_unit_vector(rng)
         t0 = time.perf_counter()
-        client.insert(embedding=vec, response=f"resp-{i}", query_text=f"q-{i}")
+        client.insert(
+            embedding=vec, response=f"resp-{i}", query_text=f"q-{i}", model_id=MODEL_ID
+        )
         insert_latencies.append((time.perf_counter() - t0) * 1000)
 
     print(f"Phase 2: running {args.queries} random queries...")
@@ -89,7 +92,7 @@ def main() -> int:
     for _ in range(args.queries):
         vec = random_unit_vector(rng)
         t0 = time.perf_counter()
-        result = client.query(embedding=vec, threshold=args.threshold)
+        result = client.query(embedding=vec, threshold=args.threshold, model_id=MODEL_ID)
         query_latencies.append((time.perf_counter() - t0) * 1000)
         if result.get("hit"):
             hits += 1

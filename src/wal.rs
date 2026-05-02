@@ -5,12 +5,22 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+pub const LEGACY_NAMESPACE: &str = "legacy::unknown";
+
+fn legacy_namespace() -> String {
+    LEGACY_NAMESPACE.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalEntry {
     pub uuid: String,
     pub embedding: Vec<f32>,
     pub response: String,
     pub query_text: String,
+    /// Namespace partition; entries from different `model_id`s never compare.
+    /// Old WAL entries lacking this field are migrated to `legacy::unknown`.
+    #[serde(default = "legacy_namespace")]
+    pub model_id: String,
 }
 
 pub struct Wal {
@@ -91,6 +101,7 @@ mod tests {
             embedding: vec![0.1, 0.2, 0.3],
             response: response.to_string(),
             query_text: format!("q-{uuid}"),
+            model_id: "test-model::3".to_string(),
         }
     }
 
@@ -144,6 +155,48 @@ mod tests {
         let path = dir.path().join("does-not-exist.wal");
         let entries = Wal::replay(&path).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wal_roundtrip_with_model_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        let mut a = sample("a", "ra");
+        a.model_id = "model-a::3".to_string();
+        let mut b = sample("b", "rb");
+        b.model_id = "model-b::3".to_string();
+        wal.append(&a).await.unwrap();
+        wal.append(&b).await.unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].model_id, "model-a::3");
+        assert_eq!(entries[1].model_id, "model-b::3");
+    }
+
+    #[tokio::test]
+    async fn test_wal_legacy_migration() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        // Manually craft a pre-M14 WAL line that lacks `model_id`.
+        let legacy_json =
+            r#"{"uuid":"old-1","embedding":[0.1,0.2,0.3],"response":"r","query_text":"q"}"#;
+        let mut f = File::create(&path).await.unwrap();
+        f.write_all(legacy_json.as_bytes()).await.unwrap();
+        f.write_all(b"\n").await.unwrap();
+        f.sync_data().await.unwrap();
+        drop(f);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, "old-1");
+        assert_eq!(entries[0].model_id, LEGACY_NAMESPACE);
     }
 
     #[tokio::test]

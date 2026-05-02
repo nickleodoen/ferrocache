@@ -113,6 +113,7 @@ mod tests {
                 &QueryRequest {
                     embedding: vec![1.0, 0.0],
                     threshold: 0.9,
+                    model_id: Some("test::2".into()),
                 },
             )
             .await
@@ -146,6 +147,7 @@ mod tests {
                     embedding: vec![1.0, 0.0],
                     response: "r".into(),
                     query_text: "q".into(),
+                    model_id: Some("test::2".into()),
                     uuid: Some("fixed-uuid".into()),
                 },
             )

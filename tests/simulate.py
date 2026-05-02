@@ -163,6 +163,8 @@ def main() -> int:
         return 1
 
     model = load_model(args.model)
+    dim = model.get_sentence_embedding_dimension()
+    model_id = f"{args.model}::{dim}"
 
     def embed(texts: list[str]) -> list[list[float]]:
         return [v.tolist() for v in model.encode(texts, show_progress_bar=False)]
@@ -181,7 +183,9 @@ def main() -> int:
 
     for (question, answer), vec in zip(SEED_QUESTIONS, seed_vecs, strict=True):
         t0 = time.perf_counter()
-        client.insert(embedding=vec, response=answer, query_text=question)
+        client.insert(
+            embedding=vec, response=answer, query_text=question, model_id=model_id
+        )
         insert_latencies.append((time.perf_counter() - t0) * 1000)
 
     # Phase 2 — expected-hit queries (variations of seeds)
@@ -199,7 +203,7 @@ def main() -> int:
         embed_latencies.append((time.perf_counter() - t0) * 1000)
 
         t0 = time.perf_counter()
-        result = client.query(embedding=vec, threshold=args.threshold)
+        result = client.query(embedding=vec, threshold=args.threshold, model_id=model_id)
         hit_query_latencies.append((time.perf_counter() - t0) * 1000)
 
         if result.get("hit"):
@@ -217,7 +221,7 @@ def main() -> int:
         embed_latencies.append((time.perf_counter() - t0) * 1000)
 
         t0 = time.perf_counter()
-        result = client.query(embedding=vec, threshold=args.threshold)
+        result = client.query(embedding=vec, threshold=args.threshold, model_id=model_id)
         miss_query_latencies.append((time.perf_counter() - t0) * 1000)
 
         if result.get("hit"):
@@ -231,7 +235,7 @@ def main() -> int:
     for variation, _ in sample:
         vec = embed([variation])[0]
         t0 = time.perf_counter()
-        client.query(embedding=vec, threshold=args.threshold)
+        client.query(embedding=vec, threshold=args.threshold, model_id=model_id)
         hit_query_latencies.append((time.perf_counter() - t0) * 1000)
 
     health = client.health()

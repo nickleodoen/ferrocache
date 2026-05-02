@@ -16,6 +16,9 @@ from ferrocache.client import FerrocacheError  # noqa: E402
 from ferrocache.middleware import wrap_anthropic, wrap_openai  # noqa: E402
 
 
+FAKE_MODEL_ID = "fake::4"
+
+
 def fake_embed(_: str) -> list[float]:
     return [0.1, 0.2, 0.3, 0.4]
 
@@ -77,7 +80,7 @@ class OpenAITests(unittest.TestCase):
             "similarity": 0.97,
         }
         real = fake_openai_client(fake_openai_response())
-        wrapped = wrap_openai(real, embed_fn=fake_embed, cache_url="http://x")
+        wrapped = wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID, cache_url="http://x")
 
         resp = wrapped.chat.completions.create(
             model="gpt-4o-mini",
@@ -95,7 +98,7 @@ class OpenAITests(unittest.TestCase):
         MockCache.return_value.query.return_value = {"hit": False}
         MockCache.return_value.insert.return_value = {"id": "new", "status": "ok"}
         real = fake_openai_client(fake_openai_response("real-api-output"))
-        wrapped = wrap_openai(real, embed_fn=fake_embed)
+        wrapped = wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
 
         resp = wrapped.chat.completions.create(
             model="gpt-4o-mini",
@@ -115,7 +118,7 @@ class OpenAITests(unittest.TestCase):
     def test_openai_fail_open(self, MockCache: MagicMock) -> None:
         MockCache.return_value.query.side_effect = FerrocacheError("connection refused")
         real = fake_openai_client(fake_openai_response("survived"))
-        wrapped = wrap_openai(real, embed_fn=fake_embed, fail_open=True)
+        wrapped = wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID, fail_open=True)
 
         resp = wrapped.chat.completions.create(
             model="gpt-4o-mini",
@@ -129,7 +132,7 @@ class OpenAITests(unittest.TestCase):
     @patch("ferrocache.middleware.FerrocacheClient")
     def test_openai_passthrough(self, MockCache: MagicMock) -> None:
         real = fake_openai_client(fake_openai_response())
-        wrapped = wrap_openai(real, embed_fn=fake_embed)
+        wrapped = wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
 
         result = wrapped.models.list()
         self.assertEqual(result, ["model-a", "model-b"])
@@ -151,7 +154,7 @@ class AnthropicTests(unittest.TestCase):
             "similarity": 0.94,
         }
         real = fake_anthropic_client(fake_anthropic_response())
-        wrapped = wrap_anthropic(real, embed_fn=fake_embed)
+        wrapped = wrap_anthropic(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
 
         resp = wrapped.messages.create(
             model="claude-haiku-4-5",
@@ -168,7 +171,7 @@ class AnthropicTests(unittest.TestCase):
     def test_anthropic_cache_miss(self, MockCache: MagicMock) -> None:
         MockCache.return_value.query.return_value = {"hit": False}
         real = fake_anthropic_client(fake_anthropic_response("anthropic real"))
-        wrapped = wrap_anthropic(real, embed_fn=fake_embed)
+        wrapped = wrap_anthropic(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
 
         resp = wrapped.messages.create(
             model="claude-haiku-4-5",
@@ -186,7 +189,7 @@ class AnthropicTests(unittest.TestCase):
     def test_anthropic_fail_open(self, MockCache: MagicMock) -> None:
         MockCache.return_value.query.side_effect = FerrocacheError("boom")
         real = fake_anthropic_client(fake_anthropic_response("served"))
-        wrapped = wrap_anthropic(real, embed_fn=fake_embed)
+        wrapped = wrap_anthropic(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
 
         resp = wrapped.messages.create(
             model="claude-haiku-4-5",
@@ -212,7 +215,7 @@ class ConfigTests(unittest.TestCase):
             clear=False,
         ):
             real = fake_openai_client(fake_openai_response())
-            wrap_openai(real, embed_fn=fake_embed)
+            wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
         MockCache.assert_called_with("http://env-host:9000")
         # threshold flows into the wrapper; verify by triggering a query
         MockCache.return_value.query.return_value = {"hit": False}
@@ -223,7 +226,7 @@ class ConfigTests(unittest.TestCase):
             clear=False,
         ):
             real = fake_openai_client(fake_openai_response())
-            wrapped = wrap_openai(real, embed_fn=fake_embed)
+            wrapped = wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
             wrapped.chat.completions.create(
                 model="m", messages=[{"role": "user", "content": "p"}]
             )
@@ -244,6 +247,7 @@ class ConfigTests(unittest.TestCase):
                 cache_url="http://explicit:1234",
                 threshold=0.88,
                 embed_fn=fake_embed,
+                model_id=FAKE_MODEL_ID,
             )
             wrapped.chat.completions.create(
                 model="m", messages=[{"role": "user", "content": "p"}]
@@ -263,7 +267,7 @@ class ConfigTests(unittest.TestCase):
             return [9.0, 8.0, 7.0]
 
         real = fake_openai_client(fake_openai_response())
-        wrapped = wrap_openai(real, embed_fn=my_embed)
+        wrapped = wrap_openai(real, embed_fn=my_embed, model_id="my-embed::3")
         wrapped.chat.completions.create(
             model="m", messages=[{"role": "user", "content": "the prompt"}]
         )
@@ -271,6 +275,51 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(captured, ["the prompt"])
         query_kwargs = MockCache.return_value.query.call_args.kwargs
         self.assertEqual(query_kwargs["embedding"], [9.0, 8.0, 7.0])
+        self.assertEqual(query_kwargs["model_id"], "my-embed::3")
+
+
+# ---------------------------------------------------------------------------
+# Namespace / model_id tests (M14)
+# ---------------------------------------------------------------------------
+
+
+class ModelIdTests(unittest.TestCase):
+    @patch("ferrocache.middleware.FerrocacheClient")
+    @patch("ferrocache._embed.get_default_embed")
+    def test_middleware_auto_model_id(
+        self, mock_get_default: MagicMock, MockCache: MagicMock
+    ) -> None:
+        """No embed_fn / model_id passed → defaults are loaded and threaded through."""
+        mock_get_default.return_value = (fake_embed, "all-MiniLM-L6-v2::384")
+        MockCache.return_value.query.return_value = {"hit": False}
+        real = fake_openai_client(fake_openai_response("api"))
+        wrapped = wrap_openai(real)
+        wrapped.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "p"}]
+        )
+
+        query_kwargs = MockCache.return_value.query.call_args.kwargs
+        self.assertEqual(query_kwargs["model_id"], "all-MiniLM-L6-v2::384")
+        insert_kwargs = MockCache.return_value.insert.call_args.kwargs
+        self.assertEqual(insert_kwargs["model_id"], "all-MiniLM-L6-v2::384")
+
+    @patch("ferrocache.middleware.FerrocacheClient")
+    def test_middleware_custom_embed_requires_model_id(self, _MockCache: MagicMock) -> None:
+        real = fake_openai_client(fake_openai_response())
+        with self.assertRaises(ValueError) as ctx:
+            wrap_openai(real, embed_fn=fake_embed)
+        self.assertIn("model_id", str(ctx.exception))
+
+    @patch("ferrocache.middleware.FerrocacheClient")
+    def test_middleware_custom_embed_with_model_id(self, MockCache: MagicMock) -> None:
+        MockCache.return_value.query.return_value = {"hit": False}
+        real = fake_openai_client(fake_openai_response())
+        wrapped = wrap_openai(real, embed_fn=fake_embed, model_id="custom::768")
+        wrapped.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "p"}]
+        )
+        query_kwargs = MockCache.return_value.query.call_args.kwargs
+        self.assertEqual(query_kwargs["model_id"], "custom::768")
 
 
 if __name__ == "__main__":

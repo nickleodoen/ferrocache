@@ -48,10 +48,12 @@ class FerrocacheTools:
         self,
         client: FerrocacheClient,
         embed_fn: Callable[[str], list[float]],
+        model_id: str = "all-MiniLM-L6-v2::384",
         default_threshold: float = DEFAULT_THRESHOLD,
     ) -> None:
         self.client = client
         self.embed_fn = embed_fn
+        self.model_id = model_id
         self.default_threshold = default_threshold
 
     async def lookup(self, query_text: str, threshold: float | None = None) -> dict[str, Any]:
@@ -65,7 +67,10 @@ class FerrocacheTools:
             return {"error": f"embedding failed: {e}"}
         try:
             result = await asyncio.to_thread(
-                self.client.query, embedding=embedding, threshold=t
+                self.client.query,
+                embedding=embedding,
+                threshold=t,
+                model_id=self.model_id,
             )
         except FerrocacheError as e:
             log.warning("ferrocache lookup failed: %s", e)
@@ -88,6 +93,7 @@ class FerrocacheTools:
                 embedding=embedding,
                 response=response,
                 query_text=query_text,
+                model_id=self.model_id,
             )
         except FerrocacheError as e:
             log.warning("ferrocache insert failed: %s", e)
@@ -200,11 +206,16 @@ def _build_tools_from_env() -> FerrocacheTools:
         threshold = DEFAULT_THRESHOLD
     embed_model = os.environ.get("FERROCACHE_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
-    from ferrocache._embed import default_embed_fn
+    from ferrocache._embed import get_default_embed
 
-    embed_fn = default_embed_fn(embed_model)
+    embed_fn, model_id = get_default_embed(embed_model)
     client = FerrocacheClient(url)
-    return FerrocacheTools(client=client, embed_fn=embed_fn, default_threshold=threshold)
+    return FerrocacheTools(
+        client=client,
+        embed_fn=embed_fn,
+        model_id=model_id,
+        default_threshold=threshold,
+    )
 
 
 async def _run_server() -> None:

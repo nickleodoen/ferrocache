@@ -21,6 +21,9 @@ from ferrocache.client import FerrocacheError  # noqa: E402
 from ferrocache.llamaindex import FerrocacheLLM  # noqa: E402
 
 
+FAKE_MODEL_ID = "fake::3"
+
+
 def fake_embed(_: str) -> list[float]:
     return [0.1, 0.2, 0.3]
 
@@ -41,7 +44,7 @@ class LlamaIndexLLMTests(unittest.TestCase):
             "similarity": 0.95,
         }
         inner = fake_inner_llm()
-        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed)
+        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
         resp = llm.complete("prompt")
         inner.complete.assert_not_called()
         self.assertEqual(resp.text, "cached output")
@@ -51,7 +54,7 @@ class LlamaIndexLLMTests(unittest.TestCase):
     def test_complete_cache_miss(self, MockCache: MagicMock) -> None:
         MockCache.return_value.query.return_value = {"hit": False}
         inner = fake_inner_llm("real answer")
-        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed)
+        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
         resp = llm.complete("prompt")
         inner.complete.assert_called_once()
         self.assertEqual(resp.text, "real answer")
@@ -65,7 +68,9 @@ class LlamaIndexLLMTests(unittest.TestCase):
     def test_fail_open(self, MockCache: MagicMock) -> None:
         MockCache.return_value.query.side_effect = FerrocacheError("down")
         inner = fake_inner_llm("survived")
-        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed, fail_open=True)
+        llm = FerrocacheLLM(
+            inner=inner, embed_fn=fake_embed, model_id=FAKE_MODEL_ID, fail_open=True
+        )
         resp = llm.complete("prompt")
         inner.complete.assert_called_once()
         self.assertEqual(resp.text, "survived")
@@ -80,7 +85,7 @@ class LlamaIndexLLMTests(unittest.TestCase):
             return [9.0, 8.0, 7.0]
 
         inner = fake_inner_llm()
-        llm = FerrocacheLLM(inner=inner, embed_fn=my_embed)
+        llm = FerrocacheLLM(inner=inner, embed_fn=my_embed, model_id="custom::3")
         llm.complete("the prompt")
         self.assertIn("the prompt", captured)
         # The first lookup call should use our custom embedding.
@@ -96,7 +101,7 @@ class LlamaIndexLLMTests(unittest.TestCase):
         }
         inner = fake_inner_llm()
         inner.chat = MagicMock()
-        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed)
+        llm = FerrocacheLLM(inner=inner, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
         resp = llm.chat([ChatMessage(role=MessageRole.USER, content="hi there")])
         inner.chat.assert_not_called()
         self.assertEqual(resp.message.content, "cached chat")

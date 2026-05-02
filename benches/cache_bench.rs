@@ -6,6 +6,7 @@ use ferrocache::index::SemanticIndex;
 use ferrocache::wal::{Wal, WalEntry};
 
 const DIM: usize = 384;
+const MODEL_ID: &str = "bench-model::384";
 
 /// Deterministic LCG-based pseudo-random unit vectors.
 fn vec_from_seed(seed: u64) -> Vec<f32> {
@@ -33,6 +34,7 @@ fn make_entry(seed: u64) -> WalEntry {
         embedding: vec_from_seed(seed),
         response: format!("response-{seed}"),
         query_text: format!("query-{seed}"),
+        model_id: MODEL_ID.to_string(),
     }
 }
 
@@ -68,7 +70,7 @@ fn bench_query_hit(c: &mut Criterion) {
     let probe = vec_from_seed(42);
     c.bench_function("query_hit_1k_384d", |b| {
         b.iter(|| {
-            let hit = idx.query(black_box(&probe), 0.90).unwrap();
+            let hit = idx.query(black_box(&probe), 0.90, MODEL_ID).unwrap();
             black_box(hit);
         });
     });
@@ -80,7 +82,7 @@ fn bench_query_miss(c: &mut Criterion) {
     let probe = vec_from_seed(999_999);
     c.bench_function("query_miss_1k_384d", |b| {
         b.iter(|| {
-            let res = idx.query(black_box(&probe), 0.999).unwrap();
+            let res = idx.query(black_box(&probe), 0.999, MODEL_ID).unwrap();
             black_box(res);
         });
     });

@@ -146,6 +146,7 @@ def _intercept(
     provider: _ProviderHooks,
     cache: FerrocacheClient,
     embed_fn: Callable[[str], list[float]],
+    model_id: str,
     threshold: float,
     fail_open: bool,
     kwargs: dict[str, Any],
@@ -162,10 +163,15 @@ def _intercept(
     if embedding is None:
         return real_call(**kwargs)
 
-    log.debug("ferrocache lookup: dim=%d, threshold=%s", len(embedding), threshold)
+    log.debug(
+        "ferrocache lookup: dim=%d, threshold=%s, model_id=%s",
+        len(embedding),
+        threshold,
+        model_id,
+    )
 
     try:
-        result = cache.query(embedding=embedding, threshold=threshold)
+        result = cache.query(embedding=embedding, threshold=threshold, model_id=model_id)
     except FerrocacheError as e:
         if not fail_open:
             raise
@@ -191,13 +197,45 @@ def _intercept(
         return resp
 
     try:
-        cache.insert(embedding=embedding, response=text, query_text=prompt)
+        cache.insert(
+            embedding=embedding,
+            response=text,
+            query_text=prompt,
+            model_id=model_id,
+        )
     except FerrocacheError as e:
         if not fail_open:
             raise
         log.warning("ferrocache insert failed: %s", e)
 
     return resp
+
+
+def _resolve_embed_and_model_id(
+    embed_fn: Callable[[str], list[float]] | None,
+    model_id: str | None,
+) -> tuple[Callable[[str], list[float]], str]:
+    """Embed-function + model_id resolution shared by all integrations.
+
+    - both None  → load the default sentence-transformers model + auto-derive model_id
+    - embed_fn given without model_id → ValueError (we won't guess)
+    - both given → use as-is
+    """
+    if embed_fn is None and model_id is None:
+        from ferrocache._embed import get_default_embed
+
+        return get_default_embed()
+    if embed_fn is not None and model_id is None:
+        raise ValueError(
+            "When providing a custom embed_fn, you must also provide model_id "
+            "(e.g. model_id='my-model::768'). Cross-model cache hits would otherwise "
+            "be silently incorrect."
+        )
+    if embed_fn is None and model_id is not None:
+        from ferrocache._embed import get_default_embed
+
+        embed_fn, _ = get_default_embed()
+    return embed_fn, model_id  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +256,14 @@ class _WrappedOpenAICompletions:
         real: Any,
         cache: FerrocacheClient,
         embed_fn: Callable[[str], list[float]],
+        model_id: str,
         threshold: float,
         fail_open: bool,
     ) -> None:
         self._real = real
         self._cache = cache
         self._embed_fn = embed_fn
+        self._model_id = model_id
         self._threshold = threshold
         self._fail_open = fail_open
 
@@ -233,6 +273,7 @@ class _WrappedOpenAICompletions:
             _openai_hooks,
             self._cache,
             self._embed_fn,
+            self._model_id,
             self._threshold,
             self._fail_open,
             kwargs,
@@ -257,6 +298,7 @@ class WrappedOpenAIClient:
         real: Any,
         cache: FerrocacheClient,
         embed_fn: Callable[[str], list[float]],
+        model_id: str,
         threshold: float,
         fail_open: bool,
     ) -> None:
@@ -265,6 +307,7 @@ class WrappedOpenAIClient:
             real.chat,
             cache=cache,
             embed_fn=embed_fn,
+            model_id=model_id,
             threshold=threshold,
             fail_open=fail_open,
         )
@@ -278,18 +321,17 @@ def wrap_openai(
     cache_url: str | None = None,
     threshold: float | None = None,
     embed_fn: Callable[[str], list[float]] | None = None,
+    model_id: str | None = None,
     fail_open: bool = True,
 ) -> WrappedOpenAIClient:
     """Wrap an `openai.OpenAI()` client so chat.completions.create checks ferrocache first."""
     cache = FerrocacheClient(_resolve_url(cache_url))
-    if embed_fn is None:
-        from ferrocache._embed import default_embed_fn
-
-        embed_fn = default_embed_fn()
+    embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
     return WrappedOpenAIClient(
         client,
         cache=cache,
         embed_fn=embed_fn,
+        model_id=model_id,
         threshold=_resolve_threshold(threshold),
         fail_open=fail_open,
     )
@@ -314,12 +356,14 @@ class _WrappedAnthropicMessages:
         real: Any,
         cache: FerrocacheClient,
         embed_fn: Callable[[str], list[float]],
+        model_id: str,
         threshold: float,
         fail_open: bool,
     ) -> None:
         self._real = real
         self._cache = cache
         self._embed_fn = embed_fn
+        self._model_id = model_id
         self._threshold = threshold
         self._fail_open = fail_open
 
@@ -329,6 +373,7 @@ class _WrappedAnthropicMessages:
             _anthropic_hooks,
             self._cache,
             self._embed_fn,
+            self._model_id,
             self._threshold,
             self._fail_open,
             kwargs,
@@ -344,6 +389,7 @@ class WrappedAnthropicClient:
         real: Any,
         cache: FerrocacheClient,
         embed_fn: Callable[[str], list[float]],
+        model_id: str,
         threshold: float,
         fail_open: bool,
     ) -> None:
@@ -352,6 +398,7 @@ class WrappedAnthropicClient:
             real.messages,
             cache=cache,
             embed_fn=embed_fn,
+            model_id=model_id,
             threshold=threshold,
             fail_open=fail_open,
         )
@@ -365,18 +412,17 @@ def wrap_anthropic(
     cache_url: str | None = None,
     threshold: float | None = None,
     embed_fn: Callable[[str], list[float]] | None = None,
+    model_id: str | None = None,
     fail_open: bool = True,
 ) -> WrappedAnthropicClient:
     """Wrap an `anthropic.Anthropic()` client so messages.create checks ferrocache first."""
     cache = FerrocacheClient(_resolve_url(cache_url))
-    if embed_fn is None:
-        from ferrocache._embed import default_embed_fn
-
-        embed_fn = default_embed_fn()
+    embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
     return WrappedAnthropicClient(
         client,
         cache=cache,
         embed_fn=embed_fn,
+        model_id=model_id,
         threshold=_resolve_threshold(threshold),
         fail_open=fail_open,
     )

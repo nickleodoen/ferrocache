@@ -53,22 +53,25 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
         embed_fn: Callable[[str], list[float]] | None = None,
         cache_url: str | None = None,
         threshold: float | None = None,
+        model_id: str | None = None,
         fail_open: bool = True,
     ) -> None:
         if not _HAS_LANGCHAIN:
             raise _missing_langchain()
 
-        from ferrocache.middleware import _resolve_threshold, _resolve_url
+        from ferrocache.middleware import (
+            _resolve_embed_and_model_id,
+            _resolve_threshold,
+            _resolve_url,
+        )
 
         self._client = FerrocacheClient(_resolve_url(cache_url))
         self._threshold = _resolve_threshold(threshold)
         self._fail_open = fail_open
 
-        if embed_fn is None:
-            from ferrocache._embed import default_embed_fn
-
-            embed_fn = default_embed_fn()
+        embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
         self._embed_fn = embed_fn
+        self._model_id = model_id
 
     def lookup(self, prompt: str, llm_string: str) -> Sequence[Generation] | None:
         try:
@@ -78,7 +81,11 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
             return None
 
         try:
-            result = self._client.query(embedding=embedding, threshold=self._threshold)
+            result = self._client.query(
+                embedding=embedding,
+                threshold=self._threshold,
+                model_id=self._model_id,
+            )
         except FerrocacheError as e:
             if not self._fail_open:
                 raise
@@ -115,7 +122,12 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
             return
 
         try:
-            self._client.insert(embedding=embedding, response=text, query_text=prompt)
+            self._client.insert(
+                embedding=embedding,
+                response=text,
+                query_text=prompt,
+                model_id=self._model_id,
+            )
         except FerrocacheError as e:
             if not self._fail_open:
                 raise

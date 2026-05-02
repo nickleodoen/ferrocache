@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: ferrocache
-Version: 0.1.0
+Version: 0.2.0
 Summary: Python client, SDK middleware, and framework integrations for ferrocache — a distributed semantic cache for LLM applications
 Author-email: Nikhil Yachareni <nikhilram@gmail.com>
 License: MIT

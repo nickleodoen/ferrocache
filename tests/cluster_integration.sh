@@ -45,12 +45,14 @@ for PORT in 3001 3002 3003; do
     assert_eq "node on port $PORT sees 3 nodes" "3" "$COUNT"
 done
 
+MODEL_ID="test-model::4"
+
 echo ""
 echo "=== Test 2: Insert on node1, query on all nodes ==="
 EMBEDDING='[1.0, 0.0, 0.0, 0.0]'
 INSERT_RESP=$(curl -s -X POST "$BASE1/insert" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING, \"response\": \"test-response-1\", \"query_text\": \"test query\"}")
+    -d "{\"embedding\": $EMBEDDING, \"response\": \"test-response-1\", \"query_text\": \"test query\", \"model_id\": \"$MODEL_ID\"}")
 UUID=$(echo "$INSERT_RESP" | jq -r '.id')
 STATUS=$(echo "$INSERT_RESP" | jq -r '.status')
 assert_eq "insert on node1 returns ok" "ok" "$STATUS"
@@ -59,7 +61,7 @@ echo "  UUID: $UUID"
 for PORT in 3001 3002 3003; do
     QUERY_RESP=$(curl -s -X POST "http://localhost:$PORT/query" \
         -H "Content-Type: application/json" \
-        -d "{\"embedding\": $EMBEDDING, \"threshold\": 0.90}")
+        -d "{\"embedding\": $EMBEDDING, \"threshold\": 0.90, \"model_id\": \"$MODEL_ID\"}")
     HIT=$(echo "$QUERY_RESP" | jq -r '.hit')
     RESP=$(echo "$QUERY_RESP" | jq -r '.response // empty')
     assert_eq "query on port $PORT returns hit" "true" "$HIT"
@@ -71,13 +73,13 @@ echo "=== Test 3: Insert on node2, query routes correctly from node3 ==="
 EMBEDDING2='[0.0, 1.0, 0.0, 0.0]'
 INSERT_RESP2=$(curl -s -X POST "$BASE2/insert" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING2, \"response\": \"test-response-2\", \"query_text\": \"second query\"}")
+    -d "{\"embedding\": $EMBEDDING2, \"response\": \"test-response-2\", \"query_text\": \"second query\", \"model_id\": \"$MODEL_ID\"}")
 STATUS2=$(echo "$INSERT_RESP2" | jq -r '.status')
 assert_eq "insert on node2 returns ok" "ok" "$STATUS2"
 
 QUERY_RESP2=$(curl -s -X POST "$BASE3/query" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING2, \"threshold\": 0.90}")
+    -d "{\"embedding\": $EMBEDDING2, \"threshold\": 0.90, \"model_id\": \"$MODEL_ID\"}")
 HIT2=$(echo "$QUERY_RESP2" | jq -r '.hit')
 RESP2=$(echo "$QUERY_RESP2" | jq -r '.response // empty')
 assert_eq "query on node3 for embedding2 returns hit" "true" "$HIT2"
@@ -95,16 +97,16 @@ echo "=== Test 5: local=true scopes the operation ==="
 EMBEDDING3='[0.0, 0.0, 1.0, 0.0]'
 curl -s -X POST "$BASE1/insert?local=true" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING3, \"response\": \"local-only\", \"query_text\": \"local test\"}" > /dev/null
+    -d "{\"embedding\": $EMBEDDING3, \"response\": \"local-only\", \"query_text\": \"local test\", \"model_id\": \"$MODEL_ID\"}" > /dev/null
 
 LOCAL_HIT=$(curl -s -X POST "$BASE1/query?local=true" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING3, \"threshold\": 0.90}" | jq -r '.hit')
+    -d "{\"embedding\": $EMBEDDING3, \"threshold\": 0.90, \"model_id\": \"$MODEL_ID\"}" | jq -r '.hit')
 assert_eq "local query on node1 hits" "true" "$LOCAL_HIT"
 
 LOCAL_MISS=$(curl -s -X POST "$BASE2/query?local=true" \
     -H "Content-Type: application/json" \
-    -d "{\"embedding\": $EMBEDDING3, \"threshold\": 0.90}" | jq -r '.hit')
+    -d "{\"embedding\": $EMBEDDING3, \"threshold\": 0.90, \"model_id\": \"$MODEL_ID\"}" | jq -r '.hit')
 assert_eq "local query on node2 misses (not replicated)" "false" "$LOCAL_MISS"
 
 echo ""
