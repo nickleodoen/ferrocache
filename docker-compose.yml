@@ -12,6 +12,7 @@ services:
       FERROCACHE_CLUSTER__SEED_NODES: "node2:4000,node3:4000"
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
       RUST_LOG: "info"
     ports:
       - "3001:3000"
@@ -33,6 +34,7 @@ services:
       FERROCACHE_CLUSTER__SEED_NODES: "node1:4000,node3:4000"
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
       RUST_LOG: "info"
     ports:
       - "3002:3000"
@@ -54,6 +56,7 @@ services:
       FERROCACHE_CLUSTER__SEED_NODES: "node1:4000,node2:4000"
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
+      # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
       RUST_LOG: "info"
     ports:
       - "3003:3000"

@@ -216,7 +216,7 @@ class ConfigTests(unittest.TestCase):
         ):
             real = fake_openai_client(fake_openai_response())
             wrap_openai(real, embed_fn=fake_embed, model_id=FAKE_MODEL_ID)
-        MockCache.assert_called_with("http://env-host:9000")
+        MockCache.assert_called_with("http://env-host:9000", auth_token=None)
         # threshold flows into the wrapper; verify by triggering a query
         MockCache.return_value.query.return_value = {"hit": False}
 
@@ -253,7 +253,7 @@ class ConfigTests(unittest.TestCase):
                 model="m", messages=[{"role": "user", "content": "p"}]
             )
 
-        MockCache.assert_called_with("http://explicit:1234")
+        MockCache.assert_called_with("http://explicit:1234", auth_token=None)
         query_kwargs = MockCache.return_value.query.call_args.kwargs
         self.assertAlmostEqual(query_kwargs["threshold"], 0.88)
 

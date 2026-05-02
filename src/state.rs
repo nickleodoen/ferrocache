@@ -24,6 +24,9 @@ pub struct AppState {
     pub compact_interval_inserts: u64,
     pub inserts_since_compact: AtomicU64,
     pub metrics: Arc<Metrics>,
+    /// Bearer token for the `/query`, `/insert`, `/stats`, `/cluster/status`,
+    /// and `/admin/compact` routes. `None` disables auth entirely.
+    pub auth_token: Option<String>,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
         router: Option<Arc<ClusterRouter>>,
         replication_factor: usize,
         compact_interval_inserts: u64,
+        auth_token: Option<String>,
     ) -> Self {
         Self {
             node_id,
@@ -53,6 +57,7 @@ impl AppState {
             compact_interval_inserts,
             inserts_since_compact: AtomicU64::new(0),
             metrics: Arc::new(Metrics::new()),
+            auth_token,
         }
     }
 }

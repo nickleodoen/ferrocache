@@ -21,7 +21,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = FerrocacheConfig::load().context("config load failed")?;
-    tracing::info!(?config, "loaded config");
+    // Avoid `?config` here so the auth_token never lands in logs via Debug.
+    tracing::info!(
+        port = config.port,
+        wal_path = %config.wal_path,
+        cluster_enabled = config.cluster.enabled,
+        compact_interval_inserts = config.compact_interval_inserts,
+        "loaded config"
+    );
+    let auth_enabled = config.auth_token.as_ref().is_some_and(|t| !t.is_empty());
+    if auth_enabled {
+        tracing::info!("bearer token auth enabled");
+    } else {
+        tracing::info!("bearer token auth disabled (FERROCACHE_AUTH_TOKEN not set)");
+    }
 
     let node_id = config
         .node_id
@@ -101,7 +114,10 @@ async fn main() -> anyhow::Result<()> {
             replication_factor = config.cluster.replication_factor,
             "cluster enabled"
         );
-        (Some(Arc::new(cs)), Some(Arc::new(ClusterRouter::new())))
+        (
+            Some(Arc::new(cs)),
+            Some(Arc::new(ClusterRouter::new(config.auth_token.clone()))),
+        )
     } else {
         tracing::info!("cluster disabled — running in single-node mode");
         (None, None)
@@ -119,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         router,
         config.cluster.replication_factor.max(1),
         config.compact_interval_inserts,
+        config.auth_token.clone(),
     ));
     let app = server::build_router(state.clone());
 

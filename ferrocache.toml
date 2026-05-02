@@ -5,6 +5,10 @@
 # node_id = "my-node-1"    # auto-generated UUID if omitted
 # wal_path = "./ferrocache.wal"
 
+# Bearer token auth (M17). Unset/empty disables auth (default).
+# Prefer setting via env: FERROCACHE_AUTH_TOKEN=...
+# auth_token = "my-secret-token"
+
 # [hnsw]
 # max_nb_connection = 16
 # max_elements = 100_000

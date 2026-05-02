@@ -81,6 +81,7 @@ if _HAS_LLAMAINDEX:
             threshold: float | None = None,
             model_id: str | None = None,
             fail_open: bool = True,
+            auth_token: str | None = None,
             **pydantic_kwargs: Any,
         ) -> None:
             super().__init__(**pydantic_kwargs)
@@ -92,7 +93,7 @@ if _HAS_LLAMAINDEX:
             )
 
             self._inner = inner
-            self._client = FerrocacheClient(_resolve_url(cache_url))
+            self._client = FerrocacheClient(_resolve_url(cache_url), auth_token=auth_token)
             self._threshold = _resolve_threshold(threshold)
             self._fail_open = fail_open
 

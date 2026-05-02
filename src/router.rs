@@ -9,21 +9,29 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ClusterRouter {
     client: Client,
+    auth_token: Option<String>,
 }
 
 impl Default for ClusterRouter {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl ClusterRouter {
-    pub fn new() -> Self {
+    pub fn new(auth_token: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(FORWARD_TIMEOUT)
             .build()
             .expect("reqwest::Client build");
-        Self { client }
+        Self { client, auth_token }
+    }
+
+    fn with_auth(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth_token {
+            Some(t) => b.header("Authorization", format!("Bearer {t}")),
+            None => b,
+        }
     }
 
     pub async fn forward_query(
@@ -33,9 +41,7 @@ impl ClusterRouter {
     ) -> Result<QueryResponse> {
         let url = format!("http://{target_addr}/query?local=true");
         let resp = self
-            .client
-            .post(&url)
-            .json(req)
+            .with_auth(self.client.post(&url).json(req))
             .send()
             .await
             .with_context(|| format!("forward /query to {target_addr}"))?;
@@ -56,9 +62,7 @@ impl ClusterRouter {
     ) -> Result<InsertResponse> {
         let url = format!("http://{target_addr}/insert?local=true");
         let resp = self
-            .client
-            .post(&url)
-            .json(req)
+            .with_auth(self.client.post(&url).json(req))
             .send()
             .await
             .with_context(|| format!("forward /insert to {target_addr}"))?;
@@ -106,7 +110,7 @@ mod tests {
             ),
         );
         let addr = spawn_mock(app).await;
-        let router = ClusterRouter::new();
+        let router = ClusterRouter::new(None);
         let resp = router
             .forward_query(
                 &addr,
@@ -121,6 +125,42 @@ mod tests {
         assert!(resp.hit);
         assert_eq!(resp.response.as_deref(), Some("from peer"));
         assert_eq!(resp.id.as_deref(), Some("u-42"));
+    }
+
+    #[tokio::test]
+    async fn test_forward_includes_auth_header_when_configured() {
+        use axum::http::HeaderMap;
+        let app = Router::new().route(
+            "/insert",
+            post(
+                |headers: HeaderMap, Json(req): Json<InsertRequest>| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string());
+                    assert_eq!(auth.as_deref(), Some("Bearer s3cr3t"));
+                    Json(InsertResponse {
+                        id: req.uuid.unwrap_or_else(|| "g".into()),
+                        status: "ok".into(),
+                    })
+                },
+            ),
+        );
+        let addr = spawn_mock(app).await;
+        let router = ClusterRouter::new(Some("s3cr3t".to_string()));
+        let resp = router
+            .forward_insert(
+                &addr,
+                &InsertRequest {
+                    embedding: vec![1.0, 0.0],
+                    response: "r".into(),
+                    query_text: "q".into(),
+                    model_id: Some("test::2".into()),
+                    uuid: Some("u".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.id, "u");
     }
 
     #[tokio::test]
@@ -139,7 +179,7 @@ mod tests {
             ),
         );
         let addr = spawn_mock(app).await;
-        let router = ClusterRouter::new();
+        let router = ClusterRouter::new(None);
         let resp = router
             .forward_insert(
                 &addr,

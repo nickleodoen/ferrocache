@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 from urllib import error, request
 
@@ -30,9 +31,18 @@ class FerrocacheError(RuntimeError):
 
 
 class FerrocacheClient:
-    def __init__(self, base_url: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = DEFAULT_TIMEOUT,
+        auth_token: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # If not passed explicitly, fall back to env. Empty string disables auth.
+        if auth_token is None:
+            auth_token = os.environ.get("FERROCACHE_AUTH_TOKEN") or None
+        self.auth_token = auth_token
 
     def insert(
         self,
@@ -73,8 +83,20 @@ class FerrocacheClient:
     def cluster_status(self) -> dict[str, Any]:
         return self._get("/cluster/status")
 
+    def _headers(self, content_type: str | None = None) -> dict[str, str]:
+        h: dict[str, str] = {}
+        if content_type:
+            h["Content-Type"] = content_type
+        if self.auth_token:
+            h["Authorization"] = f"Bearer {self.auth_token}"
+        return h
+
     def _get(self, path: str) -> dict[str, Any]:
-        req = request.Request(self.base_url + path, method="GET")
+        req = request.Request(
+            self.base_url + path,
+            headers=self._headers(),
+            method="GET",
+        )
         return self._send(req)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +104,7 @@ class FerrocacheClient:
         req = request.Request(
             self.base_url + path,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers("application/json"),
             method="POST",
         )
         return self._send(req)

@@ -13,6 +13,11 @@ pub struct FerrocacheConfig {
     pub cluster: ClusterConfig,
     #[serde(default = "default_compact_interval_inserts")]
     pub compact_interval_inserts: u64,
+    /// When set, all data routes require `Authorization: Bearer <token>`.
+    /// Unset/empty disables auth entirely (default). Configure via env
+    /// `FERROCACHE_AUTH_TOKEN`. NEVER log this value.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 fn default_compact_interval_inserts() -> u64 {
@@ -61,6 +66,7 @@ impl Default for FerrocacheConfig {
             hnsw: HnswConfig::default(),
             cluster: ClusterConfig::default(),
             compact_interval_inserts: default_compact_interval_inserts(),
+            auth_token: None,
         }
     }
 }
@@ -153,5 +159,6 @@ mod tests {
         assert_eq!(c.cluster.virtual_nodes, 64);
         assert_eq!(c.cluster.replication_factor, 2);
         assert_eq!(c.compact_interval_inserts, 10_000);
+        assert!(c.auth_token.is_none());
     }
 }

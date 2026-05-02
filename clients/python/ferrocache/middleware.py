@@ -323,9 +323,13 @@ def wrap_openai(
     embed_fn: Callable[[str], list[float]] | None = None,
     model_id: str | None = None,
     fail_open: bool = True,
+    auth_token: str | None = None,
 ) -> WrappedOpenAIClient:
-    """Wrap an `openai.OpenAI()` client so chat.completions.create checks ferrocache first."""
-    cache = FerrocacheClient(_resolve_url(cache_url))
+    """Wrap an `openai.OpenAI()` client so chat.completions.create checks ferrocache first.
+
+    `auth_token` (or env `FERROCACHE_AUTH_TOKEN`) is forwarded to the cache.
+    """
+    cache = FerrocacheClient(_resolve_url(cache_url), auth_token=auth_token)
     embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
     return WrappedOpenAIClient(
         client,
@@ -414,9 +418,13 @@ def wrap_anthropic(
     embed_fn: Callable[[str], list[float]] | None = None,
     model_id: str | None = None,
     fail_open: bool = True,
+    auth_token: str | None = None,
 ) -> WrappedAnthropicClient:
-    """Wrap an `anthropic.Anthropic()` client so messages.create checks ferrocache first."""
-    cache = FerrocacheClient(_resolve_url(cache_url))
+    """Wrap an `anthropic.Anthropic()` client so messages.create checks ferrocache first.
+
+    `auth_token` (or env `FERROCACHE_AUTH_TOKEN`) is forwarded to the cache.
+    """
+    cache = FerrocacheClient(_resolve_url(cache_url), auth_token=auth_token)
     embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
     return WrappedAnthropicClient(
         client,

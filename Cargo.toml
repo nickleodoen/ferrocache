@@ -18,6 +18,7 @@ chitchat = "0.10"
 tokio-stream = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 bincode = "1"
+subtle = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

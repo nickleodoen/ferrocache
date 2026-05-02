@@ -50,7 +50,12 @@ class FerrocacheTools:
         embed_fn: Callable[[str], list[float]],
         model_id: str = "all-MiniLM-L6-v2::384",
         default_threshold: float = DEFAULT_THRESHOLD,
+        auth_token: str | None = None,
     ) -> None:
+        # auth_token is accepted for symmetry; the client carries the actual
+        # auth header. If both are passed, the client's takes precedence.
+        if auth_token is not None and not client.auth_token:
+            client.auth_token = auth_token
         self.client = client
         self.embed_fn = embed_fn
         self.model_id = model_id
@@ -209,6 +214,7 @@ def _build_tools_from_env() -> FerrocacheTools:
     from ferrocache._embed import get_default_embed
 
     embed_fn, model_id = get_default_embed(embed_model)
+    # FerrocacheClient picks up FERROCACHE_AUTH_TOKEN automatically.
     client = FerrocacheClient(url)
     return FerrocacheTools(
         client=client,

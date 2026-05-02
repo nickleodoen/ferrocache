@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::auth::{AuthToken, auth_middleware};
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
     ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, HealthResponse,
@@ -36,7 +37,8 @@ impl LocalParam {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let auth_token = state.auth_token.clone();
+    let router = Router::new()
         .route("/query", post(query_handler))
         .route("/insert", post(insert_handler))
         .route("/health", get(health_handler))
@@ -44,7 +46,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/cluster/status", get(cluster_status_handler))
         .route("/admin/compact", post(compact_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(token) = auth_token.filter(|t| !t.is_empty()) {
+        let token_state = Arc::new(AuthToken { value: token });
+        router.layer(axum::middleware::from_fn_with_state(
+            token_state,
+            auth_middleware,
+        ))
+    } else {
+        router
+    }
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
@@ -484,6 +496,7 @@ mod tests {
             None,
             1,
             0, // disable auto-compaction in tests
+            None,
         ))
     }
 

@@ -128,6 +128,51 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 | `cluster.seed_nodes`          | list<string> | `[]`                 | `FERROCACHE_CLUSTER__SEED_NODES` (CSV) |
 | `cluster.virtual_nodes`       | usize        | `64`                 | `FERROCACHE_CLUSTER__VIRTUAL_NODES`    |
 | `cluster.replication_factor`  | usize        | `2`                  | `FERROCACHE_CLUSTER__REPLICATION_FACTOR` |
+| `auth_token`                  | string?      | `None` (auth off)    | `FERROCACHE_AUTH_TOKEN`                |
+
+## Security
+
+### Bearer token authentication
+
+Auth is **opt-in**. With `FERROCACHE_AUTH_TOKEN` unset (the default), all routes
+are open — identical to pre-M17 behavior. With it set, every request to
+`/query`, `/insert`, `/stats`, `/cluster/status`, and `/admin/compact` must
+carry `Authorization: Bearer <token>`. `/health` and `/metrics` remain
+unauthenticated so load balancers and Prometheus scrape without credentials.
+
+```bash
+export FERROCACHE_AUTH_TOKEN="my-secret-token"
+cargo run --release
+```
+
+```bash
+# 401 without the header
+curl -X POST localhost:3000/query -H 'Content-Type: application/json' -d '...'
+# 200 with the right token
+curl -X POST localhost:3000/query \
+    -H 'Authorization: Bearer my-secret-token' \
+    -H 'Content-Type: application/json' -d '...'
+```
+
+The Python client picks up `FERROCACHE_AUTH_TOKEN` automatically:
+
+```python
+from ferrocache import FerrocacheClient
+client = FerrocacheClient("http://localhost:3000")              # uses env var
+client = FerrocacheClient("http://localhost:3000", auth_token="my-secret-token")
+```
+
+The middleware wrappers (`wrap_openai`, `wrap_anthropic`, `FerrocacheCache`,
+`FerrocacheLLM`, `FerrocacheTools`) accept an `auth_token=` kwarg that flows
+through to the underlying client.
+
+When auth is enabled in a cluster, **all nodes must share the same token** —
+inter-node replication forwards include the bearer header so peers
+authenticate to one another the same way external clients do.
+
+The token is compared with `subtle::ConstantTimeEq` to avoid timing attacks
+and is never logged at any level. TLS termination is expected at a reverse
+proxy (nginx/caddy/ALB) in production; in-process TLS is deferred to M18.
 
 ## Architecture
 

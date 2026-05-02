@@ -110,6 +110,17 @@ LOCAL_MISS=$(curl -s -X POST "$BASE2/query?local=true" \
 assert_eq "local query on node2 misses (not replicated)" "false" "$LOCAL_MISS"
 
 echo ""
+echo "=== Test 6: Auth (sanity — health is always public) ==="
+# /health and /metrics must never require auth. The cluster compose file
+# leaves FERROCACHE_AUTH_TOKEN unset by default, so the data routes also
+# accept unauthenticated traffic. Auth-on integration testing requires a
+# separate compose run with the env var exported on every node.
+HEALTH=$(curl -s "$BASE1/health" | jq -r '.status')
+assert_eq "health always works without auth" "ok" "$HEALTH"
+METRICS_CT=$(curl -s -o /dev/null -w "%{content_type}" "$BASE1/metrics")
+assert_eq "metrics always works without auth" "text/plain; version=0.0.4; charset=utf-8" "$METRICS_CT"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"
