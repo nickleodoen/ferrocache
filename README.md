@@ -132,47 +132,33 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 
 ## Security
 
-### Bearer token authentication
-
-Auth is **opt-in**. With `FERROCACHE_AUTH_TOKEN` unset (the default), all routes
-are open — identical to pre-M17 behavior. With it set, every request to
-`/query`, `/insert`, `/stats`, `/cluster/status`, and `/admin/compact` must
-carry `Authorization: Bearer <token>`. `/health` and `/metrics` remain
-unauthenticated so load balancers and Prometheus scrape without credentials.
+ferrocache supports two opt-in security features:
 
 ```bash
-export FERROCACHE_AUTH_TOKEN="my-secret-token"
-cargo run --release
+# Bearer token auth on the public HTTP API
+export FERROCACHE_AUTH_TOKEN="$(openssl rand -hex 32)"
+
+# Mutual TLS between cluster nodes
+export FERROCACHE_CLUSTER__TLS__ENABLED=true
+export FERROCACHE_CLUSTER__TLS__CA_CERT_PATH=/certs/ca.pem
+export FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH=/certs/node1/cert.pem
+export FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH=/certs/node1/key.pem
 ```
 
-```bash
-# 401 without the header
-curl -X POST localhost:3000/query -H 'Content-Type: application/json' -d '...'
-# 200 with the right token
-curl -X POST localhost:3000/query \
-    -H 'Authorization: Bearer my-secret-token' \
-    -H 'Content-Type: application/json' -d '...'
-```
+Both default to disabled — pre-M17 deployments behind a VPC keep working.
+With auth on, `/health` and `/metrics` stay open (load balancers, Prometheus);
+all data routes require `Authorization: Bearer <token>`. With mTLS on,
+ferrocache binds a second listener on `internal_port` (default `port + 1000`)
+that requires a client cert chained to the cluster CA — public-port traffic
+stays plain HTTP and is expected to be terminated by a reverse proxy.
 
-The Python client picks up `FERROCACHE_AUTH_TOKEN` automatically:
+Generate dev certs for a local cluster: `cargo run --bin gen_certs node1 node2 node3`.
+The `gen_certs` binary is not built into the production Docker image.
 
-```python
-from ferrocache import FerrocacheClient
-client = FerrocacheClient("http://localhost:3000")              # uses env var
-client = FerrocacheClient("http://localhost:3000", auth_token="my-secret-token")
-```
-
-The middleware wrappers (`wrap_openai`, `wrap_anthropic`, `FerrocacheCache`,
-`FerrocacheLLM`, `FerrocacheTools`) accept an `auth_token=` kwarg that flows
-through to the underlying client.
-
-When auth is enabled in a cluster, **all nodes must share the same token** —
-inter-node replication forwards include the bearer header so peers
-authenticate to one another the same way external clients do.
-
-The token is compared with `subtle::ConstantTimeEq` to avoid timing attacks
-and is never logged at any level. TLS termination is expected at a reverse
-proxy (nginx/caddy/ALB) in production; in-process TLS is deferred to M18.
+See [docs/security.md](docs/security.md) for the full threat model, deployment
+recipes (single-node behind reverse proxy, multi-node cluster with mTLS),
+certificate management guidance, firewall port table, and the list of known
+limitations (at-rest encryption, CRL/OCSP, per-client ACLs, gossip UDP, etc.).
 
 ## Architecture
 

@@ -122,14 +122,23 @@ async fn forward_query(
     req: &QueryRequest,
 ) -> Response {
     let Some(router) = &state.router else {
-        return bad_gateway(format!("no router configured to reach {target_id}"));
+        tracing::error!(peer = %target_id, "no router configured");
+        return bad_gateway("upstream replica unavailable");
     };
-    match router.forward_query(target_addr, req).await {
+    let result = router
+        .forward_with_retry(state.max_replication_retries, &state.metrics, || {
+            router.forward_query(target_addr, req)
+        })
+        .await;
+    match result {
         Ok(resp) => {
             tracing::info!(target = %target_id, "query forwarded");
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(e) => bad_gateway(format!("failed to reach node {target_id}: {e}")),
+        Err(e) => {
+            tracing::error!(peer = %target_id, error = %e, "forward_query failed");
+            bad_gateway("upstream replica unavailable")
+        }
     }
 }
 
@@ -230,14 +239,21 @@ async fn insert_handler(
     }
 
     let Some(router) = &state.router else {
-        return bad_gateway("no router configured for replication");
+        tracing::error!("no router configured for replication");
+        return bad_gateway("upstream replica unavailable");
     };
 
     for (peer_id, peer_addr) in replicas.iter().filter(|(id, _)| id != self_id) {
         state.metrics.record_replication_forward();
-        if let Err(e) = router.forward_insert(peer_addr, &req_with_uuid).await {
+        let result = router
+            .forward_with_retry(state.max_replication_retries, &state.metrics, || {
+                router.forward_insert(peer_addr, &req_with_uuid)
+            })
+            .await;
+        if let Err(e) = result {
             state.metrics.record_replication_failure();
-            return bad_gateway(format!("replica {peer_id} failed: {e}"));
+            tracing::error!(peer = %peer_id, error = %e, "replica forward failed");
+            return bad_gateway("upstream replica unavailable");
         }
     }
 
@@ -293,11 +309,13 @@ async fn local_insert_inner(
     };
 
     if let Err(e) = wal.append(&entry).await {
+        // Log the chain (which includes paths) but never echo it to the client —
+        // the WAL path leaks deployment topology.
         tracing::error!(error = %e, "WAL append failed");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("WAL append failed: {e}"),
+                error: "persistence failed".to_string(),
             }),
         )
             .into_response());
@@ -366,11 +384,13 @@ async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
         Err(e) => {
+            // The error chain typically carries snapshot/WAL paths; keep
+            // those in logs only.
             tracing::error!(error = %e, "compaction failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("compaction failed: {e}"),
+                    error: "compaction failed".to_string(),
                 }),
             )
                 .into_response()
@@ -434,6 +454,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
         inserts_total: m.inserts_total.load(Ordering::Relaxed),
         replication_forwards: m.replication_forwards_total.load(Ordering::Relaxed),
         replication_failures: m.replication_failures_total.load(Ordering::Relaxed),
+        replication_retries: m.replication_retries_total.load(Ordering::Relaxed),
         compactions: m.compactions_total.load(Ordering::Relaxed),
     };
     Json(StatsResponse {
@@ -497,6 +518,7 @@ mod tests {
             1,
             0, // disable auto-compaction in tests
             None,
+            0, // no replication retries in tests
         ))
     }
 

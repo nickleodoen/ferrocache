@@ -75,6 +75,7 @@ pub struct CountersResponse {
     pub inserts_total: u64,
     pub replication_forwards: u64,
     pub replication_failures: u64,
+    pub replication_retries: u64,
     pub compactions: u64,
 }
 

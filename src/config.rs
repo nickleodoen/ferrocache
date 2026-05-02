@@ -34,6 +34,12 @@ pub struct ClusterConfig {
     pub replication_factor: usize,
     #[serde(default)]
     pub tls: ClusterTlsConfig,
+    #[serde(default = "default_max_replication_retries")]
+    pub max_replication_retries: usize,
+}
+
+fn default_max_replication_retries() -> usize {
+    3
 }
 
 impl Default for ClusterConfig {
@@ -46,6 +52,7 @@ impl Default for ClusterConfig {
             virtual_nodes: 64,
             replication_factor: 2,
             tls: ClusterTlsConfig::default(),
+            max_replication_retries: default_max_replication_retries(),
         }
     }
 }
@@ -141,6 +148,10 @@ impl FerrocacheConfig {
                 defaults.cluster.replication_factor as i64,
             )?
             .set_default(
+                "cluster.max_replication_retries",
+                defaults.cluster.max_replication_retries as i64,
+            )?
+            .set_default(
                 "compact_interval_inserts",
                 defaults.compact_interval_inserts as i64,
             )?
@@ -191,5 +202,6 @@ mod tests {
         assert!(c.cluster.tls.node_cert_path.is_none());
         assert!(c.cluster.tls.node_key_path.is_none());
         assert!(c.cluster.tls.internal_port.is_none());
+        assert_eq!(c.cluster.max_replication_retries, 3);
     }
 }

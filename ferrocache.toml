@@ -24,6 +24,7 @@
 # seed_nodes = []
 # virtual_nodes = 64
 # replication_factor = 2
+# max_replication_retries = 3   # retries on connect/timeout/5xx; 4xx never retried
 
 # Inter-node mTLS (M18). When enabled, ferrocache binds a SECOND listener
 # on `internal_port` (default: port + 1000) for cluster traffic only. The

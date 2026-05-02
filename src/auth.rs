@@ -99,6 +99,7 @@ mod tests {
             1,
             0,
             auth_token,
+            0,
         ))
     }
 

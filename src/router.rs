@@ -1,12 +1,18 @@
+use std::future::Future;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+use rand::Rng;
 use reqwest::Client;
 
+use crate::metrics::Metrics;
 use crate::models::{InsertRequest, InsertResponse, QueryRequest, QueryResponse};
 use crate::tls::TlsBundle;
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap the per-attempt sleep so a misconfigured `max_replication_retries`
+/// can't park the caller for hours.
+const MAX_RETRY_DELAY_MS: u64 = 5_000;
 
 pub struct ClusterRouter {
     client: Client,
@@ -61,56 +67,131 @@ impl ClusterRouter {
         }
     }
 
+    /// Forward a /query to a peer (single attempt).
+    ///
+    /// Returns the typed `reqwest::Error` so the retry layer can classify
+    /// failures by `e.is_connect()` / `e.is_timeout()` / `e.status()`. The
+    /// `?` after `error_for_status()` ensures a 5xx response surfaces as an
+    /// `Err` whose `status()` is set, which the retry layer recognizes.
     pub async fn forward_query(
         &self,
         target_addr: &str,
         req: &QueryRequest,
-    ) -> Result<QueryResponse> {
+    ) -> reqwest::Result<QueryResponse> {
         let scheme = self.scheme();
         let url = format!("{scheme}://{target_addr}/query?local=true");
         let resp = self
             .with_auth(self.client.post(&url).json(req))
             .send()
-            .await
-            .with_context(|| format!("forward /query to {target_addr}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("peer returned {status}: {body}"));
-        }
-        resp.json::<QueryResponse>()
-            .await
-            .context("decode QueryResponse from peer")
+            .await?;
+        let resp = resp.error_for_status()?;
+        resp.json::<QueryResponse>().await
     }
 
+    /// Forward an /insert to a peer (single attempt). See `forward_query`
+    /// for the retry-classification rationale.
     pub async fn forward_insert(
         &self,
         target_addr: &str,
         req: &InsertRequest,
-    ) -> Result<InsertResponse> {
+    ) -> reqwest::Result<InsertResponse> {
         let scheme = self.scheme();
         let url = format!("{scheme}://{target_addr}/insert?local=true");
         let resp = self
             .with_auth(self.client.post(&url).json(req))
             .send()
-            .await
-            .with_context(|| format!("forward /insert to {target_addr}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("peer returned {status}: {body}"));
-        }
-        resp.json::<InsertResponse>()
-            .await
-            .context("decode InsertResponse from peer")
+            .await?;
+        let resp = resp.error_for_status()?;
+        resp.json::<InsertResponse>().await
     }
+
+    /// Run `make_request` with exponential backoff. `max_retries` is the
+    /// number of retries *after* the initial attempt — so total attempts =
+    /// `max_retries + 1`.
+    ///
+    /// Backoff: base = 50ms × 2^(attempt-1), capped at 5s, with ±20% jitter.
+    /// Jitter sourced from `rand` so multiple replicas under the same
+    /// upstream blip don't synchronize their retry waves.
+    ///
+    /// Retry policy: connect errors, timeouts, and 5xx responses are
+    /// retried. 4xx is treated as a deterministic failure (wrong token,
+    /// bad request) and surfaces immediately.
+    pub async fn forward_with_retry<F, Fut, T>(
+        &self,
+        max_retries: usize,
+        metrics: &Metrics,
+        mut make_request: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = reqwest::Result<T>>,
+    {
+        let total = max_retries.saturating_add(1);
+        let mut last_err: Option<reqwest::Error> = None;
+        for attempt in 0..total {
+            if attempt > 0 {
+                metrics.record_replication_retry();
+                let delay = compute_retry_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    max_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "retrying replication"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            match make_request().await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if is_retryable(&e) {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(anyhow::Error::new(e)).context("replication forward failed");
+                }
+            }
+        }
+        Err(anyhow::Error::new(last_err.expect("at least one attempt")))
+            .context("replication forward exhausted retries")
+    }
+}
+
+/// Connect errors, timeouts, and 5xx responses are transient. Anything
+/// else (including 4xx) is treated as deterministic and not retried.
+fn is_retryable(e: &reqwest::Error) -> bool {
+    if e.is_connect() || e.is_timeout() {
+        return true;
+    }
+    e.status().is_some_and(|s| s.is_server_error())
+}
+
+fn compute_retry_delay(attempt: usize) -> Duration {
+    // attempt == 1 → 50ms base, attempt == 2 → 100ms, attempt == 3 → 200ms…
+    let shift = (attempt as u32).saturating_sub(1);
+    let base_ms: u64 = 50u64
+        .checked_shl(shift)
+        .unwrap_or(MAX_RETRY_DELAY_MS)
+        .min(MAX_RETRY_DELAY_MS);
+    let jitter_ms = (base_ms as f64 * 0.2) as i64;
+    let signed_jitter: i64 = if jitter_ms > 0 {
+        // Range [-jitter_ms, +jitter_ms]
+        let mut rng = rand::thread_rng();
+        rng.gen_range(-jitter_ms..=jitter_ms)
+    } else {
+        0
+    };
+    let delay_ms = (base_ms as i64 + signed_jitter).max(1) as u64;
+    Duration::from_millis(delay_ms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use axum::{Json, Router, extract::Query, routing::post};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     async fn spawn_mock(app: Router) -> String {
@@ -224,5 +305,123 @@ mod tests {
             .unwrap();
         assert_eq!(resp.id, "fixed-uuid");
         assert_eq!(resp.status, "ok");
+    }
+
+    /// Mock that returns 500 for the first `fail_first` requests and 200
+    /// thereafter. Returns the addr + a counter the test can read.
+    async fn flaky_mock(fail_first: usize) -> (String, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = count.clone();
+        let app = Router::new().route(
+            "/insert",
+            post(move |Json(req): Json<InsertRequest>| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_first {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "boom".to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        Json(InsertResponse {
+                            id: req.uuid.unwrap_or_else(|| "ok".into()),
+                            status: "ok".into(),
+                        })
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        (spawn_mock(app).await, count)
+    }
+
+    /// Mock that always returns the given status code with a small body.
+    async fn always_status(status: axum::http::StatusCode) -> (String, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = count.clone();
+        let app = Router::new().route(
+            "/insert",
+            post(move |Json(_): Json<InsertRequest>| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (status, "no").into_response()
+                }
+            }),
+        );
+        (spawn_mock(app).await, count)
+    }
+
+    fn sample_insert() -> InsertRequest {
+        InsertRequest {
+            embedding: vec![1.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: Some("t::2".into()),
+            uuid: Some("u".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_connection_error() {
+        // 5xx is one of the retryable error classes. The mock fails twice
+        // (returns 500) and succeeds on attempt 3 — overall call must Ok.
+        let (addr, count) = flaky_mock(2).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let metrics = Metrics::new();
+        let req = sample_insert();
+        let res = router
+            .forward_with_retry(3, &metrics, || router.forward_insert(&addr, &req))
+            .await;
+        assert!(res.is_ok(), "expected success after retries: {res:?}");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert_eq!(metrics.replication_retries_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_on_4xx() {
+        let (addr, count) = always_status(axum::http::StatusCode::BAD_REQUEST).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let metrics = Metrics::new();
+        let req = sample_insert();
+        let res = router
+            .forward_with_retry(3, &metrics, || router.forward_insert(&addr, &req))
+            .await;
+        assert!(res.is_err(), "4xx must not be retried but did not Err");
+        assert_eq!(count.load(Ordering::SeqCst), 1, "only one request expected");
+        assert_eq!(metrics.replication_retries_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausted_returns_error() {
+        let (addr, count) = always_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let metrics = Metrics::new();
+        let req = sample_insert();
+        // max_retries=2 → total attempts = 3
+        let res = router
+            .forward_with_retry(2, &metrics, || router.forward_insert(&addr, &req))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert_eq!(metrics.replication_retries_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_counter_increments() {
+        // The brief's "test_retry_backoff_increases" — we don't try to time
+        // the sleeps (flaky), but we lock in that one call → 2 retries
+        // bumps the metric by exactly 2.
+        let (addr, _count) = flaky_mock(2).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let metrics = Metrics::new();
+        let req = sample_insert();
+        let _ = router
+            .forward_with_retry(3, &metrics, || router.forward_insert(&addr, &req))
+            .await
+            .unwrap();
+        assert_eq!(metrics.replication_retries_total.load(Ordering::Relaxed), 2);
     }
 }

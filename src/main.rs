@@ -194,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         config.cluster.replication_factor.max(1),
         config.compact_interval_inserts,
         config.auth_token.clone(),
+        config.cluster.max_replication_retries,
     ));
     let app = server::build_router(state.clone());
 

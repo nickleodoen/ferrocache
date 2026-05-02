@@ -27,6 +27,9 @@ pub struct AppState {
     /// Bearer token for the `/query`, `/insert`, `/stats`, `/cluster/status`,
     /// and `/admin/compact` routes. `None` disables auth entirely.
     pub auth_token: Option<String>,
+    /// Max number of retries (after the initial attempt) for replication
+    /// forwards. Total attempts = `max_replication_retries + 1`.
+    pub max_replication_retries: usize,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
         replication_factor: usize,
         compact_interval_inserts: u64,
         auth_token: Option<String>,
+        max_replication_retries: usize,
     ) -> Self {
         Self {
             node_id,
@@ -58,6 +62,7 @@ impl AppState {
             inserts_since_compact: AtomicU64::new(0),
             metrics: Arc::new(Metrics::new()),
             auth_token,
+            max_replication_retries,
         }
     }
 }

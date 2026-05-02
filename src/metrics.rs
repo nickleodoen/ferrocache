@@ -82,6 +82,7 @@ pub struct Metrics {
     pub inserts_total: AtomicU64,
     pub replication_forwards_total: AtomicU64,
     pub replication_failures_total: AtomicU64,
+    pub replication_retries_total: AtomicU64,
     pub compactions_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
@@ -97,6 +98,7 @@ impl Metrics {
             inserts_total: AtomicU64::new(0),
             replication_forwards_total: AtomicU64::new(0),
             replication_failures_total: AtomicU64::new(0),
+            replication_retries_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
@@ -170,6 +172,11 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_replication_retry(&self) {
+        self.replication_retries_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_compaction(&self) {
         self.compactions_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -200,6 +207,7 @@ impl Metrics {
         let inserts_total = self.inserts_total.load(Ordering::Relaxed);
         let repl_forwards = self.replication_forwards_total.load(Ordering::Relaxed);
         let repl_failures = self.replication_failures_total.load(Ordering::Relaxed);
+        let repl_retries = self.replication_retries_total.load(Ordering::Relaxed);
         let compactions = self.compactions_total.load(Ordering::Relaxed);
         let hit_rate = self.hit_rate();
 
@@ -244,6 +252,12 @@ impl Metrics {
             "ferrocache_replication_failures_total",
             "Total replication failures.",
             repl_failures,
+        );
+        write_counter(
+            &mut out,
+            "ferrocache_replication_retries_total",
+            "Total replication retry attempts (high values indicate flaky peers).",
+            repl_retries,
         );
         write_counter(
             &mut out,
