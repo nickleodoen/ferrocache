@@ -1,6 +1,7 @@
 pub mod cluster;
 pub mod config;
 pub mod index;
+pub mod metrics;
 pub mod models;
 pub mod ring;
 pub mod router;

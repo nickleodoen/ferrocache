@@ -1,0 +1,34 @@
+# Overlay onto the base docker-compose.yml to add Prometheus + Grafana.
+# Usage:
+#   docker compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up -d
+# Tear down:
+#   docker compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml down -v
+#
+# Prometheus → http://localhost:9090
+# Grafana    → http://localhost:3100  (anonymous viewer, admin/admin for editing)
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ferrocache-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - fc-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ferrocache-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3100:3000"
+    networks:
+      - fc-net

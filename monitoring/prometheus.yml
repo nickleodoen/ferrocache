@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: ferrocache
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - node1:3000
+          - node2:3000
+          - node3:3000

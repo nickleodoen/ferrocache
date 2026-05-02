@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::cluster::ClusterState;
 use crate::config::HnswConfig;
 use crate::index::SemanticIndex;
+use crate::metrics::Metrics;
 use crate::router::ClusterRouter;
 use crate::wal::Wal;
 
@@ -22,6 +23,7 @@ pub struct AppState {
     pub replication_factor: usize,
     pub compact_interval_inserts: u64,
     pub inserts_since_compact: AtomicU64,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
             replication_factor,
             compact_interval_inserts,
             inserts_since_compact: AtomicU64::new(0),
+            metrics: Arc::new(Metrics::new()),
         }
     }
 }

@@ -10,9 +10,11 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
-    ClusterStatusResponse, CompactResponse, ErrorResponse, HealthResponse, InsertRequest,
-    InsertResponse, NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
+    ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, HealthResponse,
+    InsertRequest, InsertResponse, NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw,
+    StatsResponse,
 };
 use crate::snapshot;
 use crate::state::AppState;
@@ -41,6 +43,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats_handler))
         .route("/cluster/status", get(cluster_status_handler))
         .route("/admin/compact", post(compact_handler))
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -119,14 +122,20 @@ async fn forward_query(
 }
 
 async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Response {
+    let start = std::time::Instant::now();
     let dim = req.embedding.len();
     let model_id = match req.model_id.as_deref() {
         Some(s) if !s.trim().is_empty() => s,
         _ => return bad_request("model_id is required"),
     };
-    let index = state.index.read().await;
-    match index.query(&req.embedding, req.threshold, model_id) {
+    let result = {
+        let index = state.index.read().await;
+        index.query(&req.embedding, req.threshold, model_id)
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    match result {
         Ok(Some(hit)) => {
+            state.metrics.record_query_hit(model_id, elapsed);
             tracing::info!(hit = true, similarity = hit.similarity, dim, "query");
             (
                 StatusCode::OK,
@@ -140,6 +149,7 @@ async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Resp
                 .into_response()
         }
         Ok(None) => {
+            state.metrics.record_query_miss(model_id, elapsed);
             tracing::info!(hit = false, dim, "query");
             (
                 StatusCode::OK,
@@ -212,7 +222,9 @@ async fn insert_handler(
     };
 
     for (peer_id, peer_addr) in replicas.iter().filter(|(id, _)| id != self_id) {
+        state.metrics.record_replication_forward();
         if let Err(e) = router.forward_insert(peer_addr, &req_with_uuid).await {
+            state.metrics.record_replication_failure();
             return bad_gateway(format!("replica {peer_id} failed: {e}"));
         }
     }
@@ -247,6 +259,7 @@ async fn local_insert_inner(
     state: &Arc<AppState>,
     req: &InsertRequest,
 ) -> Result<String, Response> {
+    let start = std::time::Instant::now();
     let dim = req.embedding.len();
     let model_id = match req.model_id.as_deref() {
         Some(s) if !s.trim().is_empty() => s.to_string(),
@@ -263,7 +276,7 @@ async fn local_insert_inner(
         embedding: req.embedding.clone(),
         response: req.response.clone(),
         query_text: req.query_text.clone(),
-        model_id,
+        model_id: model_id.clone(),
         sequence: 0, // stamped by Wal::append
     };
 
@@ -289,6 +302,9 @@ async fn local_insert_inner(
             .into_response());
     }
 
+    let elapsed = start.elapsed().as_secs_f64();
+    state.metrics.record_insert(&model_id, elapsed);
+
     // Auto-compaction: still holding the WAL lock, so a peer's concurrent
     // insert can't race us. The threshold check + reset is only crossed
     // by one insert at a time per node.
@@ -301,6 +317,7 @@ async fn local_insert_inner(
             let wal_path = std::path::Path::new(&state.wal_path);
             match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
                 Ok(result) => {
+                    state.metrics.record_compaction();
                     tracing::info!(
                         snapshotted = result.entries_snapshotted,
                         wal_sequence = result.wal_sequence,
@@ -325,6 +342,7 @@ async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
     match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
         Ok(result) => {
             state.inserts_since_compact.store(0, Ordering::Relaxed);
+            state.metrics.record_compaction();
             (
                 StatusCode::OK,
                 Json(CompactResponse {
@@ -395,6 +413,17 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
             )
         })
         .collect();
+    let m = &state.metrics;
+    let counters = CountersResponse {
+        queries_total: m.queries_total.load(Ordering::Relaxed),
+        queries_hit: m.queries_hit.load(Ordering::Relaxed),
+        queries_miss: m.queries_miss.load(Ordering::Relaxed),
+        hit_rate: m.hit_rate(),
+        inserts_total: m.inserts_total.load(Ordering::Relaxed),
+        replication_forwards: m.replication_forwards_total.load(Ordering::Relaxed),
+        replication_failures: m.replication_failures_total.load(Ordering::Relaxed),
+        compactions: m.compactions_total.load(Ordering::Relaxed),
+    };
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
         wal_path: state.wal_path.clone(),
@@ -405,7 +434,26 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
             dimension: index.dimension(),
         },
         namespaces,
+        counters,
     })
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+    let stats = {
+        let index = state.index.read().await;
+        index.namespace_stats()
+    };
+    let cluster_nodes = match &state.cluster {
+        Some(c) => c.ring_node_count().await,
+        None => 1,
+    };
+    let body = state.metrics.render(&stats, cluster_nodes);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, METRICS_CONTENT_TYPE)],
+        body,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1069,5 +1117,112 @@ mod tests {
         assert!(body["hnsw"]["dimension"].is_null());
         assert!(body["namespaces"].is_object());
         assert_eq!(body["namespaces"].as_object().unwrap().len(), 0);
+    }
+
+    async fn body_text(body: Body) -> String {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let (app, _, _dir) = test_app().await;
+        let response = app.oneshot(get("/metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "ct={ct}");
+        let text = body_text(response.into_body()).await;
+        assert!(text.contains("ferrocache_queries_total"));
+        assert!(text.contains("ferrocache_query_duration_seconds_bucket"));
+        assert!(text.contains("ferrocache_cluster_nodes 1"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_after_operations() {
+        let (app, _, _dir) = test_app().await;
+        // 2 inserts (different vectors so HNSW doesn't dedupe at search time)
+        for v in [json!([1.0_f32, 0.0, 0.0]), json!([0.0_f32, 1.0, 0.0])] {
+            app.clone()
+                .oneshot(post_json(
+                    "/insert",
+                    json!({
+                        "embedding": v,
+                        "response": "r",
+                        "query_text": "q",
+                        "model_id": MID
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+        // 3 queries: 2 hits on the inserted vectors + 1 miss with high threshold.
+        for (v, threshold) in [
+            (json!([1.0_f32, 0.0, 0.0]), 0.9),
+            (json!([0.0_f32, 1.0, 0.0]), 0.9),
+            (json!([0.0_f32, 0.0, 1.0]), 0.99),
+        ] {
+            app.clone()
+                .oneshot(post_json(
+                    "/query",
+                    json!({"embedding": v, "threshold": threshold, "model_id": MID}),
+                ))
+                .await
+                .unwrap();
+        }
+        let response = app.oneshot(get("/metrics")).await.unwrap();
+        let text = body_text(response.into_body()).await;
+        assert!(text.contains("ferrocache_inserts_total 2"), "{text}");
+        assert!(text.contains("ferrocache_queries_total 3"), "{text}");
+        assert!(text.contains("ferrocache_queries_hit_total 2"), "{text}");
+        assert!(text.contains("ferrocache_queries_miss_total 1"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "ferrocache_namespace_entries{{namespace=\"{MID}\"}} 2"
+            )),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_includes_counters() {
+        let (app, _, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post_json(
+                "/insert",
+                json!({
+                    "embedding": [1.0_f32, 0.0, 0.0],
+                    "response": "r",
+                    "query_text": "q",
+                    "model_id": MID
+                }),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post_json(
+                "/query",
+                json!({
+                    "embedding": [1.0_f32, 0.0, 0.0],
+                    "threshold": 0.9,
+                    "model_id": MID
+                }),
+            ))
+            .await
+            .unwrap();
+        let response = app.oneshot(get("/stats")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let counters = &body["counters"];
+        assert!(counters.is_object(), "counters missing in {body}");
+        assert_eq!(counters["queries_total"], 1);
+        assert_eq!(counters["queries_hit"], 1);
+        assert_eq!(counters["inserts_total"], 1);
+        assert!((counters["hit_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
     }
 }

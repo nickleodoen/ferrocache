@@ -63,6 +63,19 @@ pub struct StatsResponse {
     pub wal_path: String,
     pub hnsw: StatsHnsw,
     pub namespaces: HashMap<String, NamespaceStatsEntry>,
+    pub counters: CountersResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CountersResponse {
+    pub queries_total: u64,
+    pub queries_hit: u64,
+    pub queries_miss: u64,
+    pub hit_rate: f64,
+    pub inserts_total: u64,
+    pub replication_forwards: u64,
+    pub replication_failures: u64,
+    pub compactions: u64,
 }
 
 #[derive(Debug, Serialize)]
