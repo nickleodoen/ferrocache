@@ -9,4 +9,5 @@ pub mod router;
 pub mod server;
 pub mod snapshot;
 pub mod state;
+pub mod tls;
 pub mod wal;

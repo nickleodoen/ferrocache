@@ -10,6 +10,7 @@ use ferrocache::router::ClusterRouter;
 use ferrocache::server;
 use ferrocache::snapshot;
 use ferrocache::state::AppState;
+use ferrocache::tls;
 use ferrocache::wal::Wal;
 
 #[tokio::main]
@@ -103,21 +104,78 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("WAL open failed")?;
 
+    // mTLS materialization is bound to cluster mode — there's no peer
+    // traffic in single-node mode, so the bundle stays None.
+    let tls_bundle = if config.cluster.enabled && config.cluster.tls.enabled {
+        tls::install_default_crypto_provider();
+        let bundle = tls::load_or_generate(&config.cluster.tls, &node_id, &config.cluster.api_addr)
+            .context("TLS bundle init")?;
+        tracing::info!("cluster mTLS enabled");
+        Some(bundle)
+    } else {
+        if config.cluster.tls.enabled {
+            tracing::warn!(
+                "cluster.tls.enabled=true ignored because cluster.enabled=false (single-node mode)"
+            );
+        }
+        None
+    };
+
+    // The internal port: explicit override > public port + 1000. We log a
+    // warning if the derived port is the same number as the gossip UDP port —
+    // legal (different proto) but a footgun for operators reading firewall
+    // rules.
+    let internal_port = config
+        .cluster
+        .tls
+        .internal_port
+        .unwrap_or_else(|| config.port.saturating_add(1000));
+    if config.cluster.enabled
+        && config.cluster.tls.enabled
+        && config
+            .cluster
+            .gossip_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            == Some(internal_port)
+    {
+        tracing::warn!(
+            internal_port,
+            gossip_port = internal_port,
+            "TLS internal_port equals gossip UDP port — set cluster.tls.internal_port explicitly to avoid confusion"
+        );
+    }
+    // Derive the host portion from api_addr (e.g. "node1:3000" → "node1").
+    // This is what peers will dial when forwarding replication via TLS.
+    let api_host = config
+        .cluster
+        .api_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(&config.cluster.api_addr)
+        .to_string();
+    let internal_addr = format!("{api_host}:{internal_port}");
+    let forward_addr = if tls_bundle.is_some() {
+        internal_addr.clone()
+    } else {
+        config.cluster.api_addr.clone()
+    };
+
     let (cluster, router) = if config.cluster.enabled {
-        let cs = ClusterState::new(&node_id, &config.cluster)
+        let cs = ClusterState::new(&node_id, &config.cluster, &forward_addr)
             .await
             .context("cluster init failed")?;
         tracing::info!(
             gossip_addr = %cs.gossip_addr(),
-            api_addr = %config.cluster.api_addr,
+            forward_addr = %forward_addr,
             seeds = ?config.cluster.seed_nodes,
             replication_factor = config.cluster.replication_factor,
+            tls = tls_bundle.is_some(),
             "cluster enabled"
         );
-        (
-            Some(Arc::new(cs)),
-            Some(Arc::new(ClusterRouter::new(config.auth_token.clone()))),
-        )
+        let router = ClusterRouter::new(config.auth_token.clone(), tls_bundle.as_ref())
+            .context("cluster router build")?;
+        (Some(Arc::new(cs)), Some(Arc::new(router)))
     } else {
         tracing::info!("cluster disabled — running in single-node mode");
         (None, None)
@@ -145,9 +203,41 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(node_id = %state.node_id, %addr, "ferrocache listening");
 
-    axum::serve(listener, app)
-        .await
-        .context("axum server failed")?;
+    // When TLS is enabled, run a second listener on the internal port that
+    // serves the same router under mTLS. The two listeners share the
+    // AppState by Arc, so /metrics + /stats reflect both surfaces.
+    if let Some(bundle) = tls_bundle {
+        let server_config = tls::build_server_config(&bundle).context("TLS server config")?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+        let internal_bind = format!("0.0.0.0:{internal_port}");
+        let internal_socket: std::net::SocketAddr = internal_bind
+            .parse()
+            .with_context(|| format!("invalid internal bind addr {internal_bind}"))?;
+        tracing::info!(addr = %internal_bind, "ferrocache TLS listening (cluster)");
+        let tls_app = app.clone();
+        let tls_handle = tokio::spawn(async move {
+            axum_server::bind_rustls(internal_socket, rustls_config)
+                .serve(tls_app.into_make_service())
+                .await
+        });
+        let plain = async {
+            axum::serve(listener, app)
+                .await
+                .context("axum server failed")
+        };
+        tokio::select! {
+            r = plain => { r?; }
+            r = tls_handle => {
+                r.context("TLS server task join")?
+                    .context("TLS server failed")?;
+            }
+        }
+    } else {
+        axum::serve(listener, app)
+            .await
+            .context("axum server failed")?;
+    }
 
     Ok(())
 }

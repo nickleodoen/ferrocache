@@ -4,27 +4,54 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 
 use crate::models::{InsertRequest, InsertResponse, QueryRequest, QueryResponse};
+use crate::tls::TlsBundle;
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ClusterRouter {
     client: Client,
     auth_token: Option<String>,
+    tls_enabled: bool,
 }
 
 impl Default for ClusterRouter {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None).expect("plain reqwest client builds")
     }
 }
 
 impl ClusterRouter {
-    pub fn new(auth_token: Option<String>) -> Self {
-        let client = Client::builder()
-            .timeout(FORWARD_TIMEOUT)
-            .build()
-            .expect("reqwest::Client build");
-        Self { client, auth_token }
+    /// Build the inter-node forwarding client.
+    ///
+    /// When `tls_bundle` is `Some`, the client only trusts the cluster CA
+    /// (system roots disabled) and presents this node's leaf cert as a
+    /// client identity — i.e. mTLS, not bearer-token-over-TLS.
+    pub fn new(auth_token: Option<String>, tls_bundle: Option<&TlsBundle>) -> Result<Self> {
+        let mut builder = Client::builder().timeout(FORWARD_TIMEOUT);
+        let tls_enabled = tls_bundle.is_some();
+        if let Some(bundle) = tls_bundle {
+            let ca = reqwest::Certificate::from_pem(bundle.ca_cert_pem.as_bytes())
+                .context("parse cluster CA PEM for reqwest")?;
+            // Concatenated cert+key PEM is what reqwest's rustls-tls
+            // Identity::from_pem expects.
+            let identity_pem = format!("{}\n{}", bundle.node_cert_pem, bundle.node_key_pem);
+            let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
+                .context("build reqwest identity from node cert/key")?;
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca)
+                .identity(identity);
+        }
+        let client = builder.build().context("build reqwest client")?;
+        Ok(Self {
+            client,
+            auth_token,
+            tls_enabled,
+        })
+    }
+
+    fn scheme(&self) -> &'static str {
+        if self.tls_enabled { "https" } else { "http" }
     }
 
     fn with_auth(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -39,7 +66,8 @@ impl ClusterRouter {
         target_addr: &str,
         req: &QueryRequest,
     ) -> Result<QueryResponse> {
-        let url = format!("http://{target_addr}/query?local=true");
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/query?local=true");
         let resp = self
             .with_auth(self.client.post(&url).json(req))
             .send()
@@ -60,7 +88,8 @@ impl ClusterRouter {
         target_addr: &str,
         req: &InsertRequest,
     ) -> Result<InsertResponse> {
-        let url = format!("http://{target_addr}/insert?local=true");
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/insert?local=true");
         let resp = self
             .with_auth(self.client.post(&url).json(req))
             .send()
@@ -110,7 +139,7 @@ mod tests {
             ),
         );
         let addr = spawn_mock(app).await;
-        let router = ClusterRouter::new(None);
+        let router = ClusterRouter::new(None, None).unwrap();
         let resp = router
             .forward_query(
                 &addr,
@@ -146,7 +175,7 @@ mod tests {
             ),
         );
         let addr = spawn_mock(app).await;
-        let router = ClusterRouter::new(Some("s3cr3t".to_string()));
+        let router = ClusterRouter::new(Some("s3cr3t".to_string()), None).unwrap();
         let resp = router
             .forward_insert(
                 &addr,
@@ -179,7 +208,7 @@ mod tests {
             ),
         );
         let addr = spawn_mock(app).await;
-        let router = ClusterRouter::new(None);
+        let router = ClusterRouter::new(None, None).unwrap();
         let resp = router
             .forward_insert(
                 &addr,

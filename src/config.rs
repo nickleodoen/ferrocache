@@ -32,6 +32,8 @@ pub struct ClusterConfig {
     pub seed_nodes: Vec<String>,
     pub virtual_nodes: usize,
     pub replication_factor: usize,
+    #[serde(default)]
+    pub tls: ClusterTlsConfig,
 }
 
 impl Default for ClusterConfig {
@@ -43,8 +45,32 @@ impl Default for ClusterConfig {
             seed_nodes: Vec::new(),
             virtual_nodes: 64,
             replication_factor: 2,
+            tls: ClusterTlsConfig::default(),
         }
     }
+}
+
+/// mTLS for inter-node cluster traffic. Off by default; behavior is
+/// identical to pre-M18 when `enabled = false`.
+///
+/// When `enabled = true` and all three `*_path` fields are set, certs are
+/// loaded from disk (production mode). When any path is missing, a fresh CA
+/// + leaf cert pair is generated in memory and a warning is logged — useful
+///   for local smoke tests, never appropriate for production (every node
+///   would synthesize its own CA and they wouldn't trust each other).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ClusterTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub node_cert_path: Option<String>,
+    #[serde(default)]
+    pub node_key_path: Option<String>,
+    /// TLS listener port. When `None`, derived as `port + 1000` at startup.
+    #[serde(default)]
+    pub internal_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -160,5 +186,10 @@ mod tests {
         assert_eq!(c.cluster.replication_factor, 2);
         assert_eq!(c.compact_interval_inserts, 10_000);
         assert!(c.auth_token.is_none());
+        assert!(!c.cluster.tls.enabled);
+        assert!(c.cluster.tls.ca_cert_path.is_none());
+        assert!(c.cluster.tls.node_cert_path.is_none());
+        assert!(c.cluster.tls.node_key_path.is_none());
+        assert!(c.cluster.tls.internal_port.is_none());
     }
 }

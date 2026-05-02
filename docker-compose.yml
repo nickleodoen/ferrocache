@@ -13,11 +13,19 @@ services:
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
       # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
+      # To enable mTLS: run `cargo run --bin gen_certs node1 node2 node3`,
+      # mount `./certs` into each container at `/certs`, and uncomment:
+      # FERROCACHE_CLUSTER__TLS__ENABLED: "true"
+      # FERROCACHE_CLUSTER__TLS__CA_CERT_PATH: "/certs/ca.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH: "/certs/node1/cert.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH: "/certs/node1/key.pem"
+      # FERROCACHE_CLUSTER__TLS__INTERNAL_PORT: "4443"
       RUST_LOG: "info"
     ports:
       - "3001:3000"
     volumes:
       - node1-data:/data
+      # - ./certs:/certs:ro
     networks:
       - fc-net
 
@@ -35,11 +43,17 @@ services:
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
       # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
+      # FERROCACHE_CLUSTER__TLS__ENABLED: "true"
+      # FERROCACHE_CLUSTER__TLS__CA_CERT_PATH: "/certs/ca.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH: "/certs/node2/cert.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH: "/certs/node2/key.pem"
+      # FERROCACHE_CLUSTER__TLS__INTERNAL_PORT: "4443"
       RUST_LOG: "info"
     ports:
       - "3002:3000"
     volumes:
       - node2-data:/data
+      # - ./certs:/certs:ro
     networks:
       - fc-net
 
@@ -57,11 +71,17 @@ services:
       FERROCACHE_CLUSTER__REPLICATION_FACTOR: "2"
       FERROCACHE_CLUSTER__VIRTUAL_NODES: "64"
       # FERROCACHE_AUTH_TOKEN: "change-me-in-production"
+      # FERROCACHE_CLUSTER__TLS__ENABLED: "true"
+      # FERROCACHE_CLUSTER__TLS__CA_CERT_PATH: "/certs/ca.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH: "/certs/node3/cert.pem"
+      # FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH: "/certs/node3/key.pem"
+      # FERROCACHE_CLUSTER__TLS__INTERNAL_PORT: "4443"
       RUST_LOG: "info"
     ports:
       - "3003:3000"
     volumes:
       - node3-data:/data
+      # - ./certs:/certs:ro
     networks:
       - fc-net
 

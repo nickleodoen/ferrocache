@@ -24,3 +24,16 @@
 # seed_nodes = []
 # virtual_nodes = 64
 # replication_factor = 2
+
+# Inter-node mTLS (M18). When enabled, ferrocache binds a SECOND listener
+# on `internal_port` (default: port + 1000) for cluster traffic only. The
+# public port stays plain HTTP. All nodes must share the same cluster CA;
+# leave the *_path fields unset to auto-generate dev certs in memory
+# (warning: every node will synthesize its own CA — only useful for a
+# single-node smoke test, not a real cluster).
+# [cluster.tls]
+# enabled = false
+# ca_cert_path = "/certs/ca.pem"
+# node_cert_path = "/certs/node1/cert.pem"
+# node_key_path = "/certs/node1/key.pem"
+# internal_port = 4443

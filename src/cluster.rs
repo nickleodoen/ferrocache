@@ -26,7 +26,13 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
-    pub async fn new(node_id: &str, config: &ClusterConfig) -> Result<Self> {
+    /// `forward_addr` is the addr peers should use to reach this node for
+    /// replication forwarding. With TLS off, it's `config.api_addr`; with
+    /// TLS on, it's `host:internal_port`. The chitchat KV key stays
+    /// `api_addr` regardless — semantically it's "addr for peer forwards",
+    /// and a homogeneous cluster (all-TLS or none-TLS) means peers consume
+    /// it the same way.
+    pub async fn new(node_id: &str, config: &ClusterConfig, forward_addr: &str) -> Result<Self> {
         let gossip_addr: SocketAddr = config
             .gossip_addr
             .parse()
@@ -50,7 +56,7 @@ impl ClusterState {
             extra_liveness_predicate: None,
         };
 
-        let initial_kvs = vec![(API_ADDR_KEY.to_string(), config.api_addr.clone())];
+        let initial_kvs = vec![(API_ADDR_KEY.to_string(), forward_addr.to_string())];
         let handle = spawn_chitchat(chitchat_config, initial_kvs, &UdpTransport)
             .await
             .context("spawn_chitchat failed")?;
@@ -61,7 +67,7 @@ impl ClusterState {
         let ring = Arc::new(RwLock::new(ring));
 
         let mut addrs = HashMap::new();
-        addrs.insert(node_id.to_string(), config.api_addr.clone());
+        addrs.insert(node_id.to_string(), forward_addr.to_string());
         let addrs = Arc::new(RwLock::new(addrs));
 
         spawn_ring_reconciler(
@@ -69,7 +75,7 @@ impl ClusterState {
             ring.clone(),
             addrs.clone(),
             node_id.to_string(),
-            config.api_addr.clone(),
+            forward_addr.to_string(),
         );
 
         Ok(Self {
@@ -77,7 +83,7 @@ impl ClusterState {
             ring,
             addrs,
             self_node_id: node_id.to_string(),
-            self_api_addr: config.api_addr.clone(),
+            self_api_addr: forward_addr.to_string(),
             gossip_addr,
         })
     }
