@@ -80,6 +80,13 @@ pub struct NamespaceStatsEntry {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompactResponse {
+    pub status: String,
+    pub entries_snapshotted: usize,
+    pub wal_sequence: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ClusterStatusResponse {
     pub mode: &'static str,
     pub self_node_id: String,

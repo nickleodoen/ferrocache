@@ -4,7 +4,7 @@
 
 **What this is:** Distributed semantic cache for LLM applications, written in Rust. Single binary, multi-node via consistent hashing + gossip replication. Portfolio project for big-tech Core SWE interviews.
 
-**Current phase:** Phase 4 in progress. M14 done (namespaces). Next: M15 — WAL compaction.
+**Current phase:** Phase 4 in progress. M15 done (WAL compaction). Next: M16 — Prometheus /metrics.
 
 **Completed work:**
 - M1: axum scaffold (3 routes, tracing, env-based port)
@@ -20,6 +20,7 @@
 - M11: framework backends — `FerrocacheCache` (LangChain `BaseCache`) + `FerrocacheLLM` (LlamaIndex `CustomLLM` subclass); optional imports, fail-open default, custom `embed_fn` supported
 - M12: MCP server (`ferrocache.mcp_server`) over stdio — 3 tools (`semantic_cache_lookup`, `semantic_cache_store`, `cache_status`), text-in/JSON-out (embedding handled internally), Claude Desktop + Claude Code setup docs
 - M13: distribution — `pyproject.toml` with optional extras (`[openai]`, `[anthropic]`, `[langchain]`, `[llamaindex]`, `[mcp]`, `[all]`); base `pip install ferrocache` is zero-deps; root + Python LICENSE; release CI on `v*` tags publishes Docker image to GHCR and Python package to PyPI via OIDC trusted publishing
+- M14: namespace partitioning — `SemanticIndex` is a `HashMap<model_id → NamespacedIndex>`, each with its own HNSW + side-table; `model_id` required on `/insert` and `/query`; Python integrations auto-derive `model_id` from default embed model; PyPI bumped to 0.2.0; pre-M14 WAL entries migrate to `legacy::unknown`
 
 **Module map:**
 - lib.rs — re-exports modules so benches and external consumers can import
@@ -33,7 +34,8 @@
 - ring.rs — HashRing (BTreeMap<u64, node_id>, FNV-1a, virtual nodes, get_n_nodes for replica walk)
 - cluster.rs — ClusterState wrapping chitchat; reconciler syncs ring + node_id→api_addr map from gossip KV
 - router.rs — ClusterRouter (reqwest client) — forward_query / forward_insert to peers with `?local=true`
-- benches/cache_bench.rs — criterion: insert / query_hit / query_miss / insert_with_wal
+- snapshot.rs — `SnapshotEntry` + `write_snapshot`/`read_snapshot` (magic+version+wal_seq+bincode); `compact()` helper that writes the snapshot and truncates the WAL atomically
+- benches/cache_bench.rs — criterion: insert / query_hit / query_miss / insert_with_wal / snapshot_write_10k
 - clients/python/ferrocache.py — stdlib-only Python client (urllib + json)
 
 **Architecture decisions (append-only, one line each):**
@@ -66,6 +68,11 @@
 - `model_id` is required on `/insert` and `/query`; old WAL entries without it default to `legacy::unknown`
 - `model_id` format convention: `model_name::dimension` (e.g. `all-MiniLM-L6-v2::384`)
 - Cross-namespace queries are impossible by construction — vectors from different models never compare
+- Snapshot format: `magic (FERROSNA) + version (u64=1) + wal_sequence (u64) + entry_count (u64) + bincode-encoded Vec<SnapshotEntry>`; written atomically via temp+rename so a crash never corrupts the prior snapshot
+- Compaction: snapshot the side-table entries, then truncate the WAL — HNSW is rebuilt from stored embeddings on load (no need to serialize the graph itself)
+- WAL entries carry a monotonic `sequence: u64` that never resets — startup skips entries `<= snapshot_watermark` so the WAL tail replay is bounded
+- Auto-compaction every N inserts (default 10K via `compact_interval_inserts`, 0 disables); manual via `POST /admin/compact`
+- `CacheEntry` again stores `embedding` + `query_text` so snapshots can dump the full record (re-added in M15; was dropped in M4)
 
 **Non-negotiable constraints:**
 - No auth/TLS until Phase 5
@@ -80,35 +87,6 @@
 - Summarize deleted sessions as one-line entries under "Completed work" above
 
 ## Section 2: Rolling Session Log (last 2 sessions only)
-
-### 2026-05-01 — Mission 13: Distribution (PyPI + GHCR + release CI)
-**Built:** `clients/python/pyproject.toml` (PEP 621) declaring `ferrocache 0.1.0` with the `setuptools.build_meta` backend, MIT license, Python 3.9-3.13 classifiers, `[project.urls]` pointing at the GitHub repo, and `[project.optional-dependencies]` with seven extras: `[openai]` `[anthropic]` `[langchain]` `[llamaindex]` `[mcp]` `[embeddings]` `[all]`. The base install has zero deps. `[tool.setuptools.packages.find]` picks up `ferrocache` and all submodules under `clients/python/`. PyPI-facing `clients/python/README.md` (concise — install matrix, quick start, framework + MCP snippets, env-var table). `MANIFEST.in` includes README + LICENSE. New MIT `LICENSE` at repo root and copy in `clients/python/`. New `.github/workflows/release.yml` triggered on `v*` tags, two jobs: `docker` (login to GHCR with `GITHUB_TOKEN`, build + push `ghcr.io/nickleodoen/ferrocache:<version>` and `:latest` via `docker/build-push-action@v5` + Buildx) and `pypi` (set up Python 3.12, `python -m build` in `clients/python/`, publish via `pypa/gh-action-pypi-publish` using OIDC trusted publishing — no API token committed; needs to be configured once on pypi.org). Updated root README's Quickstart to lead with `docker run ghcr.io/nickleodoen/ferrocache` and `pip install ferrocache`, plus a full installation matrix.
-
-**Verified:**
-- `python -m build` in `clients/python/` produces `ferrocache-0.1.0.tar.gz` + `ferrocache-0.1.0-py3-none-any.whl` containing all 7 modules (`__init__`, `client`, `_embed`, `middleware`, `langchain`, `llamaindex`, `mcp_server`) + LICENSE in `dist-info/licenses/`.
-- Fresh venv `pip install ferrocache-0.1.0-py3-none-any.whl` installs ferrocache + pip only (zero extra deps). All four base imports succeed: `from ferrocache import FerrocacheClient, FerrocacheError`, `from ferrocache.middleware import wrap_openai, wrap_anthropic`, `from ferrocache.langchain import FerrocacheCache`, `from ferrocache.llamaindex import FerrocacheLLM`.
-- Instantiating `FerrocacheCache()` / `FerrocacheLLM(inner=None)` without the optional dep raises the expected ImportErrors (`"... requires langchain-core. Install it with..."`).
-- `pip install ferrocache[mcp]` from the wheel pulls `mcp 1.27.0` + `sentence-transformers 5.4.1` and `from ferrocache.mcp_server import FerrocacheTools, TOOL_DEFINITIONS` works.
-- Existing test suites still pass: 40 Rust + 30 Python.
-- `release.yml` parses as valid YAML; jobs `docker` + `pypi` declared, `on.push.tags=['v*']` only.
-
-**Key decisions:**
-- Used `setuptools.build_meta` (the standard backend) — the brief's `setuptools.backends._legacy:_Backend` is not a real path; clearly a typo.
-- Base package has *zero* runtime deps — the stdlib HTTP client works on its own. Every framework SDK lives behind an extra. `pip install ferrocache` in CI for a project that only uses the HTTP client takes <1s.
-- PyPI publish via OIDC trusted publishing (no `PYPI_API_TOKEN` secret committed). One-time setup on pypi.org wires the GitHub repo + workflow as a trusted publisher; tokens then come from GitHub OIDC at runtime.
-- Docker tags both `<version>` and `latest` so users can pin or float — same `docker compose` config in this repo can target either.
-- License file lives at repo root AND in `clients/python/` — the wheel's `MANIFEST.in` only sees the latter, but the repo root one is canonical.
-- Did NOT push a tag this mission. Wheel/sdist verified locally; first real publish happens when `git tag v0.1.0 && git push --tags` runs the workflow.
-
-**Deviations:**
-- Brief's build-backend was wrong (`setuptools.backends._legacy:_Backend`); used `setuptools.build_meta`. Confirmed the wheel builds and installs.
-- Brief left author email as a placeholder; used the git-config email `nikhilram@gmail.com`. Likewise `Nikhil Yachareni` from `git config user.name`.
-- Added `docker/setup-buildx-action@v3` step to the release workflow — `docker/build-push-action@v5` runs faster and supports more cache options with Buildx enabled. Not strictly required but standard practice.
-- Skipped TestPyPI; the brief flagged it as optional. Local wheel install in a fresh venv covers the same failure modes.
-
-**Project shipped.** No M14 planned. Future polish (non-blocking): WAL compaction/snapshotting, /metrics endpoint (Prometheus), TLS+auth (Phase 3 constraint deferred), async OpenAI/Anthropic wrappers, native async LangChain/LlamaIndex backends (`alookup`, `acomplete`), node-failure resilience tests.
-
-**Open:** First real publish requires (a) configuring pypi.org trusted publishing for `nickleodoen/ferrocache`, (b) creating the `pypi` GitHub environment, (c) tagging `v0.1.0` and pushing. The Rust crate is *not* on crates.io yet — would need `cargo publish` and a `crates.io` token, which is a separate mission if pursued.
 
 ### 2026-05-01 — Mission 14: Embedding Namespaces + Default Embed Model
 **Built (Rust):** Refactored `SemanticIndex` from a single HNSW into `HashMap<String, NamespacedIndex>` keyed by `model_id`. Each namespace owns its own `Hnsw<f32, DistCosine>`, side-table `HashMap<usize, CacheEntry>`, `next_id` counter, and dimension lock. `NamespacedIndex` is the M13-era index in miniature; `SemanticIndex` is now a thin lazy-init dispatcher with `namespaces`, `hnsw_config`, `namespace_mut(model_id)` (or-insert-with), `replay_entry`, `query(emb, threshold, model_id)` (returns `Ok(None)` for unknown namespace — miss, not error), `entry_count()` (sum), `namespace_stats() -> HashMap<String, NamespaceStats>`, and a backward-compat `dimension()`. `WalEntry` gained `model_id: String` with `#[serde(default = "legacy_namespace")]` returning the new public constant `LEGACY_NAMESPACE = "legacy::unknown"`; pre-M14 lines without the field are silently quarantined into that namespace on replay. Wire protocol: `InsertRequest` and `QueryRequest` carry an `Option<String>` `model_id` — modeled as Option so the server returns a clean 400 (`"model_id is required"`) instead of a serde rejection. `validate_model_id` helper on the inbound path; `local_insert_inner` constructs the `WalEntry` with the supplied id (and rejects empty/whitespace). `/stats` response gained a `namespaces: HashMap<String, NamespaceStatsEntry>` map (`{ entry_count, dimension }` per namespace). Removed the global "any-dim mismatch" pre-check from `local_insert_inner` — dimension is now enforced per-namespace by `NamespacedIndex` so different models can coexist with different dims. Updated all 4 criterion benches to pass `MODEL_ID = "bench-model::384"`. Updated `tests/cluster_integration.sh` to thread `"model_id": "test-model::4"` through every insert/query.
@@ -142,3 +120,34 @@
 **Next session (M15 if pursued):** WAL compaction / snapshotting — the WAL grows unbounded as inserts accumulate. A snapshot mechanism (write the live index state to disk on shutdown / SIGUSR1, replay snapshot + tail-WAL on startup) would cap startup time and disk use. Related: `/metrics` endpoint (Prometheus exposition format) for namespace counts, query latencies, replication failures.
 
 **Open:** Pre-existing WAL files written by a 0.1.0 server will replay correctly into the M14 server (entries land in `legacy::unknown`), but those entries are unreachable via the new HTTP API unless the user passes `model_id="legacy::unknown"` explicitly. Document this in a migration note before the v0.2.0 release. The `dimension` field on `StatsHnsw` is now misleading for multi-namespace deployments (returns one namespace's dim arbitrarily) — kept for backward compat, but `namespaces` is the canonical inspection point. No async-aware version of the per-namespace lock exists; the global `RwLock<SemanticIndex>` still serializes namespace-creation, which is fine at cache scale but could become contention if a single node hosts 10k+ namespaces. No `cargo bench` run was performed in this mission — namespace lookup adds a HashMap deref before HNSW search, expected overhead is sub-microsecond and below criterion's noise floor.
+
+### 2026-05-02 — Mission 15: WAL Compaction + Snapshotting
+**Built:** New `src/snapshot.rs` (added to `lib.rs`) with `SnapshotEntry { uuid, embedding, response, query_text, model_id }`, `MAGIC = 0x4645_5252_4F53_4E41` ("FERROSNA"), `VERSION = 1`. `write_snapshot(path, entries, wal_sequence)` writes magic+version+wal_sequence+entry_count headers (32 bytes, little-endian) followed by `bincode::serialize(entries)` to `{path}.tmp`, fsyncs, then `tokio::fs::rename` to `path` — atomic; a crash mid-write never touches the prior snapshot. `read_snapshot(path)` validates each header field (descriptive error on magic mismatch / unsupported version / count mismatch), returns `(Vec<SnapshotEntry>, wal_sequence)`. `compact(index, wal, snapshot_path, wal_path)` flattens via `index.snapshot_entries()`, writes the snapshot, then calls `wal.truncate(wal_path)` (which fsyncs an empty file then reopens for append; the in-memory `Wal::sequence` counter persists across truncate). `snapshot_path_for(wal_path) -> PathBuf` derives `{wal}.snap`. `WalEntry` gained `sequence: u64` with `#[serde(default)]` so pre-M15 lines default to 0; `Wal::open_with_sequence`, `Wal::current_sequence()`, and `Wal::append` (now returns the assigned `u64` and stamps `entry.sequence` before serialization). `CacheEntry` re-gained `embedding: Vec<f32>` and `query_text: String` (dropped in M4 because "WAL was source of truth" — needed back so snapshots can dump the full record without re-reading the WAL). `SemanticIndex::snapshot_entries() -> Vec<SnapshotEntry>` and `replay_snapshot_entry(SnapshotEntry)` round-trip cleanly. `AppState` gained `snapshot_path: PathBuf`, `compact_interval_inserts: u64`, and `inserts_since_compact: AtomicU64`. `FerrocacheConfig::compact_interval_inserts` (default 10_000; serde default + config-rs default both wired). After every successful local insert (still under the WAL mutex), the counter increments and on threshold the index read lock is taken inline and `snapshot::compact(...)` runs — same caller blocks until done, but subsequent inserts wait on the WAL mutex anyway. New `POST /admin/compact` returns `{ status, entries_snapshotted, wal_sequence }`. Startup in `main.rs` now: try `read_snapshot` if file exists → on success, `replay_snapshot_entry` everything and capture `snapshot_sequence`; on corrupt/unreadable → log warning and proceed; full `Wal::replay` always runs but entries are filtered to `sequence > snapshot_sequence` when a snapshot loaded; the WAL is reopened with `Wal::open_with_sequence` set to `max(snapshot_sequence, last_replayed_sequence)`. New criterion bench `bench_snapshot_write_10k` measures `write_snapshot` of 10K 384-dim entries. Updated all existing call sites: `WalEntry { ..., sequence: 0 }` (stamped on append); test `build_state` constructs a snapshot path and disables auto-compaction (`compact_interval_inserts = 0`); benches' `make_entry`. Added `bincode = "1"` to `Cargo.toml`.
+
+**Verified:**
+- `cargo test` — 64/64 pass (was 51 before; +5 snapshot-module tests, +3 wal sequence tests, +1 index round-trip, +3 server tests covering /admin/compact, full snapshot+restart, and corrupt-snapshot fallback).
+- `cargo clippy --all-targets -- -D warnings` — clean (after replacing literal `0.7071` with `std::f32::consts::FRAC_1_SQRT_2` in a test vector to dodge `clippy::approx_constant`).
+- `cargo fmt --check` — clean.
+- `cargo build --release --bin ferrocache` — clean.
+- End-to-end smoke test on the release binary: insert 3 entries → POST `/admin/compact` returns `{"entries_snapshotted":3,"wal_sequence":3}`, snapshot file exists, WAL on disk truncated to 0 bytes → kill → restart → log shows `snapshot loaded loaded=3 wal_sequence=3` then `startup replay complete wal_tail_entries=0 snapshot_watermark=3` → query returns `hit=true,response="r1",similarity=1.0`. Verified the in-memory `Wal::sequence` counter keeps going (truncate+append goes to seq 4, not 1) via `test_wal_truncate_keeps_sequence_counter`.
+
+**Key decisions:**
+- Snapshot side-table data, not the HNSW graph. Rebuild HNSW from stored embeddings on load. Two reasons: (a) hnsw_rs doesn't expose the graph in a portable way, and (b) rebuild cost is bounded by *snapshot size*, not unbounded WAL size — already a strict win even if HNSW serialization were free. Cost: a 10K-entry snapshot takes O(10K * log10K) HNSW inserts on startup, but that's still much faster than replaying a 10K-line WAL plus everything written since.
+- Atomic temp+rename for snapshots is the *only* safe write path. Half-written snapshot + fsync on the wrong file would silently corrupt restart; the rename is a single inode-level atomic operation on POSIX.
+- Auto-compaction trigger fires *inline* on the insert that crosses the threshold (not in a background task). Reasoning: the trigger thread already holds the WAL mutex, so spawning a task would just queue up behind itself, and the simpler synchronous path means there's no "concurrent compactions" failure mode to defend against. The atomic `fetch_add` + threshold check ensures only one insert per cycle triggers compaction. `compact_interval_inserts = 0` disables auto-compaction (used in tests; manual /admin/compact still works).
+- WAL sequence numbers don't reset on truncate. After compaction, the next append continues from `seq + 1`. This means sequences are globally monotonic across the lifetime of the WAL file, which is what makes the `entry.sequence > snapshot_watermark` filter on startup correct.
+- `Wal::append` now returns the assigned sequence. Stamps `entry.sequence` from the caller's WalEntry before serialization — caller can pass `sequence: 0` and the WAL will overwrite with the real value. This keeps the API ergonomic (callers don't need to know the next seq) without forcing a `&mut` ref to the entry.
+- Snapshot path is derived from WAL path (`{wal}.snap`), not separately configurable. One fewer config knob; a user who wants to store the snapshot elsewhere can symlink. Reduces footguns where snapshot and WAL get out of sync because they were configured to different volumes.
+- New `CacheEntry` fields (`embedding`, `query_text`) cost ~1.5KB per entry at 384-dim — still tiny next to HNSW graph memory. Trading a bit of RAM for a much smaller snapshot serialization codepath (no need for a parallel WAL-tail re-read at compaction time).
+
+**Deviations:**
+- Brief asked for `embedding: Vec<f32>` on `CacheEntry` only; also re-added `query_text: String` because (a) the brief explicitly said "Also re-add `query_text: String` to `CacheEntry` if it was also dropped" and (b) the snapshot needs it to round-trip the full record.
+- Brief specified the snapshot header as `[8 magic][8 version][8 wal_sequence][8 entry_count][bincode...]`. Implemented exactly with little-endian byte order. Total 32-byte header.
+- Brief's `CompactionResult` had `old_wal_entries: u64`. Dropped that field — it isn't observable from inside `compact()` (we no longer have a count of WAL lines before truncate, only the sequence number, which is what the operator actually needs). Kept `entries_snapshotted` and `wal_sequence`.
+- Brief test `test_compact_endpoint` was specified as inserting "some entries"; used 3 entries with distinct namespaces' style assertions (`entries_snapshotted == 3`, `wal_sequence == 3`).
+- Brief test `test_startup_with_snapshot` said "embeddings `[i, 0, 0]`" implicitly. Used distinct unit-direction vectors instead — colinear scalar multiples have cosine similarity = 1.0, so the nearest neighbor for any of them is HNSW-internal-id 0, making "tail entry survives" indistinguishable from "first entry survives." Switched to `[1,0,0,0]`, `[0,1,0,0]`, `[0,0,1,0]`, `[1/√2, 1/√2, 0, 0]`, `[1/√3, 1/√3, 1/√3, 0]`, with a tail vector `[0,0,0,1]` that's orthogonal to all of them.
+- Brief mentioned `tokio::spawn` for auto-compaction "BUT the compaction task needs to acquire locks, so the next insert will wait for it anyway — simpler to just run it inline." Did exactly the inline path; documented in the code comment.
+
+**Next session (M16):** Prometheus `/metrics` endpoint. Counters: insert/query/cache_hit/cache_miss/replication_failure totals, namespace count, entries_per_namespace, last_compact_timestamp. Histograms: query_duration_seconds, insert_duration_seconds (with bucket selections appropriate for sub-millisecond → tens-of-ms ranges). Probably wire `prometheus = "0.13"` or use an axum-native metrics crate. Want labels `{ namespace, hit }` on query counter so dashboards can split by model.
+
+**Open:** Compaction holds the WAL lock + index read lock for the duration of the snapshot write — at 10K entries, this is sub-second on local disk but could be problematic on slow disks or for very large indexes (100K+). A non-blocking approach (clone the side-table into a separate buffer under brief lock, then write to disk afterwards) is straightforward but adds ~entry-size bytes of transient memory; deferred. The bench `bench_snapshot_write_10k` was added but not run with `cargo bench` in this session (no real numbers in this log). The snapshot file is unencrypted on disk — not a regression vs the WAL (also unencrypted), but worth flagging for the eventual TLS+at-rest-encryption pass. There is no online `/admin/snapshot-info` endpoint; `/stats` could grow a `last_snapshot_sequence` field next mission.

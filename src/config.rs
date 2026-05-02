@@ -11,6 +11,12 @@ pub struct FerrocacheConfig {
     pub hnsw: HnswConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default = "default_compact_interval_inserts")]
+    pub compact_interval_inserts: u64,
+}
+
+fn default_compact_interval_inserts() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,6 +60,7 @@ impl Default for FerrocacheConfig {
             wal_path: "./ferrocache.wal".to_string(),
             hnsw: HnswConfig::default(),
             cluster: ClusterConfig::default(),
+            compact_interval_inserts: default_compact_interval_inserts(),
         }
     }
 }
@@ -101,6 +108,10 @@ impl FerrocacheConfig {
                 "cluster.replication_factor",
                 defaults.cluster.replication_factor as i64,
             )?
+            .set_default(
+                "compact_interval_inserts",
+                defaults.compact_interval_inserts as i64,
+            )?
             .add_source(File::with_name("ferrocache").required(false))
             .add_source(
                 // FERROCACHE_PORT → port; FERROCACHE_CLUSTER__ENABLED → cluster.enabled.
@@ -141,5 +152,6 @@ mod tests {
         assert!(c.cluster.seed_nodes.is_empty());
         assert_eq!(c.cluster.virtual_nodes, 64);
         assert_eq!(c.cluster.replication_factor, 2);
+        assert_eq!(c.compact_interval_inserts, 10_000);
     }
 }

@@ -3,6 +3,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferrocache::config::HnswConfig;
 use ferrocache::index::SemanticIndex;
+use ferrocache::snapshot::write_snapshot;
 use ferrocache::wal::{Wal, WalEntry};
 
 const DIM: usize = 384;
@@ -35,6 +36,7 @@ fn make_entry(seed: u64) -> WalEntry {
         response: format!("response-{seed}"),
         query_text: format!("query-{seed}"),
         model_id: MODEL_ID.to_string(),
+        sequence: 0,
     }
 }
 
@@ -115,11 +117,39 @@ fn bench_insert_with_wal(c: &mut Criterion) {
     });
 }
 
+fn bench_snapshot_write_10k(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let idx = populate(10_000);
+    let entries = idx.snapshot_entries();
+
+    c.bench_function("snapshot_write_10k_384d", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("snap");
+                (dir, path)
+            },
+            |(_dir, path)| {
+                runtime.block_on(async {
+                    write_snapshot(black_box(&path), black_box(&entries), 0)
+                        .await
+                        .unwrap();
+                });
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_insert,
     bench_query_hit,
     bench_query_miss,
-    bench_insert_with_wal
+    bench_insert_with_wal,
+    bench_snapshot_write_10k
 );
 criterion_main!(benches);

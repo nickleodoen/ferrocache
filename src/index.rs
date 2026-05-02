@@ -4,11 +4,14 @@ use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
 use crate::config::HnswConfig;
+use crate::snapshot::SnapshotEntry;
 use crate::wal::WalEntry;
 
 pub struct CacheEntry {
     pub uuid: String,
+    pub embedding: Vec<f32>,
     pub response: String,
+    pub query_text: String,
 }
 
 #[derive(Debug)]
@@ -57,6 +60,7 @@ impl NamespacedIndex {
         uuid: String,
         embedding: Vec<f32>,
         response: String,
+        query_text: String,
     ) -> Result<()> {
         match self.dimension {
             None => self.dimension = Some(embedding.len()),
@@ -73,8 +77,20 @@ impl NamespacedIndex {
         let id = self.next_id;
         self.next_id += 1;
         self.hnsw.insert((&embedding, id));
-        self.entries.insert(id, CacheEntry { uuid, response });
+        self.entries.insert(
+            id,
+            CacheEntry {
+                uuid,
+                embedding,
+                response,
+                query_text,
+            },
+        );
         Ok(())
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &CacheEntry> {
+        self.entries.values()
     }
 
     pub fn query(&self, embedding: &[f32], threshold: f32) -> Result<Option<QueryHit>> {
@@ -146,12 +162,16 @@ impl SemanticIndex {
         &mut self,
         embedding: Vec<f32>,
         response: String,
-        _query_text: String,
+        query_text: String,
         model_id: &str,
     ) -> Result<String> {
         let uuid = uuid::Uuid::new_v4().to_string();
-        self.namespace_mut(model_id)
-            .insert_with_uuid(uuid.clone(), embedding, response)?;
+        self.namespace_mut(model_id).insert_with_uuid(
+            uuid.clone(),
+            embedding,
+            response,
+            query_text,
+        )?;
         Ok(uuid)
     }
 
@@ -160,11 +180,42 @@ impl SemanticIndex {
             uuid,
             embedding,
             response,
+            query_text,
             model_id,
             ..
         } = entry;
         self.namespace_mut(&model_id)
-            .insert_with_uuid(uuid, embedding, response)
+            .insert_with_uuid(uuid, embedding, response, query_text)
+    }
+
+    pub fn replay_snapshot_entry(&mut self, entry: SnapshotEntry) -> Result<()> {
+        let SnapshotEntry {
+            uuid,
+            embedding,
+            response,
+            query_text,
+            model_id,
+        } = entry;
+        self.namespace_mut(&model_id)
+            .insert_with_uuid(uuid, embedding, response, query_text)
+    }
+
+    /// Flatten every namespace into a `Vec<SnapshotEntry>`. Used by
+    /// compaction; the result is a complete picture of in-memory state.
+    pub fn snapshot_entries(&self) -> Vec<SnapshotEntry> {
+        let mut out = Vec::with_capacity(self.entry_count());
+        for (model_id, ns) in &self.namespaces {
+            for entry in ns.entries() {
+                out.push(SnapshotEntry {
+                    uuid: entry.uuid.clone(),
+                    embedding: entry.embedding.clone(),
+                    response: entry.response.clone(),
+                    query_text: entry.query_text.clone(),
+                    model_id: model_id.clone(),
+                });
+            }
+        }
+        out
     }
 
     pub fn query(
@@ -361,5 +412,50 @@ mod tests {
         let idx = test_index();
         let result = idx.query(&[0.1, 0.2, 0.3], 0.5, "never-seen::3").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_entries_roundtrip() {
+        let mut src = test_index();
+        src.insert(
+            vec![1.0, 0.0, 0.0],
+            "model-a-resp".into(),
+            "qa".into(),
+            "model-a::3",
+        )
+        .unwrap();
+        src.insert(
+            vec![0.0, 1.0, 0.0],
+            "model-a-resp2".into(),
+            "qa2".into(),
+            "model-a::3",
+        )
+        .unwrap();
+        src.insert(
+            vec![1.0, 0.0, 0.0, 0.0],
+            "model-b-resp".into(),
+            "qb".into(),
+            "model-b::4",
+        )
+        .unwrap();
+
+        let snap = src.snapshot_entries();
+        assert_eq!(snap.len(), 3);
+
+        let mut dst = test_index();
+        for e in snap {
+            dst.replay_snapshot_entry(e).unwrap();
+        }
+        assert_eq!(dst.entry_count(), 3);
+        let hit = dst
+            .query(&[1.0_f32, 0.0, 0.0], 0.90, "model-a::3")
+            .unwrap()
+            .expect("should hit");
+        assert_eq!(hit.response, "model-a-resp");
+        let hit_b = dst
+            .query(&[1.0_f32, 0.0, 0.0, 0.0], 0.90, "model-b::4")
+            .unwrap()
+            .expect("should hit");
+        assert_eq!(hit_b.response, "model-b-resp");
     }
 }

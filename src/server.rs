@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::{
     Json, Router,
@@ -10,9 +11,10 @@ use axum::{
 use serde::Deserialize;
 
 use crate::models::{
-    ClusterStatusResponse, ErrorResponse, HealthResponse, InsertRequest, InsertResponse,
-    NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
+    ClusterStatusResponse, CompactResponse, ErrorResponse, HealthResponse, InsertRequest,
+    InsertResponse, NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw, StatsResponse,
 };
+use crate::snapshot;
 use crate::state::AppState;
 use crate::wal::WalEntry;
 
@@ -38,6 +40,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
         .route("/cluster/status", get(cluster_status_handler))
+        .route("/admin/compact", post(compact_handler))
         .with_state(state)
 }
 
@@ -261,6 +264,7 @@ async fn local_insert_inner(
         response: req.response.clone(),
         query_text: req.query_text.clone(),
         model_id,
+        sequence: 0, // stamped by Wal::append
     };
 
     if let Err(e) = wal.append(&entry).await {
@@ -285,8 +289,63 @@ async fn local_insert_inner(
             .into_response());
     }
 
+    // Auto-compaction: still holding the WAL lock, so a peer's concurrent
+    // insert can't race us. The threshold check + reset is only crossed
+    // by one insert at a time per node.
+    let interval = state.compact_interval_inserts;
+    if interval > 0 {
+        let prev = state.inserts_since_compact.fetch_add(1, Ordering::Relaxed);
+        if prev + 1 >= interval {
+            state.inserts_since_compact.store(0, Ordering::Relaxed);
+            let index = state.index.read().await;
+            let wal_path = std::path::Path::new(&state.wal_path);
+            match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
+                Ok(result) => {
+                    tracing::info!(
+                        snapshotted = result.entries_snapshotted,
+                        wal_sequence = result.wal_sequence,
+                        "auto-compaction fired"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "auto-compaction failed; continuing");
+                }
+            }
+        }
+    }
+
     tracing::info!(id = %uuid, dim, "inserted");
     Ok(uuid)
+}
+
+async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
+    let mut wal = state.wal.lock().await;
+    let index = state.index.read().await;
+    let wal_path = std::path::Path::new(&state.wal_path);
+    match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
+        Ok(result) => {
+            state.inserts_since_compact.store(0, Ordering::Relaxed);
+            (
+                StatusCode::OK,
+                Json(CompactResponse {
+                    status: "ok".to_string(),
+                    entries_snapshotted: result.entries_snapshotted,
+                    wal_sequence: result.wal_sequence,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "compaction failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("compaction failed: {e}"),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -365,15 +424,18 @@ mod tests {
     async fn build_state(wal_path: PathBuf) -> Arc<AppState> {
         let hnsw = HnswConfig::default();
         let wal = Wal::open(&wal_path).await.unwrap();
+        let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
         Arc::new(AppState::new(
             "test-node".to_string(),
             SemanticIndex::new(&hnsw),
             wal,
             wal_path.to_string_lossy().into_owned(),
+            snapshot_path,
             hnsw,
             None,
             None,
             1,
+            0, // disable auto-compaction in tests
         ))
     }
 
@@ -823,6 +885,174 @@ mod tests {
         let nodes = body["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0], "test-node");
+    }
+
+    #[tokio::test]
+    async fn test_compact_endpoint() {
+        let (app, state, _dir) = test_app().await;
+        for v in [
+            json!([1.0_f32, 0.0, 0.0]),
+            json!([0.0_f32, 1.0, 0.0]),
+            json!([0.0_f32, 0.0, 1.0]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    "/insert",
+                    json!({
+                        "embedding": v,
+                        "response": "r",
+                        "query_text": "q",
+                        "model_id": MID,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(post_json("/admin/compact", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["entries_snapshotted"], 3);
+        assert_eq!(body["wal_sequence"], 3);
+        assert!(state.snapshot_path.exists(), "snapshot file must exist");
+    }
+
+    #[tokio::test]
+    async fn test_startup_with_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("startup.wal");
+        // Distinct unit-direction embeddings so each entry is its own nearest neighbor.
+        let r2 = std::f32::consts::FRAC_1_SQRT_2;
+        let r3 = 1.0_f32 / 3.0_f32.sqrt();
+        let snapshot_vecs: [[f32; 4]; 5] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [r2, r2, 0.0, 0.0],
+            [r3, r3, r3, 0.0],
+        ];
+        let tail_vec: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+        // Round 1: insert via the router, then compact via the endpoint.
+        {
+            let state = build_state(wal_path.clone()).await;
+            let app = build_router(state.clone());
+            for (i, v) in snapshot_vecs.iter().enumerate() {
+                let payload = json!({
+                    "embedding": v,
+                    "response": format!("r{i}"),
+                    "query_text": format!("q{i}"),
+                    "model_id": MID
+                });
+                let response = app
+                    .clone()
+                    .oneshot(post_json("/insert", payload))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            let response = app
+                .oneshot(post_json("/admin/compact", json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state.snapshot_path.exists());
+            // One more insert AFTER the snapshot — this should land in the WAL tail.
+            let app2 = build_router(state.clone());
+            let payload = json!({
+                "embedding": tail_vec,
+                "response": "tail-r",
+                "query_text": "tail-q",
+                "model_id": MID
+            });
+            app2.oneshot(post_json("/insert", payload)).await.unwrap();
+        }
+
+        // Round 2: simulate restart by replaying snapshot + WAL tail manually.
+        let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+        let (snap_entries, snap_seq) = crate::snapshot::read_snapshot(&snapshot_path)
+            .await
+            .unwrap();
+        assert_eq!(snap_entries.len(), 5);
+        assert_eq!(snap_seq, 5);
+
+        let mut fresh = SemanticIndex::new(&HnswConfig::default());
+        for e in snap_entries {
+            fresh.replay_snapshot_entry(e).unwrap();
+        }
+        let tail: Vec<_> = Wal::replay(&wal_path)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.sequence > snap_seq)
+            .collect();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].response, "tail-r");
+        for e in tail {
+            fresh.replay_entry(e).unwrap();
+        }
+        assert_eq!(fresh.entry_count(), 6);
+
+        let hit = fresh
+            .query(&tail_vec, 0.90, MID)
+            .unwrap()
+            .expect("tail entry survives restart");
+        assert_eq!(hit.response, "tail-r");
+        let hit2 = fresh
+            .query(&snapshot_vecs[2], 0.90, MID)
+            .unwrap()
+            .expect("snapshotted entry survives restart");
+        assert_eq!(hit2.response, "r2");
+    }
+
+    #[tokio::test]
+    async fn test_startup_corrupt_snapshot_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("fb.wal");
+        let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+
+        // Seed the WAL with two entries directly.
+        {
+            let mut wal = Wal::open(&wal_path).await.unwrap();
+            for i in 0..2u32 {
+                wal.append(&WalEntry {
+                    uuid: format!("u{i}"),
+                    embedding: vec![i as f32, 0.0, 0.0],
+                    response: format!("r{i}"),
+                    query_text: format!("q{i}"),
+                    model_id: MID.to_string(),
+                    sequence: 0,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        // Write garbage at the snapshot path.
+        tokio::fs::write(&snapshot_path, b"this is not a snapshot")
+            .await
+            .unwrap();
+
+        // read_snapshot must error cleanly (callers fall back to full WAL replay).
+        assert!(
+            crate::snapshot::read_snapshot(&snapshot_path)
+                .await
+                .is_err()
+        );
+
+        // Full WAL replay still recovers everything.
+        let entries = Wal::replay(&wal_path).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut fresh = SemanticIndex::new(&HnswConfig::default());
+        for e in entries {
+            fresh.replay_entry(e).unwrap();
+        }
+        assert_eq!(fresh.entry_count(), 2);
     }
 
     #[tokio::test]

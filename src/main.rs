@@ -8,6 +8,7 @@ use ferrocache::config::FerrocacheConfig;
 use ferrocache::index::SemanticIndex;
 use ferrocache::router::ClusterRouter;
 use ferrocache::server;
+use ferrocache::snapshot;
 use ferrocache::state::AppState;
 use ferrocache::wal::Wal;
 
@@ -27,21 +28,65 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    tracing::info!(path = %config.wal_path, "WAL path");
+    let snapshot_path = snapshot::snapshot_path_for(&config.wal_path);
+    tracing::info!(
+        wal_path = %config.wal_path,
+        snapshot_path = %snapshot_path.display(),
+        "WAL paths"
+    );
+
+    let mut index = SemanticIndex::new(&config.hnsw);
+
+    // Try snapshot first; fall back to full WAL replay if missing or corrupt.
+    let snapshot_sequence: Option<u64> = if snapshot_path.exists() {
+        match snapshot::read_snapshot(&snapshot_path).await {
+            Ok((entries, seq)) => {
+                let count = entries.len();
+                let mut loaded = 0usize;
+                for e in entries {
+                    match index.replay_snapshot_entry(e) {
+                        Ok(()) => loaded += 1,
+                        Err(err) => tracing::warn!(error = %err, "snapshot entry rejected"),
+                    }
+                }
+                tracing::info!(loaded, total = count, wal_sequence = seq, "snapshot loaded");
+                Some(seq)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot read failed; falling back to full WAL replay");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let entries = Wal::replay(&config.wal_path)
         .await
         .context("WAL replay failed")?;
-    let mut index = SemanticIndex::new(&config.hnsw);
     let mut replayed = 0usize;
+    let mut max_seq = snapshot_sequence.unwrap_or(0);
+    let watermark = snapshot_sequence.unwrap_or(0);
+    let only_tail = snapshot_sequence.is_some();
     for entry in entries {
+        if only_tail && entry.sequence <= watermark {
+            continue;
+        }
+        if entry.sequence > max_seq {
+            max_seq = entry.sequence;
+        }
         match index.replay_entry(entry) {
             Ok(()) => replayed += 1,
             Err(e) => tracing::warn!(error = %e, "WAL replay entry rejected"),
         }
     }
-    tracing::info!(count = replayed, "WAL replay complete");
+    tracing::info!(
+        wal_tail_entries = replayed,
+        snapshot_watermark = watermark,
+        "startup replay complete"
+    );
 
-    let wal = Wal::open(&config.wal_path)
+    let wal = Wal::open_with_sequence(&config.wal_path, max_seq)
         .await
         .context("WAL open failed")?;
 
@@ -68,10 +113,12 @@ async fn main() -> anyhow::Result<()> {
         index,
         wal,
         config.wal_path.clone(),
+        snapshot_path,
         config.hnsw.clone(),
         cluster,
         router,
         config.cluster.replication_factor.max(1),
+        config.compact_interval_inserts,
     ));
     let app = server::build_router(state.clone());
 

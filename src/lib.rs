@@ -5,5 +5,6 @@ pub mod models;
 pub mod ring;
 pub mod router;
 pub mod server;
+pub mod snapshot;
 pub mod state;
 pub mod wal;

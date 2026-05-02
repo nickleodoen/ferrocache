@@ -21,14 +21,23 @@ pub struct WalEntry {
     /// Old WAL entries lacking this field are migrated to `legacy::unknown`.
     #[serde(default = "legacy_namespace")]
     pub model_id: String,
+    /// Monotonically increasing sequence number; used by compaction to skip
+    /// entries already captured in a snapshot. Old WAL entries default to 0.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 pub struct Wal {
     file: File,
+    sequence: u64,
 }
 
 impl Wal {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_sequence(path, 0).await
+    }
+
+    pub async fn open_with_sequence(path: impl AsRef<Path>, sequence: u64) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -43,11 +52,23 @@ impl Wal {
             .open(path)
             .await
             .with_context(|| format!("failed to open WAL at {}", path.display()))?;
-        Ok(Self { file })
+        Ok(Self { file, sequence })
     }
 
-    pub async fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        let mut line = serde_json::to_vec(entry).context("WAL serialize failed")?;
+    pub fn current_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Stamp a sequence number into the entry, append, and fsync.
+    /// The entry's existing `sequence` field is overwritten.
+    pub async fn append(&mut self, entry: &WalEntry) -> Result<u64> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .context("WAL sequence overflow")?;
+        let mut stamped = entry.clone();
+        stamped.sequence = self.sequence;
+        let mut line = serde_json::to_vec(&stamped).context("WAL serialize failed")?;
         line.push(b'\n');
         self.file
             .write_all(&line)
@@ -57,6 +78,32 @@ impl Wal {
             .sync_data()
             .await
             .context("WAL sync_data failed")?;
+        Ok(self.sequence)
+    }
+
+    /// Atomically replace the WAL with an empty file. The in-memory sequence
+    /// counter continues from where it was (does NOT reset).
+    pub async fn truncate(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let new_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .await
+            .with_context(|| format!("failed to truncate WAL at {}", path.display()))?;
+        new_file
+            .sync_all()
+            .await
+            .context("WAL truncate sync failed")?;
+        // Reopen in append mode so subsequent writes go to the end.
+        let appender = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+            .with_context(|| format!("failed to reopen WAL at {}", path.display()))?;
+        self.file = appender;
         Ok(())
     }
 
@@ -102,6 +149,7 @@ mod tests {
             response: response.to_string(),
             query_text: format!("q-{uuid}"),
             model_id: "test-model::3".to_string(),
+            sequence: 0,
         }
     }
 
@@ -204,5 +252,75 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let entries = Wal::replay(tmp.path()).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wal_sequence_increments() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        let s1 = wal.append(&sample("a", "ra")).await.unwrap();
+        let s2 = wal.append(&sample("b", "rb")).await.unwrap();
+        let s3 = wal.append(&sample("c", "rc")).await.unwrap();
+        assert_eq!((s1, s2, s3), (1, 2, 3));
+        assert_eq!(wal.current_sequence(), 3);
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wal_replay_with_sequence_filter() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        for i in 0..5u32 {
+            wal.append(&sample(&format!("u{i}"), &format!("r{i}")))
+                .await
+                .unwrap();
+        }
+        drop(wal);
+
+        let entries: Vec<WalEntry> = Wal::replay(&path)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.sequence > 3)
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 4);
+        assert_eq!(entries[1].sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn test_wal_truncate_keeps_sequence_counter() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        wal.append(&sample("a", "ra")).await.unwrap();
+        wal.append(&sample("b", "rb")).await.unwrap();
+        assert_eq!(wal.current_sequence(), 2);
+
+        wal.truncate(&path).await.unwrap();
+        assert_eq!(wal.current_sequence(), 2, "counter must NOT reset");
+
+        let s = wal.append(&sample("c", "rc")).await.unwrap();
+        assert_eq!(s, 3);
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, "c");
+        assert_eq!(entries[0].sequence, 3);
     }
 }
