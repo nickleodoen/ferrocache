@@ -3,21 +3,23 @@ use std::sync::atomic::Ordering;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::future::join_all;
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use crate::auth::{AuthToken, auth_middleware};
+use crate::cluster::ClusterState;
 use crate::failure_detector::PeerStatus;
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
-    ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, HealthResponse,
-    InsertRequest, InsertResponse, NamespaceStatsEntry, PeerHealth, QueryRequest, QueryResponse,
-    StatsHnsw, StatsResponse,
+    ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, FullEntryResponse,
+    HealthResponse, InsertRequest, InsertResponse, NamespaceStatsEntry, PeerHealth, QueryRequest,
+    QueryResponse, ReadRepairRequest, ReadRepairResponse, StatsHnsw, StatsResponse,
 };
 use crate::state::AppState;
 use crate::wal::{
@@ -31,11 +33,35 @@ pub const MAX_RESPONSE_BYTES: usize = 102_400;
 pub struct LocalParam {
     #[serde(default)]
     pub local: Option<bool>,
+    /// Read repair (M23): set to `Some(false)` by the read-repair fan-out
+    /// to prevent the recipient from doing its own replica fan-out and
+    /// looping. `None` and `Some(true)` both mean "default behaviour".
+    #[serde(default)]
+    pub repair: Option<bool>,
 }
 
 impl LocalParam {
     fn is_local(&self) -> bool {
         self.local.unwrap_or(false)
+    }
+
+    /// Whether to attempt read-repair on miss.
+    ///
+    /// - `Some(v)` is an explicit override and wins.
+    /// - `None` defaults based on `local`: client-driven `?local=true` is a
+    ///   diagnostic / "don't touch other nodes" signal, so we DON'T repair.
+    ///   A request that went through ring routing (no params) DOES want
+    ///   repair.
+    /// - The read-repair fan-out always sets `repair=false` explicitly to
+    ///   avoid recursion.
+    /// - The coordinator's forward-to-owner (`forward_query`) always sets
+    ///   `repair=true` explicitly so the owner — the actual primary —
+    ///   triggers repair on miss.
+    fn try_repair(&self) -> bool {
+        match self.repair {
+            Some(v) => v,
+            None => !self.is_local(),
+        }
     }
 }
 
@@ -49,6 +75,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/cluster/status", get(cluster_status_handler))
         .route("/admin/compact", post(compact_handler))
         .route("/metrics", get(metrics_handler))
+        // Read-repair internal endpoints (M23). Both follow the same auth
+        // pattern as the public routes — they're cluster-internal calls
+        // but a misconfigured deployment exposing them externally still
+        // requires the bearer token if auth is on.
+        .route("/internal/entry/:uuid", get(get_entry_handler))
+        .route("/internal/read-repair", post(read_repair_handler))
         .with_state(state);
 
     if let Some(token) = auth_token.filter(|t| !t.is_empty()) {
@@ -133,7 +165,10 @@ async fn query_handler(
         return forward_query(&state, &target_id, &target_addr, &req).await;
     }
 
-    process_query_locally(&state, req).await
+    // Read-repair (M23) only applies on the "owner" code path — the local
+    // miss is the trigger to ask replicas. The fan-out itself sets
+    // `?repair=false` so replicas don't recurse.
+    process_query_locally(&state, req, params.try_repair()).await
 }
 
 async fn forward_query(
@@ -163,7 +198,11 @@ async fn forward_query(
     }
 }
 
-async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Response {
+async fn process_query_locally(
+    state: &Arc<AppState>,
+    req: QueryRequest,
+    try_repair: bool,
+) -> Response {
     let start = std::time::Instant::now();
     let dim = req.embedding.len();
     let model_id = match req.model_id.as_deref() {
@@ -193,6 +232,24 @@ async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Resp
         Ok(None) => {
             state.metrics.record_query_miss(model_id, elapsed);
             tracing::info!(hit = false, dim, "query");
+
+            // Read repair (M23): if we're the ring owner / coordinator and
+            // a replica has the entry, return its hit and asynchronously
+            // backfill our local index. Skipped when:
+            //   - the request explicitly disabled repair (`?repair=false`)
+            //   - read_repair_enabled is off in config
+            //   - we're not in cluster mode
+            //   - replication_factor is 1 (no replicas to ask)
+            if try_repair
+                && state.read_repair_enabled
+                && state.replication_factor > 1
+                && let Some(cluster) = state.cluster.as_ref()
+                && let Some(repaired) = attempt_read_repair(state, cluster, model_id, &req).await
+            {
+                tracing::info!(hit = true, repaired = true, "query (repaired from replica)");
+                return (StatusCode::OK, Json(repaired)).into_response();
+            }
+
             (
                 StatusCode::OK,
                 Json(QueryResponse {
@@ -205,6 +262,154 @@ async fn process_query_locally(state: &Arc<AppState>, req: QueryRequest) -> Resp
                 .into_response()
         }
         Err(e) => bad_request(e.to_string()),
+    }
+}
+
+/// Query non-dead replicas in parallel. Returns the first hit (if any) so
+/// the client gets a low-latency response, and spawns a background task
+/// that fetches the full entry from the replica and re-inserts it locally.
+/// Failures (network, missing UUID, WAL channel closed) increment
+/// `read_repair_failures_total` but never propagate out of the spawn.
+async fn attempt_read_repair(
+    state: &Arc<AppState>,
+    cluster: &Arc<ClusterState>,
+    model_id: &str,
+    req: &QueryRequest,
+) -> Option<QueryResponse> {
+    let router = state.router.as_ref()?;
+    let replicas = cluster
+        .get_replica_addrs(&req.embedding, state.replication_factor)
+        .await;
+    let self_id = cluster.self_node_id();
+
+    // Filter to peers we should actually ask. M21's Dead skip applies here
+    // too — a peer chitchat told us is gone won't answer.
+    let mut peers: Vec<(String, String)> = Vec::new();
+    for (id, addr) in replicas {
+        if id == self_id {
+            continue;
+        }
+        if cluster.peer_status(&id).await == PeerStatus::Dead {
+            continue;
+        }
+        peers.push((id, addr));
+    }
+    if peers.is_empty() {
+        return None;
+    }
+
+    // Parallel fan-out. `forward_query_no_repair` adds `?repair=false` so
+    // the recipient doesn't itself fan out (would be N×N traffic + a loop
+    // risk in degenerate ring configurations).
+    let queries = peers
+        .iter()
+        .map(|(_, addr)| router.forward_query_no_repair(addr, req));
+    let results = join_all(queries).await;
+
+    // Pair each result with its peer id/addr so we know who to fetch the
+    // full entry from below.
+    let mut hit: Option<(String, String, QueryResponse)> = None;
+    for ((peer_id, peer_addr), result) in peers.iter().zip(results) {
+        match result {
+            Ok(qr) if qr.hit => {
+                hit = Some((peer_id.clone(), peer_addr.clone(), qr));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "read repair: replica query failed");
+            }
+        }
+    }
+    let (peer_id, peer_addr, qr) = hit?;
+    let uuid = match qr.id.clone() {
+        Some(u) => u,
+        None => {
+            // A replica reporting `hit=true` without an id is a protocol
+            // bug, not a transient failure — count it but still return the
+            // hit since the response/similarity are still useful.
+            state.metrics.record_read_repair_failure();
+            tracing::warn!(peer = %peer_id, "read repair: replica hit had no id");
+            return Some(qr);
+        }
+    };
+
+    // Spawn the actual repair as a fire-and-forget — the client gets the
+    // hit immediately, durability of the new local entry happens later.
+    let state_clone = state.clone();
+    let model_id_owned = model_id.to_string();
+    tokio::spawn(async move {
+        perform_repair(state_clone, peer_id, peer_addr, uuid, model_id_owned).await;
+    });
+    Some(qr)
+}
+
+/// Background half of read repair: GET /internal/entry/{uuid} from the
+/// replica that hit, then push the full entry through the WAL group-commit
+/// channel so it lands on disk + in the index with full durability.
+async fn perform_repair(
+    state: Arc<AppState>,
+    peer_id: String,
+    peer_addr: String,
+    uuid: String,
+    model_id: String,
+) {
+    let Some(router) = state.router.as_ref() else {
+        state.metrics.record_read_repair_failure();
+        return;
+    };
+
+    let full = match router.forward_get_entry(&peer_addr, &uuid).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            // Replica raced — the entry was there during the query but
+            // gone by the time we asked for it (compaction? eviction?
+            // unrealistic for ferrocache today, but cheap to handle).
+            state.metrics.record_read_repair_failure();
+            tracing::warn!(peer = %peer_id, uuid = %uuid, "read repair: replica returned 404 for entry");
+            return;
+        }
+        Err(e) => {
+            state.metrics.record_read_repair_failure();
+            tracing::warn!(peer = %peer_id, uuid = %uuid, error = %e, "read repair: forward_get_entry failed");
+            return;
+        }
+    };
+
+    let entry = WalEntry {
+        uuid: full.uuid.clone(),
+        embedding: full.embedding,
+        response: full.response,
+        query_text: full.query_text,
+        model_id: full.model_id,
+        sequence: 0, // stamped by the flush task
+    };
+
+    let (tx, rx) = oneshot::channel();
+    if state
+        .wal
+        .sender()
+        .send(WalCommand::Insert(WalInsertRequest { entry, respond: tx }))
+        .await
+        .is_err()
+    {
+        state.metrics.record_read_repair_failure();
+        tracing::warn!(uuid = %uuid, "read repair: WAL channel closed");
+        return;
+    }
+    match rx.await {
+        Ok(Ok(_seq)) => {
+            state.metrics.record_read_repair();
+            tracing::info!(peer = %peer_id, uuid = %uuid, model_id = %model_id, "read repair complete");
+        }
+        Ok(Err(e)) => {
+            state.metrics.record_read_repair_failure();
+            tracing::warn!(uuid = %uuid, error = %e, "read repair: local insert rejected");
+        }
+        Err(_) => {
+            state.metrics.record_read_repair_failure();
+            tracing::warn!(uuid = %uuid, "read repair: WAL flush task dropped reply");
+        }
     }
 }
 
@@ -413,6 +618,124 @@ async fn local_insert_inner(
     Ok(uuid)
 }
 
+async fn get_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Path(uuid): Path<String>,
+) -> Response {
+    let entry = state.index.read().await.get_entry_by_uuid(&uuid);
+    match entry {
+        Some(e) => (
+            StatusCode::OK,
+            Json(FullEntryResponse {
+                uuid: e.uuid,
+                embedding: e.embedding,
+                response: e.response,
+                query_text: e.query_text,
+                model_id: e.model_id,
+            }),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "entry not found".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn read_repair_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReadRepairRequest>,
+) -> Response {
+    if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if req.model_id.trim().is_empty() {
+        return bad_request("model_id is required");
+    }
+    if req.uuid.trim().is_empty() {
+        return bad_request("uuid is required");
+    }
+    if req.response.len() > MAX_RESPONSE_BYTES {
+        return bad_request(format!(
+            "response size {} exceeds max {}",
+            req.response.len(),
+            MAX_RESPONSE_BYTES
+        ));
+    }
+
+    let entry = WalEntry {
+        uuid: req.uuid.clone(),
+        embedding: req.embedding,
+        response: req.response,
+        query_text: req.query_text,
+        model_id: req.model_id.clone(),
+        sequence: 0,
+    };
+    let (tx, rx) = oneshot::channel();
+    if state
+        .wal
+        .sender()
+        .send(WalCommand::Insert(WalInsertRequest { entry, respond: tx }))
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "persistence failed".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match rx.await {
+        Ok(Ok(_)) => {
+            state.metrics.record_read_repair();
+            (
+                StatusCode::OK,
+                Json(ReadRepairResponse {
+                    status: "ok".to_string(),
+                    repaired: true,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(InsertError::Index(e))) => {
+            state.metrics.record_read_repair_failure();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(InsertError::Wal(e))) => {
+            state.metrics.record_read_repair_failure();
+            tracing::error!(error = %e, "read-repair WAL append failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "persistence failed".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            state.metrics.record_read_repair_failure();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "persistence failed".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
     // Compaction goes through the same flush-task channel as inserts, so
     // any pending writes are drained first (FIFO).
@@ -497,6 +820,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
                 node_count,
                 peer_health,
                 dead_nodes,
+                read_repair_enabled: state.read_repair_enabled,
             })
         }
         None => Json(ClusterStatusResponse {
@@ -507,6 +831,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
             node_count: 1,
             peer_health: std::collections::HashMap::new(),
             dead_nodes: Vec::new(),
+            read_repair_enabled: state.read_repair_enabled,
         }),
     }
 }
@@ -537,6 +862,8 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
         replication_failures: m.replication_failures_total.load(Ordering::Relaxed),
         replication_retries: m.replication_retries_total.load(Ordering::Relaxed),
         compactions: m.compactions_total.load(Ordering::Relaxed),
+        read_repairs: m.read_repairs_total.load(Ordering::Relaxed),
+        read_repair_failures: m.read_repair_failures_total.load(Ordering::Relaxed),
     };
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
@@ -621,7 +948,8 @@ mod tests {
             1,
             metrics,
             None,
-            0, // no replication retries in tests
+            0,    // no replication retries in tests
+            true, // read_repair_enabled — no-op in tests since cluster is None
         ))
     }
 
@@ -1087,6 +1415,7 @@ mod tests {
             node_count: 2,
             peer_health: std::collections::HashMap::new(),
             dead_nodes: vec!["node-C".into()],
+            read_repair_enabled: true,
         };
         let body = serde_json::to_value(&resp).unwrap();
         let dead = body["dead_nodes"].as_array().expect("dead_nodes present");
@@ -1123,6 +1452,7 @@ mod tests {
             node_count: 2,
             peer_health,
             dead_nodes: Vec::new(),
+            read_repair_enabled: true,
         };
         let body = serde_json::to_value(&resp).unwrap();
         let ph = body["peer_health"]
@@ -1135,6 +1465,150 @@ mod tests {
         assert_eq!(entry["status"], "alive");
         assert_eq!(entry["status"].as_str(), Some("alive"));
         let _ = PS::Alive; // anchor the import so cargo's unused warning pass stays clean.
+    }
+
+    // --- M23: read repair endpoints ---------------------------------------
+
+    #[tokio::test]
+    async fn test_read_repair_endpoint_inserts_entry() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "uuid": "fixed-uuid-r",
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "repaired-resp",
+            "query_text": "q",
+            "model_id": MID,
+        });
+        let response = app
+            .clone()
+            .oneshot(post_json("/internal/read-repair", payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["repaired"], true);
+
+        // The entry must be queryable locally afterwards.
+        let q = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.9,
+            "model_id": MID,
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["id"], "fixed-uuid-r");
+        assert_eq!(body["response"], "repaired-resp");
+    }
+
+    #[tokio::test]
+    async fn test_get_entry_endpoint_returns_full_entry() {
+        let (app, _, _dir) = test_app().await;
+        let insert = json!({
+            "embedding": [0.5_f32, 0.5, 0.0],
+            "response": "the-r",
+            "query_text": "the-q",
+            "model_id": MID,
+            "uuid": "lookup-target",
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", insert))
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(get("/internal/entry/lookup-target?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["uuid"], "lookup-target");
+        assert_eq!(body["response"], "the-r");
+        assert_eq!(body["query_text"], "the-q");
+        assert_eq!(body["model_id"], MID);
+        let emb = body["embedding"].as_array().unwrap();
+        assert_eq!(emb.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_entry_endpoint_404() {
+        let (app, _, _dir) = test_app().await;
+        let resp = app
+            .oneshot(get("/internal/entry/nonexistent?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_read_repair_validates_inputs() {
+        let (app, _, _dir) = test_app().await;
+        let bad = json!({
+            "uuid": "",
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "q",
+            "model_id": MID,
+        });
+        let resp = app
+            .oneshot(post_json("/internal/read-repair", bad))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_local_param_repair_semantics() {
+        // M23 contract:
+        // - No params → entry-point coordinator → try_repair == true
+        // - `?local=true` alone (client diagnostic) → try_repair == false
+        // - `?local=true&repair=true` (forwarded by coordinator) → true
+        // - `?local=true&repair=false` (read-repair fan-out) → false
+        assert!(LocalParam::default().try_repair(), "no params");
+        let client_local = LocalParam {
+            local: Some(true),
+            repair: None,
+        };
+        assert!(
+            !client_local.try_repair(),
+            "explicit ?local=true defaults to no repair"
+        );
+        let forwarded = LocalParam {
+            local: Some(true),
+            repair: Some(true),
+        };
+        assert!(forwarded.try_repair(), "forwarded by coordinator");
+        let fan_out = LocalParam {
+            local: Some(true),
+            repair: Some(false),
+        };
+        assert!(!fan_out.try_repair(), "fan-out itself");
+    }
+
+    #[tokio::test]
+    async fn test_query_local_does_not_trigger_repair_loop() {
+        // ?local=true on a fresh node returns a clean miss without the
+        // handler trying to recurse (the LocalParam.try_repair check
+        // doesn't fire because there's no cluster wired). This
+        // exercises the path that would loop if we forgot to gate it.
+        let (app, _, _dir) = test_app().await;
+        let q = json!({
+            "embedding": [0.1_f32, 0.2, 0.3],
+            "threshold": 0.9,
+            "model_id": MID,
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true&repair=false", q))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], false);
     }
 
     #[tokio::test]

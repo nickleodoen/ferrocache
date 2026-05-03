@@ -69,6 +69,13 @@ pub struct ClusterConfig {
     /// `/cluster/status` but ring membership stays static.
     #[serde(default = "default_dead_node_removal_enabled")]
     pub dead_node_removal_enabled: bool,
+    /// Read repair (M23): on a query miss, the coordinator queries
+    /// non-dead replicas in parallel. If any reports a hit, the result is
+    /// returned to the client immediately and the entry is fetched +
+    /// re-inserted locally in a fire-and-forget background task. Set
+    /// `false` to disable replica fan-out on miss entirely.
+    #[serde(default = "default_read_repair_enabled")]
+    pub read_repair_enabled: bool,
 }
 
 fn default_max_replication_retries() -> usize {
@@ -91,6 +98,10 @@ fn default_dead_node_removal_enabled() -> bool {
     true
 }
 
+fn default_read_repair_enabled() -> bool {
+    true
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -106,6 +117,7 @@ impl Default for ClusterConfig {
             phi_window_size: default_phi_window_size(),
             phi_min_std_dev_ms: default_phi_min_std_dev_ms(),
             dead_node_removal_enabled: default_dead_node_removal_enabled(),
+            read_repair_enabled: default_read_repair_enabled(),
         }
     }
 }
@@ -220,6 +232,10 @@ impl FerrocacheConfig {
                 defaults.cluster.dead_node_removal_enabled,
             )?
             .set_default(
+                "cluster.read_repair_enabled",
+                defaults.cluster.read_repair_enabled,
+            )?
+            .set_default(
                 "compact_interval_inserts",
                 defaults.compact_interval_inserts as i64,
             )?
@@ -277,6 +293,7 @@ mod tests {
         assert_eq!(c.cluster.phi_window_size, 100);
         assert!((c.cluster.phi_min_std_dev_ms - 100.0).abs() < 1e-9);
         assert!(c.cluster.dead_node_removal_enabled);
+        assert!(c.cluster.read_repair_enabled);
         assert_eq!(c.wal_batch_size, 256);
         assert_eq!(c.wal_batch_timeout_ms, 1);
     }

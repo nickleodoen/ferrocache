@@ -32,9 +32,23 @@ pub struct NamespaceStats {
 pub struct NamespacedIndex {
     hnsw: Hnsw<'static, f32, DistCosine>,
     entries: HashMap<usize, CacheEntry>,
+    /// Reverse map (M23): UUID → side-table internal id, so read-repair
+    /// fetch-by-UUID is O(1) instead of a linear scan over `entries`.
+    uuid_to_internal: HashMap<String, usize>,
     next_id: usize,
     dimension: Option<usize>,
     ef_search: usize,
+}
+
+/// Full cache entry including its namespace — what `/internal/entry/{uuid}`
+/// returns and what read-repair re-inserts on the local node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullEntry {
+    pub uuid: String,
+    pub embedding: Vec<f32>,
+    pub response: String,
+    pub query_text: String,
+    pub model_id: String,
 }
 
 impl NamespacedIndex {
@@ -49,6 +63,7 @@ impl NamespacedIndex {
         Self {
             hnsw,
             entries: HashMap::new(),
+            uuid_to_internal: HashMap::new(),
             next_id: 0,
             dimension: None,
             ef_search: cfg.ef_search,
@@ -74,9 +89,17 @@ impl NamespacedIndex {
             _ => {}
         }
 
+        // De-duplicate on UUID so read-repair re-inserting an entry doesn't
+        // create a second copy in the side-table. This is also the right
+        // behaviour for WAL replay if the same UUID appears twice.
+        if self.uuid_to_internal.contains_key(&uuid) {
+            return Ok(());
+        }
+
         let id = self.next_id;
         self.next_id += 1;
         self.hnsw.insert((&embedding, id));
+        self.uuid_to_internal.insert(uuid.clone(), id);
         self.entries.insert(
             id,
             CacheEntry {
@@ -87,6 +110,11 @@ impl NamespacedIndex {
             },
         );
         Ok(())
+    }
+
+    pub fn get_by_uuid(&self, uuid: &str) -> Option<&CacheEntry> {
+        let id = self.uuid_to_internal.get(uuid)?;
+        self.entries.get(id)
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &CacheEntry> {
@@ -140,6 +168,10 @@ impl NamespacedIndex {
 /// owns its own HNSW; cross-namespace queries are impossible by construction.
 pub struct SemanticIndex {
     namespaces: HashMap<String, NamespacedIndex>,
+    /// UUID → owning `model_id`. Populated on every successful insert so
+    /// read-repair (M23) can find an entry by its UUID without scanning
+    /// every namespace.
+    uuid_to_namespace: HashMap<String, String>,
     hnsw_config: HnswConfig,
 }
 
@@ -147,6 +179,7 @@ impl SemanticIndex {
     pub fn new(cfg: &HnswConfig) -> Self {
         Self {
             namespaces: HashMap::new(),
+            uuid_to_namespace: HashMap::new(),
             hnsw_config: cfg.clone(),
         }
     }
@@ -155,6 +188,11 @@ impl SemanticIndex {
         self.namespaces
             .entry(model_id.to_string())
             .or_insert_with(|| NamespacedIndex::new(&self.hnsw_config))
+    }
+
+    fn record_uuid(&mut self, uuid: &str, model_id: &str) {
+        self.uuid_to_namespace
+            .insert(uuid.to_string(), model_id.to_string());
     }
 
     #[cfg(test)]
@@ -172,6 +210,7 @@ impl SemanticIndex {
             response,
             query_text,
         )?;
+        self.record_uuid(&uuid, model_id);
         Ok(uuid)
     }
 
@@ -184,8 +223,14 @@ impl SemanticIndex {
             model_id,
             ..
         } = entry;
-        self.namespace_mut(&model_id)
-            .insert_with_uuid(uuid, embedding, response, query_text)
+        self.namespace_mut(&model_id).insert_with_uuid(
+            uuid.clone(),
+            embedding,
+            response,
+            query_text,
+        )?;
+        self.record_uuid(&uuid, &model_id);
+        Ok(())
     }
 
     pub fn replay_snapshot_entry(&mut self, entry: SnapshotEntry) -> Result<()> {
@@ -196,8 +241,30 @@ impl SemanticIndex {
             query_text,
             model_id,
         } = entry;
-        self.namespace_mut(&model_id)
-            .insert_with_uuid(uuid, embedding, response, query_text)
+        self.namespace_mut(&model_id).insert_with_uuid(
+            uuid.clone(),
+            embedding,
+            response,
+            query_text,
+        )?;
+        self.record_uuid(&uuid, &model_id);
+        Ok(())
+    }
+
+    /// Look up a full entry (including its namespace) by UUID. Used by
+    /// the `/internal/entry/{uuid}` endpoint so read-repair can re-insert
+    /// the entry on a stale primary.
+    pub fn get_entry_by_uuid(&self, uuid: &str) -> Option<FullEntry> {
+        let model_id = self.uuid_to_namespace.get(uuid)?.clone();
+        let ns = self.namespaces.get(&model_id)?;
+        let entry = ns.get_by_uuid(uuid)?;
+        Some(FullEntry {
+            uuid: entry.uuid.clone(),
+            embedding: entry.embedding.clone(),
+            response: entry.response.clone(),
+            query_text: entry.query_text.clone(),
+            model_id,
+        })
     }
 
     /// Flatten every namespace into a `Vec<SnapshotEntry>`. Used by
@@ -412,6 +479,107 @@ mod tests {
         let idx = test_index();
         let result = idx.query(&[0.1, 0.2, 0.3], 0.5, "never-seen::3").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_entry_by_uuid_found() {
+        let mut idx = test_index();
+        let entry = WalEntry {
+            uuid: "fixed-uuid".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "the answer".into(),
+            query_text: "the question".into(),
+            model_id: M.into(),
+            sequence: 0,
+        };
+        idx.replay_entry(entry).unwrap();
+        let got = idx.get_entry_by_uuid("fixed-uuid").unwrap();
+        assert_eq!(got.uuid, "fixed-uuid");
+        assert_eq!(got.embedding, vec![1.0, 0.0, 0.0]);
+        assert_eq!(got.response, "the answer");
+        assert_eq!(got.query_text, "the question");
+        assert_eq!(got.model_id, M);
+    }
+
+    #[test]
+    fn test_get_entry_by_uuid_not_found() {
+        let idx = test_index();
+        assert!(idx.get_entry_by_uuid("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_entry_by_uuid_cross_namespace() {
+        let mut idx = test_index();
+        let a = WalEntry {
+            uuid: "u-a".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "ra".into(),
+            query_text: "qa".into(),
+            model_id: "model-a::3".into(),
+            sequence: 0,
+        };
+        let b = WalEntry {
+            uuid: "u-b".into(),
+            embedding: vec![0.0, 1.0, 0.0],
+            response: "rb".into(),
+            query_text: "qb".into(),
+            model_id: "model-b::3".into(),
+            sequence: 0,
+        };
+        idx.replay_entry(a).unwrap();
+        idx.replay_entry(b).unwrap();
+        let hit = idx.get_entry_by_uuid("u-b").unwrap();
+        assert_eq!(hit.model_id, "model-b::3");
+        assert_eq!(hit.response, "rb");
+    }
+
+    #[test]
+    fn test_uuid_to_namespace_populated_on_replay() {
+        let mut idx = test_index();
+        idx.replay_entry(WalEntry {
+            uuid: "u1".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: "m::3".into(),
+            sequence: 0,
+        })
+        .unwrap();
+        idx.replay_snapshot_entry(SnapshotEntry {
+            uuid: "u2".into(),
+            embedding: vec![0.0, 1.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: "m::3".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            idx.uuid_to_namespace.get("u1").map(String::as_str),
+            Some("m::3")
+        );
+        assert_eq!(
+            idx.uuid_to_namespace.get("u2").map(String::as_str),
+            Some("m::3")
+        );
+    }
+
+    #[test]
+    fn test_replay_dedupes_on_uuid() {
+        // Replaying the same UUID twice must not create a duplicate entry.
+        // (Important for read-repair — the coordinator may replay an entry
+        // that was already inserted by another concurrent path.)
+        let mut idx = test_index();
+        let mk = || WalEntry {
+            uuid: "dup".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: M.into(),
+            sequence: 0,
+        };
+        idx.replay_entry(mk()).unwrap();
+        idx.replay_entry(mk()).unwrap();
+        assert_eq!(idx.entry_count(), 1);
     }
 
     #[test]

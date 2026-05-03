@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         config.auth_token.clone(),
         config.cluster.max_replication_retries,
+        config.cluster.read_repair_enabled,
     ));
     let app = server::build_router(state.clone());
 

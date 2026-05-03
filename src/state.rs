@@ -30,6 +30,11 @@ pub struct AppState {
     /// Max number of retries (after the initial attempt) for replication
     /// forwards. Total attempts = `max_replication_retries + 1`.
     pub max_replication_retries: usize,
+    /// Read repair (M23): on a query miss, fan out to non-dead replicas
+    /// and return the first hit while spawning an async repair task.
+    /// `false` makes a coordinator miss return immediately without
+    /// touching replicas.
+    pub read_repair_enabled: bool,
 }
 
 impl AppState {
@@ -47,6 +52,7 @@ impl AppState {
         metrics: Arc<Metrics>,
         auth_token: Option<String>,
         max_replication_retries: usize,
+        read_repair_enabled: bool,
     ) -> Self {
         Self {
             node_id,
@@ -61,6 +67,7 @@ impl AppState {
             metrics,
             auth_token,
             max_replication_retries,
+            read_repair_enabled,
         }
     }
 }

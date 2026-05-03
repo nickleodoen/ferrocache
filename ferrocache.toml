@@ -42,6 +42,12 @@
 # values are still reported via /metrics + /cluster/status but the ring
 # stays static — useful for monitoring-only rollouts.
 # dead_node_removal_enabled = true
+#
+# Read repair (M23). On a query miss, fan out to non-dead replicas in
+# parallel; first hit is returned to the client immediately, the entry
+# is fetched and re-inserted locally in a background task. Set false
+# to disable replica fan-out on miss.
+# read_repair_enabled = true
 
 # Inter-node mTLS (M18). When enabled, ferrocache binds a SECOND listener
 # on `internal_port` (default: port + 1000) for cluster traffic only. The

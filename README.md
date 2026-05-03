@@ -131,6 +131,7 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 | `auth_token`                  | string?      | `None` (auth off)    | `FERROCACHE_AUTH_TOKEN`                |
 | `wal_batch_size`              | usize        | `256`                | `FERROCACHE_WAL_BATCH_SIZE`            |
 | `wal_batch_timeout_ms`        | u64          | `1`                  | `FERROCACHE_WAL_BATCH_TIMEOUT_MS`      |
+| `cluster.read_repair_enabled` | bool         | `true`               | `FERROCACHE_CLUSTER__READ_REPAIR_ENABLED` |
 
 ## Security
 
@@ -196,6 +197,12 @@ flowchart LR
 - **Why synchronous replication.** Cache writes are infrequent vs reads; durability simplicity > write throughput for this workload. Async replication would need anti-entropy and read-repair, which is a different project.
 - **Why Rust.** A cache in front of an LLM lives on the latency hot path. We want predictable tail latencies (no GC pauses) and a single static binary that drops onto any host.
 - **Why HNSW over IVF/PQ.** HNSW gives sub-millisecond recall at our scale (≤100k entries per node) without index training. IVF/PQ make sense above ~10M vectors, not here.
+
+### Read Repair
+
+When a query misses on the ring owner, ferrocache queries that key's other replicas in parallel. If any replica reports a hit, the cached response goes back to the client immediately and the entry is asynchronously copied (over the WAL group-commit channel, so it's durable) to the local index. This handles the common case of a re-joined node whose index missed inserts while it was down — the next time someone queries, the gap is filled.
+
+Read repair is enabled by default. Disable with `FERROCACHE_CLUSTER__READ_REPAIR_ENABLED=false`. The repair traffic is observable as `ferrocache_read_repairs_total` and `ferrocache_read_repair_failures_total` in `/metrics`. There's no Merkle-tree background reconciliation — that's overkill for a cache; entries that are never queried again don't need repair.
 
 ## Benchmarks
 

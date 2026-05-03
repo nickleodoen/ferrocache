@@ -92,6 +92,13 @@ pub struct Metrics {
     /// Cumulative count of ring membership mutations (M22): each add or
     /// remove from `HashRing` driven by the reconciler bumps this once.
     pub ring_changes_total: AtomicU64,
+    /// Read repairs completed (M23): an entry was fetched from a replica
+    /// after a local miss and successfully re-inserted on this node.
+    pub read_repairs_total: AtomicU64,
+    /// Read repair attempts that didn't complete (network error, replica
+    /// returned 404 for the UUID, WAL channel closed, etc.). Tracked
+    /// separately so it can be alerted on without polluting `repairs_total`.
+    pub read_repair_failures_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
     pub insert_duration: LatencyHistogram,
@@ -109,6 +116,8 @@ impl Metrics {
             replication_retries_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
             ring_changes_total: AtomicU64::new(0),
+            read_repairs_total: AtomicU64::new(0),
+            read_repair_failures_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
             insert_duration: LatencyHistogram::new(),
@@ -192,6 +201,15 @@ impl Metrics {
 
     pub fn record_ring_change(&self) {
         self.ring_changes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_read_repair(&self) {
+        self.read_repairs_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_read_repair_failure(&self) {
+        self.read_repair_failures_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -287,6 +305,20 @@ impl Metrics {
             "ferrocache_ring_changes_total",
             "Total ring membership changes (adds + removes).",
             ring_changes,
+        );
+        let read_repairs = self.read_repairs_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_read_repairs_total",
+            "Total read repairs completed (entries copied from replica to local).",
+            read_repairs,
+        );
+        let read_repair_failures = self.read_repair_failures_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_read_repair_failures_total",
+            "Read repair attempts that failed (replica unreachable, entry missing, etc).",
+            read_repair_failures,
         );
 
         let total_entries: usize = index_stats.values().map(|s| s.entry_count).sum();

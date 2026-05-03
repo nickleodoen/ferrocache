@@ -117,6 +117,7 @@ mod tests {
             metrics,
             auth_token,
             0,
+            true,
         ))
     }
 

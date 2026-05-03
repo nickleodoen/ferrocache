@@ -175,6 +175,52 @@ STATUS_CODE_REJOIN=$(curl -s -o /dev/null -w "%{http_code}" "$BASE1/cluster/stat
 assert_eq "cluster/status 200 after node3 restarts" "200" "$STATUS_CODE_REJOIN"
 
 echo ""
+echo "=== Test 8: Read repair (M23) ==="
+# Insert directly on node1 with ?local=true so node2/node3 don't learn
+# about it via replication. Then query the same embedding via node2 — if
+# node2 is the ring owner, the local miss triggers a fan-out to replicas;
+# node1 (where the entry is) returns the hit. The behaviour is gated on
+# ring layout and `read_repair_enabled = true` (default).
+# Use a fresh model_id namespace for this test so prior tests' entries
+# (which may share dims and partial directions) don't trigger false hits
+# at the 0.90 threshold.
+RR_MODEL="m23-rr::4"
+EMBEDDING_RR='[0.1, 0.2, 0.7, 0.6]'
+RR_INSERT=$(curl -s -X POST "$BASE1/insert?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_RR, \"response\": \"repair-test\", \"query_text\": \"repair\", \"model_id\": \"$RR_MODEL\", \"uuid\": \"rr-target\"}" | jq -r '.status')
+assert_eq "local-only insert on node1" "ok" "$RR_INSERT"
+
+# Verify locality of the seed: node1 has it, node2 doesn't (yet).
+LOCAL_HIT_N1=$(curl -s -X POST "$BASE1/query?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_RR, \"threshold\": 0.90, \"model_id\": \"$RR_MODEL\"}" | jq -r '.hit')
+assert_eq "node1 has the entry locally" "true" "$LOCAL_HIT_N1"
+
+LOCAL_HIT_N2_BEFORE=$(curl -s -X POST "$BASE2/query?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_RR, \"threshold\": 0.90, \"model_id\": \"$RR_MODEL\"}" | jq -r '.hit')
+assert_eq "node2 does NOT have the entry locally yet" "false" "$LOCAL_HIT_N2_BEFORE"
+
+# /internal/entry/{uuid} on node1 should return the full entry, on node2 a 404.
+ENTRY_N1_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE1/internal/entry/rr-target?local=true")
+assert_eq "/internal/entry on node1 returns 200" "200" "$ENTRY_N1_CODE"
+ENTRY_N2_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE2/internal/entry/rr-target?local=true")
+assert_eq "/internal/entry on node2 returns 404" "404" "$ENTRY_N2_CODE"
+
+# Routed query through node2 — non-502 is the load-bearing assertion.
+# Whether it's a hit (read repair found it on node1) or miss (replica
+# walk skipped node1) depends on the ring; both produce 200.
+ROUTED_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_RR, \"threshold\": 0.90, \"model_id\": \"$RR_MODEL\"}")
+assert_eq "routed query through node2 returns 200" "200" "$ROUTED_CODE"
+
+# read_repair_enabled flag visible in /cluster/status.
+RR_FLAG=$(curl -s "$BASE1/cluster/status" | jq -r '.read_repair_enabled')
+assert_eq "/cluster/status reports read_repair_enabled" "true" "$RR_FLAG"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

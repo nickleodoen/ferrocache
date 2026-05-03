@@ -45,6 +45,36 @@ pub struct InsertResponse {
     pub status: String,
 }
 
+/// Wire format for `GET /internal/entry/{uuid}` and what
+/// `forward_get_entry` returns. Carries the embedding so the coordinator
+/// can re-insert the entry locally during read repair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullEntryResponse {
+    pub uuid: String,
+    pub embedding: Vec<f32>,
+    pub response: String,
+    pub query_text: String,
+    pub model_id: String,
+}
+
+/// Wire format for `POST /internal/read-repair`. Same shape as a normal
+/// insert but the `uuid` is mandatory — read-repair never invents UUIDs,
+/// it copies the existing one from the replica that had the entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadRepairRequest {
+    pub uuid: String,
+    pub embedding: Vec<f32>,
+    pub response: String,
+    pub query_text: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadRepairResponse {
+    pub status: String,
+    pub repaired: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -77,6 +107,8 @@ pub struct CountersResponse {
     pub replication_failures: u64,
     pub replication_retries: u64,
     pub compactions: u64,
+    pub read_repairs: u64,
+    pub read_repair_failures: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +148,9 @@ pub struct ClusterStatusResponse {
     /// from the ring (M22). They re-enter `nodes` automatically on re-join.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dead_nodes: Vec<String>,
+    /// Whether read-repair (M23) is active for this node. Reflects
+    /// `cluster.read_repair_enabled` at config-load time.
+    pub read_repair_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]

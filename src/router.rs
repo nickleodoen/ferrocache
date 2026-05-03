@@ -6,7 +6,9 @@ use rand::Rng;
 use reqwest::Client;
 
 use crate::metrics::Metrics;
-use crate::models::{InsertRequest, InsertResponse, QueryRequest, QueryResponse};
+use crate::models::{
+    FullEntryResponse, InsertRequest, InsertResponse, QueryRequest, QueryResponse,
+};
 use crate::tls::TlsBundle;
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,13 +81,54 @@ impl ClusterRouter {
         req: &QueryRequest,
     ) -> reqwest::Result<QueryResponse> {
         let scheme = self.scheme();
-        let url = format!("{scheme}://{target_addr}/query?local=true");
+        // `repair=true` (M23): the recipient IS the ring owner, so on a
+        // local miss it should fan out to its replicas. `local=true`
+        // continues to mean "skip ring routing".
+        let url = format!("{scheme}://{target_addr}/query?local=true&repair=true");
         let resp = self
             .with_auth(self.client.post(&url).json(req))
             .send()
             .await?;
         let resp = resp.error_for_status()?;
         resp.json::<QueryResponse>().await
+    }
+
+    /// Forward a /query to a replica during read-repair fan-out (M23). The
+    /// `repair=false` param tells the recipient NOT to do its own
+    /// read-repair on miss — that prevents an N-way fan-out from looping
+    /// the cluster. Always uses `?local=true` for the same reason.
+    pub async fn forward_query_no_repair(
+        &self,
+        target_addr: &str,
+        req: &QueryRequest,
+    ) -> reqwest::Result<QueryResponse> {
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/query?local=true&repair=false");
+        let resp = self
+            .with_auth(self.client.post(&url).json(req))
+            .send()
+            .await?;
+        let resp = resp.error_for_status()?;
+        resp.json::<QueryResponse>().await
+    }
+
+    /// Fetch the full entry (including embedding) for a UUID from a peer
+    /// during read repair. Returns `Ok(None)` for a 404 — the peer didn't
+    /// have the entry — and `Err` for transport / non-404 status.
+    pub async fn forward_get_entry(
+        &self,
+        target_addr: &str,
+        uuid: &str,
+    ) -> reqwest::Result<Option<FullEntryResponse>> {
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/internal/entry/{uuid}?local=true");
+        let resp = self.with_auth(self.client.get(&url)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        let body = resp.json::<FullEntryResponse>().await?;
+        Ok(Some(body))
     }
 
     /// Forward an /insert to a peer (single attempt). See `forward_query`
@@ -210,6 +253,7 @@ mod tests {
             post(
                 |Query(q): Query<HashMap<String, String>>, Json(_): Json<QueryRequest>| async move {
                     assert_eq!(q.get("local").map(String::as_str), Some("true"));
+                    assert_eq!(q.get("repair").map(String::as_str), Some("true"));
                     Json(QueryResponse {
                         hit: true,
                         id: Some("u-42".to_string()),
@@ -407,6 +451,46 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 3);
         assert_eq!(metrics.replication_retries_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_forward_get_entry_200() {
+        use axum::{Router, extract::Path, routing::get};
+        let app = Router::new().route(
+            "/internal/entry/:uuid",
+            get(|Path(uuid): Path<String>| async move {
+                Json(FullEntryResponse {
+                    uuid,
+                    embedding: vec![1.0, 0.0, 0.0],
+                    response: "from peer".into(),
+                    query_text: "q".into(),
+                    model_id: "m::3".into(),
+                })
+            }),
+        );
+        let addr = spawn_mock(app).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let resp = router.forward_get_entry(&addr, "u-42").await.unwrap();
+        let entry = resp.expect("Some(entry) for 200");
+        assert_eq!(entry.uuid, "u-42");
+        assert_eq!(entry.response, "from peer");
+        assert_eq!(entry.embedding.len(), 3);
+        assert_eq!(entry.model_id, "m::3");
+    }
+
+    #[tokio::test]
+    async fn test_forward_get_entry_404() {
+        use axum::{Router, http::StatusCode, routing::get};
+        let app = Router::new().route(
+            "/internal/entry/:uuid",
+            get(|_: axum::extract::Path<String>| async move {
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }),
+        );
+        let addr = spawn_mock(app).await;
+        let router = ClusterRouter::new(None, None).unwrap();
+        let resp = router.forward_get_entry(&addr, "ghost").await.unwrap();
+        assert!(resp.is_none(), "404 must surface as Ok(None)");
     }
 
     #[tokio::test]
