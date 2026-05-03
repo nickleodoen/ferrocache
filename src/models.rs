@@ -112,6 +112,10 @@ pub struct ClusterStatusResponse {
     /// disabled or no peers have been observed yet.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub peer_health: HashMap<String, PeerHealth>,
+    /// Nodes the failure detector confirmed dead and the reconciler removed
+    /// from the ring (M22). They re-enter `nodes` automatically on re-join.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub dead_nodes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

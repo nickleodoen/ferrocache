@@ -89,6 +89,9 @@ pub struct Metrics {
     pub replication_failures_total: AtomicU64,
     pub replication_retries_total: AtomicU64,
     pub compactions_total: AtomicU64,
+    /// Cumulative count of ring membership mutations (M22): each add or
+    /// remove from `HashRing` driven by the reconciler bumps this once.
+    pub ring_changes_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
     pub insert_duration: LatencyHistogram,
@@ -105,6 +108,7 @@ impl Metrics {
             replication_failures_total: AtomicU64::new(0),
             replication_retries_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
+            ring_changes_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
             insert_duration: LatencyHistogram::new(),
@@ -184,6 +188,10 @@ impl Metrics {
 
     pub fn record_compaction(&self) {
         self.compactions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_ring_change(&self) {
+        self.ring_changes_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -272,6 +280,13 @@ impl Metrics {
             "ferrocache_compactions_total",
             "Total compaction cycles completed.",
             compactions,
+        );
+        let ring_changes = self.ring_changes_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_ring_changes_total",
+            "Total ring membership changes (adds + removes).",
+            ring_changes,
         );
 
         let total_entries: usize = index_stats.values().map(|s| s.entry_count).sum();
@@ -385,6 +400,13 @@ impl Metrics {
             &mut out,
             "ferrocache_cluster_nodes",
             "Number of nodes in the cluster.",
+            cluster_nodes as u64,
+        );
+        write_gauge_u64(
+            &mut out,
+            "ferrocache_ring_members",
+            "Current number of nodes in the hash ring (matches cluster_nodes; \
+             distinct gauge name kept for clarity in dashboards).",
             cluster_nodes as u64,
         );
 

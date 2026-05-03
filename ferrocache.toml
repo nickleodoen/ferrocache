@@ -37,6 +37,11 @@
 # phi_threshold = 8.0
 # phi_window_size = 100
 # phi_min_std_dev_ms = 100.0
+#
+# Ring reassignment on detector-confirmed Dead (M22). When false, phi
+# values are still reported via /metrics + /cluster/status but the ring
+# stays static — useful for monitoring-only rollouts.
+# dead_node_removal_enabled = true
 
 # Inter-node mTLS (M18). When enabled, ferrocache binds a SECOND listener
 # on `internal_port` (default: port + 1000) for cluster traffic only. The

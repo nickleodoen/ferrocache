@@ -63,6 +63,12 @@ pub struct ClusterConfig {
     /// well-defined (and absorb tiny network jitter as "still normal").
     #[serde(default = "default_phi_min_std_dev_ms")]
     pub phi_min_std_dev_ms: f64,
+    /// When `true` (default), peers the failure detector marks `Dead` are
+    /// automatically removed from the hash ring (M22). Set `false` for a
+    /// monitoring-only mode where phi values are reported via metrics and
+    /// `/cluster/status` but ring membership stays static.
+    #[serde(default = "default_dead_node_removal_enabled")]
+    pub dead_node_removal_enabled: bool,
 }
 
 fn default_max_replication_retries() -> usize {
@@ -81,6 +87,10 @@ fn default_phi_min_std_dev_ms() -> f64 {
     crate::failure_detector::DEFAULT_MIN_STD_DEV_MS
 }
 
+fn default_dead_node_removal_enabled() -> bool {
+    true
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -95,6 +105,7 @@ impl Default for ClusterConfig {
             phi_threshold: default_phi_threshold(),
             phi_window_size: default_phi_window_size(),
             phi_min_std_dev_ms: default_phi_min_std_dev_ms(),
+            dead_node_removal_enabled: default_dead_node_removal_enabled(),
         }
     }
 }
@@ -205,6 +216,10 @@ impl FerrocacheConfig {
                 defaults.cluster.phi_min_std_dev_ms,
             )?
             .set_default(
+                "cluster.dead_node_removal_enabled",
+                defaults.cluster.dead_node_removal_enabled,
+            )?
+            .set_default(
                 "compact_interval_inserts",
                 defaults.compact_interval_inserts as i64,
             )?
@@ -261,6 +276,7 @@ mod tests {
         assert!((c.cluster.phi_threshold - 8.0).abs() < 1e-9);
         assert_eq!(c.cluster.phi_window_size, 100);
         assert!((c.cluster.phi_min_std_dev_ms - 100.0).abs() < 1e-9);
+        assert!(c.cluster.dead_node_removal_enabled);
         assert_eq!(c.wal_batch_size, 256);
         assert_eq!(c.wal_batch_timeout_ms, 1);
     }

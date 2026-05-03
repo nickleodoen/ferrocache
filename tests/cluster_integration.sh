@@ -121,6 +121,60 @@ METRICS_CT=$(curl -s -o /dev/null -w "%{content_type}" "$BASE1/metrics")
 assert_eq "metrics always works without auth" "text/plain; version=0.0.4; charset=utf-8" "$METRICS_CT"
 
 echo ""
+echo "=== Test 7: Node failure and ring reassignment (M22) ==="
+# Insert via node1 — replication_factor=2 puts a copy on the ring's
+# clockwise successor. After we kill node3 the cluster must keep serving
+# without 502s. Phi-accrual + chitchat detection together take a while,
+# so this test is timing-tolerant: the load-bearing assertion is
+# "non-502", not "miss vs hit" or precise dead_nodes contents.
+EMBEDDING_FAIL='[0.5, 0.5, 0.0, 0.0]'
+INSERT_RESP_FAIL=$(curl -s -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_FAIL, \"response\": \"failover-test\", \"query_text\": \"failover\", \"model_id\": \"test-model::4\"}")
+STATUS_FAIL=$(echo "$INSERT_RESP_FAIL" | jq -r '.status')
+assert_eq "insert before failover" "ok" "$STATUS_FAIL"
+
+echo "  Stopping ferrocache-node3..."
+docker stop ferrocache-node3 > /dev/null
+
+# Failure detection latency = chitchat dead-time + phi-accrual rise.
+# Default config can take 30+ seconds; we wait 35 to give it slack.
+echo "  Waiting 35s for failure detection to fire..."
+sleep 35
+
+# /cluster/status must still respond (the cluster is degraded, not down).
+STATUS_CODE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE1/cluster/status")
+assert_eq "cluster/status still 200 after node3 dies" "200" "$STATUS_CODE_STATUS"
+
+# The critical assertion: queries return 200 (miss-or-hit), never 502.
+# A 502 would mean the cluster is still routing to the dead node and
+# returning upstream-unavailable. After this many seconds, either
+# chitchat or phi-accrual (or both) should have removed node3 from the
+# ring or M21's soft skip should fire — both paths produce 200.
+STATUS_CODE_QUERY=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE1/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": $EMBEDDING_FAIL, \"threshold\": 0.90, \"model_id\": \"test-model::4\"}")
+assert_eq "query with dead node returns 200, not 502" "200" "$STATUS_CODE_QUERY"
+
+# Inserts during degraded replication should still succeed (warn-logged,
+# replication factor degrades silently).
+STATUS_CODE_INSERT=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.6, 0.6, 0.0, 0.0], \"response\": \"degraded-write\", \"query_text\": \"degraded\", \"model_id\": \"test-model::4\"}")
+assert_eq "insert during failure returns 200, not 502" "200" "$STATUS_CODE_INSERT"
+
+echo "  Restarting ferrocache-node3..."
+docker start ferrocache-node3 > /dev/null
+echo "  Waiting 15s for re-join..."
+sleep 15
+
+# After restart, the cluster should stay healthy. Exact node count
+# depends on gossip convergence timing, so just assert /cluster/status
+# is still answering.
+STATUS_CODE_REJOIN=$(curl -s -o /dev/null -w "%{http_code}" "$BASE1/cluster/status")
+assert_eq "cluster/status 200 after node3 restarts" "200" "$STATUS_CODE_REJOIN"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

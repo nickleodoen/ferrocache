@@ -220,4 +220,41 @@ mod tests {
         r.add_node("only");
         assert_eq!(r.get_node_for_embedding(&[1.0_f32, 0.0, 0.0]), Some("only"));
     }
+
+    #[test]
+    fn test_remove_redistributes_keys() {
+        // Consistent-hashing invariant: removing a node only remaps the
+        // keys it owned. Keys owned by other nodes keep their owner.
+        let mut r = HashRing::new(64);
+        for id in ["A", "B", "C"] {
+            r.add_node(id);
+        }
+        let keys: Vec<u64> = (0..200u64)
+            .map(|k| fnv1a_hash(format!("k-{k}").as_bytes()))
+            .collect();
+        let before: Vec<String> = keys
+            .iter()
+            .map(|k| r.get_node(*k).unwrap().to_string())
+            .collect();
+
+        r.remove_node("C");
+
+        let after: Vec<String> = keys
+            .iter()
+            .map(|k| r.get_node(*k).unwrap().to_string())
+            .collect();
+
+        let mut owned_by_c = 0usize;
+        let mut not_c_changed = 0usize;
+        for (b, a) in before.iter().zip(&after) {
+            assert_ne!(a, "C", "removed node still owns a key");
+            if b == "C" {
+                owned_by_c += 1;
+            } else if b != a {
+                not_c_changed += 1;
+            }
+        }
+        assert!(owned_by_c > 0, "test sanity: C owned at least one key");
+        assert_eq!(not_c_changed, 0, "non-C keys must keep their owner");
+    }
 }

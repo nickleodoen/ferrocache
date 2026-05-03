@@ -488,6 +488,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
                 .into_iter()
                 .map(|(id, status, phi)| (id, PeerHealth { status, phi }))
                 .collect();
+            let dead_nodes = cluster.dead_nodes().await;
             Json(ClusterStatusResponse {
                 mode: "clustered",
                 self_node_id: cluster.self_node_id().to_string(),
@@ -495,6 +496,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
                 nodes,
                 node_count,
                 peer_health,
+                dead_nodes,
             })
         }
         None => Json(ClusterStatusResponse {
@@ -504,6 +506,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
             nodes: vec![state.node_id.clone()],
             node_count: 1,
             peer_health: std::collections::HashMap::new(),
+            dead_nodes: Vec::new(),
         }),
     }
 }
@@ -1073,6 +1076,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cluster_status_shows_dead_nodes() {
+        // ClusterState::new requires a UDP handle; build the response shape
+        // directly instead, exercising the serializer.
+        let resp = ClusterStatusResponse {
+            mode: "clustered",
+            self_node_id: "self".into(),
+            gossip_addr: Some("0.0.0.0:4000".into()),
+            nodes: vec!["self".into(), "node-A".into()],
+            node_count: 2,
+            peer_health: std::collections::HashMap::new(),
+            dead_nodes: vec!["node-C".into()],
+        };
+        let body = serde_json::to_value(&resp).unwrap();
+        let dead = body["dead_nodes"].as_array().expect("dead_nodes present");
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0], "node-C");
+        let nodes = body["nodes"].as_array().unwrap();
+        assert!(!nodes.iter().any(|v| v == "node-C"));
+    }
+
+    #[tokio::test]
     async fn test_cluster_status_includes_peer_health() {
         // ClusterState::new requires a UDP socket + gossip handshake, which
         // is too heavy for a unit test. Instead we exercise the shape: feed
@@ -1098,6 +1122,7 @@ mod tests {
             nodes: vec!["self".into(), "peer-A".into()],
             node_count: 2,
             peer_health,
+            dead_nodes: Vec::new(),
         };
         let body = serde_json::to_value(&resp).unwrap();
         let ph = body["peer_health"]

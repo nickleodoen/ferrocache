@@ -164,8 +164,13 @@ async fn main() -> anyhow::Result<()> {
         config.cluster.api_addr.clone()
     };
 
+    // Build shared state holders (metrics + index) up front so the cluster
+    // reconciler and the WAL flush task can both share them.
+    let index_arc = Arc::new(RwLock::new(index));
+    let metrics = Arc::new(Metrics::new());
+
     let (cluster, router) = if config.cluster.enabled {
-        let cs = ClusterState::new(&node_id, &config.cluster, &forward_addr)
+        let cs = ClusterState::new(&node_id, &config.cluster, &forward_addr, metrics.clone())
             .await
             .context("cluster init failed")?;
         tracing::info!(
@@ -174,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             seeds = ?config.cluster.seed_nodes,
             replication_factor = config.cluster.replication_factor,
             tls = tls_bundle.is_some(),
+            dead_node_removal_enabled = config.cluster.dead_node_removal_enabled,
             "cluster enabled"
         );
         let router = ClusterRouter::new(config.auth_token.clone(), tls_bundle.as_ref())
@@ -189,8 +195,6 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the group-commit flush task. The task takes ownership of the
     // sole `Wal` and a clone of the index/metrics; from here on out, no
     // other code path writes to the WAL directly.
-    let index_arc = Arc::new(RwLock::new(index));
-    let metrics = Arc::new(Metrics::new());
     let group_commit_config = GroupCommitConfig {
         batch_size: config.wal_batch_size.max(1),
         batch_timeout: Duration::from_millis(config.wal_batch_timeout_ms),
