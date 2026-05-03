@@ -1,4 +1,4 @@
-.PHONY: build test cluster-up cluster-down cluster-test simulate simulate-no-ml simulate-cluster clean
+.PHONY: build test cluster-up cluster-down cluster-test simulate simulate-no-ml simulate-cluster bench-concurrent bench-concurrent-cluster clean
 
 build:
 	cargo build --release
@@ -30,6 +30,14 @@ simulate-no-ml:
 simulate-cluster:
 	@echo "Running simulation against 3-node cluster (localhost:3001)..."
 	python3 tests/simulate.py --url http://localhost:3001
+
+bench-concurrent:
+	@echo "Running concurrent benchmarks against localhost:3000..."
+	python3 tests/bench_concurrent.py
+
+bench-concurrent-cluster:
+	@echo "Running concurrent benchmarks against 3-node cluster..."
+	python3 tests/bench_concurrent.py --url http://localhost:3001
 
 clean:
 	cargo clean

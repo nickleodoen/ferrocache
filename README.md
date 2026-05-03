@@ -129,6 +129,8 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 | `cluster.virtual_nodes`       | usize        | `64`                 | `FERROCACHE_CLUSTER__VIRTUAL_NODES`    |
 | `cluster.replication_factor`  | usize        | `2`                  | `FERROCACHE_CLUSTER__REPLICATION_FACTOR` |
 | `auth_token`                  | string?      | `None` (auth off)    | `FERROCACHE_AUTH_TOKEN`                |
+| `wal_batch_size`              | usize        | `256`                | `FERROCACHE_WAL_BATCH_SIZE`            |
+| `wal_batch_timeout_ms`        | u64          | `1`                  | `FERROCACHE_WAL_BATCH_TIMEOUT_MS`      |
 
 ## Security
 
@@ -197,6 +199,8 @@ flowchart LR
 
 ## Benchmarks
 
+### Single-operation latency (criterion)
+
 Measured on Apple Silicon via `cargo bench`. Numbers are wall-clock per operation, 384-dim unit vectors, 1k pre-populated entries where applicable.
 
 | Benchmark               | Latency (median) | Notes                                  |
@@ -207,6 +211,31 @@ Measured on Apple Silicon via `cargo bench`. Numbers are wall-clock per operatio
 | Insert + WAL fsync      | 5.1 ms           | fsync-per-insert dominates (APFS)      |
 
 Reproduce with `cargo bench`. HTML reports land in `target/criterion/`.
+
+### Throughput under concurrency (M20: WAL group-commit)
+
+Measured on Apple Silicon, `cargo run --release`, 384-dim embeddings, 5s per cell. Reproduce with `make bench-concurrent`.
+
+The pre-M20 path took the WAL mutex per insert → `fsync(2)` serialized every writer. Group-commit coalesces concurrent inserts into a single batched write + one fsync, so adding clients keeps adding throughput until HNSW becomes the bottleneck.
+
+**Insert throughput** (`wal_batch_size=1` baseline vs default group-commit, 50 concurrent clients):
+
+| Mode                | 1 client | 10 clients | 50 clients | 100 clients |
+|---------------------|---------:|-----------:|-----------:|------------:|
+| Per-insert fsync    |  169/s   |   183/s    |   167/s    |    183/s    |
+| Group-commit (256)  |  122/s   |   682/s    |  1057/s    |   1365/s    |
+| **Speedup**         |   0.7×   |    3.7×    |    6.3×    |     7.5×    |
+
+p99 insert latency at concurrency 100: **675ms → 108ms** under group-commit.
+
+**Query throughput** (read-side, no fsync involved — both modes scale identically):
+
+| Workload      | 1 client | 10 clients | 50 clients | 100 clients |
+|---------------|---------:|-----------:|-----------:|------------:|
+| Query (hit)   | 1568/s   |  3529/s    |  3513/s    |   3553/s    |
+| Query (miss)  | 2632/s   |  3498/s    |  3513/s    |   3544/s    |
+
+The single-client insert is slightly slower under group-commit (122/s vs 169/s) because the batch timeout adds ~1ms of "wait for friends" latency. That's a tunable knob: `wal_batch_timeout_ms = 0` or `wal_batch_size = 1` reverts to the old per-insert fsync path.
 
 ## Simulation
 
@@ -346,10 +375,11 @@ Full setup (Claude Desktop / Claude Code config snippets, env vars, troubleshoot
 ## Development
 
 ```bash
-cargo test                        # unit tests (40)
+cargo test                        # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo bench                       # criterion benchmarks
+cargo bench                       # criterion benchmarks (per-op latency)
+make bench-concurrent             # concurrent throughput (insert/query at 1/10/50/100)
 make cluster-test                 # docker compose + integration script
 ```
 

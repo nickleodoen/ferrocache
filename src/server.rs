@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use tokio::sync::oneshot;
 
 use crate::auth::{AuthToken, auth_middleware};
 use crate::metrics::METRICS_CONTENT_TYPE;
@@ -17,9 +18,10 @@ use crate::models::{
     InsertRequest, InsertResponse, NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw,
     StatsResponse,
 };
-use crate::snapshot;
 use crate::state::AppState;
-use crate::wal::WalEntry;
+use crate::wal::{
+    CompactRequest, InsertError, InsertRequest as WalInsertRequest, WalCommand, WalEntry,
+};
 
 pub const MAX_EMBEDDING_DIM: usize = 4096;
 pub const MAX_RESPONSE_BYTES: usize = 102_400;
@@ -283,6 +285,9 @@ async fn process_insert_locally(state: &Arc<AppState>, req: InsertRequest) -> Re
 }
 
 /// Performs the WAL-first local insert. Returns the UUID actually stored.
+/// The WAL flush task owns the only `Wal` handle — this function sends the
+/// entry through the group-commit channel and awaits the flush task's
+/// oneshot reply (which lands after fsync + index insert).
 async fn local_insert_inner(
     state: &Arc<AppState>,
     req: &InsertRequest,
@@ -293,7 +298,6 @@ async fn local_insert_inner(
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => return Err(bad_request("model_id is required")),
     };
-    let mut wal = state.wal.lock().await;
 
     let uuid = req
         .uuid
@@ -305,13 +309,18 @@ async fn local_insert_inner(
         response: req.response.clone(),
         query_text: req.query_text.clone(),
         model_id: model_id.clone(),
-        sequence: 0, // stamped by Wal::append
+        sequence: 0, // stamped by the flush task
     };
 
-    if let Err(e) = wal.append(&entry).await {
-        // Log the chain (which includes paths) but never echo it to the client —
-        // the WAL path leaks deployment topology.
-        tracing::error!(error = %e, "WAL append failed");
+    let (tx, rx) = oneshot::channel();
+    if state
+        .wal
+        .sender()
+        .send(WalCommand::Insert(WalInsertRequest { entry, respond: tx }))
+        .await
+        .is_err()
+    {
+        tracing::error!("WAL flush task channel closed");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -321,72 +330,92 @@ async fn local_insert_inner(
             .into_response());
     }
 
-    if let Err(e) = state.index.write().await.replay_entry(entry) {
-        tracing::error!(error = %e, "index insert failed after WAL append");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response());
+    match rx.await {
+        Ok(Ok(_seq)) => {}
+        Ok(Err(InsertError::Wal(e))) => {
+            tracing::error!(error = %e, "WAL append failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "persistence failed".to_string(),
+                }),
+            )
+                .into_response());
+        }
+        Ok(Err(InsertError::Index(e))) => {
+            tracing::error!(error = %e, "index insert rejected");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response());
+        }
+        Err(_) => {
+            tracing::error!("WAL flush task dropped before reply");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "persistence failed".to_string(),
+                }),
+            )
+                .into_response());
+        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.record_insert(&model_id, elapsed);
-
-    // Auto-compaction: still holding the WAL lock, so a peer's concurrent
-    // insert can't race us. The threshold check + reset is only crossed
-    // by one insert at a time per node.
-    let interval = state.compact_interval_inserts;
-    if interval > 0 {
-        let prev = state.inserts_since_compact.fetch_add(1, Ordering::Relaxed);
-        if prev + 1 >= interval {
-            state.inserts_since_compact.store(0, Ordering::Relaxed);
-            let index = state.index.read().await;
-            let wal_path = std::path::Path::new(&state.wal_path);
-            match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
-                Ok(result) => {
-                    state.metrics.record_compaction();
-                    tracing::info!(
-                        snapshotted = result.entries_snapshotted,
-                        wal_sequence = result.wal_sequence,
-                        "auto-compaction fired"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "auto-compaction failed; continuing");
-                }
-            }
-        }
-    }
 
     tracing::info!(id = %uuid, dim, "inserted");
     Ok(uuid)
 }
 
 async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
-    let mut wal = state.wal.lock().await;
-    let index = state.index.read().await;
-    let wal_path = std::path::Path::new(&state.wal_path);
-    match snapshot::compact(&index, &mut wal, &state.snapshot_path, wal_path).await {
-        Ok(result) => {
-            state.inserts_since_compact.store(0, Ordering::Relaxed);
-            state.metrics.record_compaction();
+    // Compaction goes through the same flush-task channel as inserts, so
+    // any pending writes are drained first (FIFO).
+    let (tx, rx) = oneshot::channel();
+    if state
+        .wal
+        .sender()
+        .send(WalCommand::Compact(CompactRequest { respond: tx }))
+        .await
+        .is_err()
+    {
+        tracing::error!("WAL flush task channel closed during compact");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "compaction failed".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match rx.await {
+        Ok(Ok(result)) => (
+            StatusCode::OK,
+            Json(CompactResponse {
+                status: "ok".to_string(),
+                entries_snapshotted: result.entries_snapshotted,
+                wal_sequence: result.wal_sequence,
+            }),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            // The error chain typically carries snapshot/WAL paths; keep
+            // those in logs only.
+            tracing::error!(error = %e, "compaction failed");
             (
-                StatusCode::OK,
-                Json(CompactResponse {
-                    status: "ok".to_string(),
-                    entries_snapshotted: result.entries_snapshotted,
-                    wal_sequence: result.wal_sequence,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "compaction failed".to_string(),
                 }),
             )
                 .into_response()
         }
-        Err(e) => {
-            // The error chain typically carries snapshot/WAL paths; keep
-            // those in logs only.
-            tracing::error!(error = %e, "compaction failed");
+        Err(_) => {
+            tracing::error!("WAL flush task dropped during compact");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -494,29 +523,48 @@ mod tests {
     use super::*;
     use crate::config::HnswConfig;
     use crate::index::SemanticIndex;
-    use crate::wal::Wal;
+    use crate::metrics::Metrics;
+    use crate::wal::{GroupCommitConfig, GroupCommitWal, Wal};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     async fn build_state(wal_path: PathBuf) -> Arc<AppState> {
         let hnsw = HnswConfig::default();
         let wal = Wal::open(&wal_path).await.unwrap();
         let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+        let index = Arc::new(RwLock::new(SemanticIndex::new(&hnsw)));
+        let metrics = Arc::new(Metrics::new());
+        // Tests use batch_size=1 so each insert fsyncs immediately, matching
+        // pre-M20 semantics that existing assertions rely on.
+        let gc = GroupCommitWal::spawn(
+            wal,
+            wal_path.clone(),
+            snapshot_path.clone(),
+            index.clone(),
+            metrics.clone(),
+            0, // disable auto-compaction in tests
+            GroupCommitConfig {
+                batch_size: 1,
+                batch_timeout: std::time::Duration::from_millis(0),
+                channel_capacity: 64,
+            },
+        );
         Arc::new(AppState::new(
             "test-node".to_string(),
-            SemanticIndex::new(&hnsw),
-            wal,
+            index,
+            gc,
             wal_path.to_string_lossy().into_owned(),
             snapshot_path,
             hnsw,
             None,
             None,
             1,
-            0, // disable auto-compaction in tests
+            metrics,
             None,
             0, // no replication retries in tests
         ))

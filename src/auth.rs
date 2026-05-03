@@ -71,14 +71,16 @@ mod tests {
     use super::*;
     use crate::config::HnswConfig;
     use crate::index::SemanticIndex;
+    use crate::metrics::Metrics;
     use crate::server::build_router;
     use crate::state::AppState;
-    use crate::wal::Wal;
+    use crate::wal::{GroupCommitConfig, GroupCommitWal, Wal};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     const MID: &str = "test-model::3";
@@ -87,17 +89,32 @@ mod tests {
         let hnsw = HnswConfig::default();
         let wal = Wal::open(&wal_path).await.unwrap();
         let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+        let index = Arc::new(RwLock::new(SemanticIndex::new(&hnsw)));
+        let metrics = Arc::new(Metrics::new());
+        let gc = GroupCommitWal::spawn(
+            wal,
+            wal_path.clone(),
+            snapshot_path.clone(),
+            index.clone(),
+            metrics.clone(),
+            0,
+            GroupCommitConfig {
+                batch_size: 1,
+                batch_timeout: std::time::Duration::from_millis(0),
+                channel_capacity: 64,
+            },
+        );
         Arc::new(AppState::new(
             "test-node".to_string(),
-            SemanticIndex::new(&hnsw),
-            wal,
+            index,
+            gc,
             wal_path.to_string_lossy().into_owned(),
             snapshot_path,
             hnsw,
             None,
             None,
             1,
-            0,
+            metrics,
             auth_token,
             0,
         ))

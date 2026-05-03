@@ -5,6 +5,12 @@
 # node_id = "my-node-1"    # auto-generated UUID if omitted
 # wal_path = "./ferrocache.wal"
 
+# WAL group-commit (M20). Coalesces concurrent inserts so one fsync
+# covers a whole batch — insert throughput scales with concurrency.
+# wal_batch_size = 1 degrades to per-insert fsync (pre-M20 behavior).
+# wal_batch_size = 256
+# wal_batch_timeout_ms = 1
+
 # Bearer token auth (M17). Unset/empty disables auth (default).
 # Prefer setting via env: FERROCACHE_AUTH_TOKEN=...
 # auth_token = "my-secret-token"

@@ -18,10 +18,26 @@ pub struct FerrocacheConfig {
     /// `FERROCACHE_AUTH_TOKEN`. NEVER log this value.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Group-commit batch size. Inserts are coalesced up to this many per
+    /// fsync. Set to `1` for per-insert fsync (the pre-M20 behavior).
+    #[serde(default = "default_wal_batch_size")]
+    pub wal_batch_size: usize,
+    /// Max time the flush task waits for additional inserts to join the
+    /// current batch after the first one arrives.
+    #[serde(default = "default_wal_batch_timeout_ms")]
+    pub wal_batch_timeout_ms: u64,
 }
 
 fn default_compact_interval_inserts() -> u64 {
     10_000
+}
+
+fn default_wal_batch_size() -> usize {
+    256
+}
+
+fn default_wal_batch_timeout_ms() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -100,6 +116,8 @@ impl Default for FerrocacheConfig {
             cluster: ClusterConfig::default(),
             compact_interval_inserts: default_compact_interval_inserts(),
             auth_token: None,
+            wal_batch_size: default_wal_batch_size(),
+            wal_batch_timeout_ms: default_wal_batch_timeout_ms(),
         }
     }
 }
@@ -155,6 +173,8 @@ impl FerrocacheConfig {
                 "compact_interval_inserts",
                 defaults.compact_interval_inserts as i64,
             )?
+            .set_default("wal_batch_size", defaults.wal_batch_size as i64)?
+            .set_default("wal_batch_timeout_ms", defaults.wal_batch_timeout_ms as i64)?
             .add_source(File::with_name("ferrocache").required(false))
             .add_source(
                 // FERROCACHE_PORT → port; FERROCACHE_CLUSTER__ENABLED → cluster.enabled.
@@ -203,5 +223,7 @@ mod tests {
         assert!(c.cluster.tls.node_key_path.is_none());
         assert!(c.cluster.tls.internal_port.is_none());
         assert_eq!(c.cluster.max_replication_retries, 3);
+        assert_eq!(c.wal_batch_size, 256);
+        assert_eq!(c.wal_batch_timeout_ms, 1);
     }
 }

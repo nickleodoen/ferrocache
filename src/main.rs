@@ -1,17 +1,20 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use ferrocache::cluster::ClusterState;
 use ferrocache::config::FerrocacheConfig;
 use ferrocache::index::SemanticIndex;
+use ferrocache::metrics::Metrics;
 use ferrocache::router::ClusterRouter;
 use ferrocache::server;
 use ferrocache::snapshot;
 use ferrocache::state::AppState;
 use ferrocache::tls;
-use ferrocache::wal::Wal;
+use ferrocache::wal::{DEFAULT_CHANNEL_CAPACITY, GroupCommitConfig, GroupCommitWal, Wal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -182,17 +185,43 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let addr = format!("0.0.0.0:{}", config.port);
+
+    // Spawn the group-commit flush task. The task takes ownership of the
+    // sole `Wal` and a clone of the index/metrics; from here on out, no
+    // other code path writes to the WAL directly.
+    let index_arc = Arc::new(RwLock::new(index));
+    let metrics = Arc::new(Metrics::new());
+    let group_commit_config = GroupCommitConfig {
+        batch_size: config.wal_batch_size.max(1),
+        batch_timeout: Duration::from_millis(config.wal_batch_timeout_ms),
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+    };
+    tracing::info!(
+        batch_size = group_commit_config.batch_size,
+        batch_timeout_ms = config.wal_batch_timeout_ms,
+        "WAL group-commit configured"
+    );
+    let wal_handle = GroupCommitWal::spawn(
+        wal,
+        std::path::PathBuf::from(&config.wal_path),
+        snapshot_path.clone(),
+        index_arc.clone(),
+        metrics.clone(),
+        config.compact_interval_inserts,
+        group_commit_config,
+    );
+
     let state = Arc::new(AppState::new(
         node_id,
-        index,
-        wal,
+        index_arc,
+        wal_handle,
         config.wal_path.clone(),
         snapshot_path,
         config.hnsw.clone(),
         cluster,
         router,
         config.cluster.replication_factor.max(1),
-        config.compact_interval_inserts,
+        metrics,
         config.auth_token.clone(),
         config.cluster.max_replication_retries,
     ));
