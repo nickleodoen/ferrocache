@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cluster;
 pub mod config;
+pub mod failure_detector;
 pub mod index;
 pub mod metrics;
 pub mod models;

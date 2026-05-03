@@ -3,7 +3,12 @@ use std::fmt::Write as _;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::failure_detector::PeerStatus;
 use crate::index::NamespaceStats;
+
+/// Per-peer phi accrual snapshot for /metrics rendering. Sourced from
+/// `PhiAccrualDetector::snapshot()` in the metrics handler.
+pub type PeerPhiSnapshot = Vec<(String, PeerStatus, f64)>;
 
 /// Histogram bucket upper bounds (seconds). 100µs → 10s.
 pub const BUCKET_BOUNDS: &[f64] = &[
@@ -194,10 +199,13 @@ impl Metrics {
     /// per-namespace entry counts (the index is the source of truth, not
     /// our counters, since entries can be inserted via WAL replay).
     /// `cluster_nodes` is the live node count (1 if cluster disabled).
+    /// `peer_phi` is the optional per-peer failure-detector snapshot
+    /// (M21); empty when cluster is disabled.
     pub fn render(
         &self,
         index_stats: &HashMap<String, NamespaceStats>,
         cluster_nodes: usize,
+        peer_phi: &PeerPhiSnapshot,
     ) -> String {
         let mut out = String::with_capacity(4096);
 
@@ -380,6 +388,45 @@ impl Metrics {
             cluster_nodes as u64,
         );
 
+        // Per-peer phi gauge + suspected/dead peer count rollups (M21).
+        // Sorted output keeps /metrics deterministic across scrapes.
+        let mut peers_sorted: Vec<&(String, PeerStatus, f64)> = peer_phi.iter().collect();
+        peers_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_peer_phi Phi accrual value per peer (higher = more likely down)."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_peer_phi gauge");
+        for (id, _, phi) in &peers_sorted {
+            let _ = writeln!(
+                out,
+                "ferrocache_peer_phi{{peer=\"{}\"}} {phi:.6}",
+                escape_label(id)
+            );
+        }
+        out.push('\n');
+
+        let suspected = peers_sorted
+            .iter()
+            .filter(|(_, s, _)| *s == PeerStatus::Suspected)
+            .count() as u64;
+        let dead = peers_sorted
+            .iter()
+            .filter(|(_, s, _)| *s == PeerStatus::Dead)
+            .count() as u64;
+        write_gauge_u64(
+            &mut out,
+            "ferrocache_peers_suspected",
+            "Number of peers currently in suspected state.",
+            suspected,
+        );
+        write_gauge_u64(
+            &mut out,
+            "ferrocache_peers_dead",
+            "Number of peers currently confirmed dead.",
+            dead,
+        );
+
         out
     }
 }
@@ -524,7 +571,7 @@ mod tests {
                 dimension: Some(3),
             },
         );
-        let body = m.render(&stats, 1);
+        let body = m.render(&stats, 1, &Vec::new());
 
         assert!(body.contains("ferrocache_queries_total 3"), "{body}");
         assert!(body.contains("ferrocache_queries_hit_total 2"));
@@ -549,7 +596,7 @@ mod tests {
     fn test_hit_rate_zero_queries() {
         let m = Metrics::new();
         assert_eq!(m.hit_rate(), 0.0);
-        let body = m.render(&empty_stats(), 1);
+        let body = m.render(&empty_stats(), 1, &Vec::new());
         assert!(body.contains("ferrocache_hit_rate 0.000000"));
     }
 
@@ -560,7 +607,7 @@ mod tests {
         m.record_replication_forward();
         m.record_replication_failure();
         m.record_compaction();
-        let body = m.render(&empty_stats(), 1);
+        let body = m.render(&empty_stats(), 1, &Vec::new());
         assert!(body.contains("ferrocache_replication_forwards_total 2"));
         assert!(body.contains("ferrocache_replication_failures_total 1"));
         assert!(body.contains("ferrocache_compactions_total 1"));

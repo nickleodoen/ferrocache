@@ -31,6 +31,12 @@
 # virtual_nodes = 64
 # replication_factor = 2
 # max_replication_retries = 3   # retries on connect/timeout/5xx; 4xx never retried
+#
+# Phi accrual failure detector (M21). Heartbeats piggyback on chitchat
+# gossip; threshold 8 → ~99.999999% confidence the peer is down.
+# phi_threshold = 8.0
+# phi_window_size = 100
+# phi_min_std_dev_ms = 100.0
 
 # Inter-node mTLS (M18). When enabled, ferrocache binds a SECOND listener
 # on `internal_port` (default: port + 1000) for cluster traffic only. The

@@ -9,6 +9,7 @@ use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig
 use tokio::sync::RwLock;
 
 use crate::config::ClusterConfig;
+use crate::failure_detector::{PeerStatus, PhiAccrualDetector};
 use crate::ring::HashRing;
 
 const RING_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
@@ -23,6 +24,7 @@ pub struct ClusterState {
     self_node_id: String,
     self_api_addr: String,
     gossip_addr: SocketAddr,
+    failure_detector: Arc<PhiAccrualDetector>,
 }
 
 impl ClusterState {
@@ -70,12 +72,19 @@ impl ClusterState {
         addrs.insert(node_id.to_string(), forward_addr.to_string());
         let addrs = Arc::new(RwLock::new(addrs));
 
+        let failure_detector = Arc::new(PhiAccrualDetector::new(
+            config.phi_threshold,
+            config.phi_window_size,
+            config.phi_min_std_dev_ms,
+        ));
+
         spawn_ring_reconciler(
             handle.clone(),
             ring.clone(),
             addrs.clone(),
             node_id.to_string(),
             forward_addr.to_string(),
+            failure_detector.clone(),
         );
 
         Ok(Self {
@@ -85,7 +94,24 @@ impl ClusterState {
             self_node_id: node_id.to_string(),
             self_api_addr: forward_addr.to_string(),
             gossip_addr,
+            failure_detector,
         })
+    }
+
+    pub fn failure_detector(&self) -> &Arc<PhiAccrualDetector> {
+        &self.failure_detector
+    }
+
+    /// Convenience: status snapshot for a peer. Returns `Alive` for peers
+    /// not yet tracked by the detector (no heartbeats observed) so callers
+    /// don't need a special "unknown" branch.
+    pub async fn peer_status(&self, node_id: &str) -> PeerStatus {
+        self.failure_detector
+            .peer_statuses()
+            .await
+            .get(node_id)
+            .copied()
+            .unwrap_or(PeerStatus::Alive)
     }
 
     pub fn self_node_id(&self) -> &str {
@@ -146,6 +172,7 @@ fn spawn_ring_reconciler(
     addrs: Arc<RwLock<HashMap<String, String>>>,
     self_node_id: String,
     self_api_addr: String,
+    failure_detector: Arc<PhiAccrualDetector>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RING_RECONCILE_INTERVAL);
@@ -169,6 +196,32 @@ fn spawn_ring_reconciler(
                 })
                 .await;
 
+            // Heartbeat on every gossip tick: each peer chitchat reports as
+            // live counts as one heartbeat. The phi calculation uses these
+            // inter-arrivals so a missed tick climbs phi at the rate
+            // observed jitter says is unusual.
+            for node_id in snapshot.keys() {
+                if node_id != &self_node_id {
+                    failure_detector.record_heartbeat(node_id).await;
+                }
+            }
+
+            // Recompute phi for every tracked peer AFTER recording — peers
+            // that just heartbeated have phi reset; peers that didn't are
+            // the ones that may transition to Suspected/Dead.
+            let statuses = failure_detector.check_all().await;
+            for (node_id, (status, phi)) in &statuses {
+                match status {
+                    PeerStatus::Suspected => {
+                        tracing::warn!(peer = %node_id, phi = phi, "peer suspected down");
+                    }
+                    PeerStatus::Dead => {
+                        tracing::error!(peer = %node_id, phi = phi, "peer confirmed dead");
+                    }
+                    PeerStatus::Alive => {}
+                }
+            }
+
             let live: BTreeSet<String> = snapshot.keys().cloned().collect();
             let current: BTreeSet<String> = ring.read().await.nodes().into_iter().collect();
             let added: Vec<String> = live.difference(&current).cloned().collect();
@@ -187,6 +240,13 @@ fn spawn_ring_reconciler(
                 for id in &removed {
                     a.remove(id);
                 }
+            }
+
+            // Stop tracking peers chitchat dropped from the ring (M22 will
+            // handle the reverse: keeping them in the ring while marking
+            // them dead until reassignment).
+            for id in &removed {
+                failure_detector.remove_peer(id).await;
             }
 
             if added.is_empty() && removed.is_empty() {

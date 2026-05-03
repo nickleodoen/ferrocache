@@ -12,11 +12,12 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use crate::auth::{AuthToken, auth_middleware};
+use crate::failure_detector::PeerStatus;
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
     ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, HealthResponse,
-    InsertRequest, InsertResponse, NamespaceStatsEntry, QueryRequest, QueryResponse, StatsHnsw,
-    StatsResponse,
+    InsertRequest, InsertResponse, NamespaceStatsEntry, PeerHealth, QueryRequest, QueryResponse,
+    StatsHnsw, StatsResponse,
 };
 use crate::state::AppState;
 use crate::wal::{
@@ -111,6 +112,24 @@ async fn query_handler(
         && let Some((target_id, target_addr)) = cluster.get_target_addr(&req.embedding).await
         && target_id != cluster.self_node_id()
     {
+        // Soft failover (M21): if the failure detector has marked the
+        // owning node as Dead, skip the request entirely and return a miss.
+        // This avoids the retry-then-502 chain on requests we already know
+        // will fail. M22 will reassign the ring; until then "miss" is the
+        // safe degraded answer (a wrong cache miss is cheap; a 502 isn't).
+        if cluster.peer_status(&target_id).await == PeerStatus::Dead {
+            tracing::warn!(peer = %target_id, "skipping query to dead peer; returning miss");
+            return (
+                StatusCode::OK,
+                Json(QueryResponse {
+                    hit: false,
+                    id: None,
+                    response: None,
+                    similarity: None,
+                }),
+            )
+                .into_response();
+        }
         return forward_query(&state, &target_id, &target_addr, &req).await;
     }
 
@@ -245,8 +264,18 @@ async fn insert_handler(
         return bad_gateway("upstream replica unavailable");
     };
 
+    // Soft failover (M21): skip replicas the failure detector has marked
+    // Dead. The replication factor degrades to surviving replicas only —
+    // logged at warn so operators see the degraded state in dashboards.
+    let mut skipped_dead: Vec<&str> = Vec::new();
+    let mut attempted = 0usize;
     for (peer_id, peer_addr) in replicas.iter().filter(|(id, _)| id != self_id) {
+        if cluster.peer_status(peer_id).await == PeerStatus::Dead {
+            skipped_dead.push(peer_id.as_str());
+            continue;
+        }
         state.metrics.record_replication_forward();
+        attempted += 1;
         let result = router
             .forward_with_retry(state.max_replication_retries, &state.metrics, || {
                 router.forward_insert(peer_addr, &req_with_uuid)
@@ -257,6 +286,19 @@ async fn insert_handler(
             tracing::error!(peer = %peer_id, error = %e, "replica forward failed");
             return bad_gateway("upstream replica unavailable");
         }
+    }
+
+    if !skipped_dead.is_empty() {
+        let surviving = if self_in_replica_set {
+            attempted + 1
+        } else {
+            attempted
+        };
+        tracing::warn!(
+            dead_peers = ?skipped_dead,
+            effective_replicas = surviving,
+            "replication degraded — some replicas unavailable"
+        );
     }
 
     tracing::info!(id = %uuid, replicas = replicas.len(), "insert replicated");
@@ -441,12 +483,18 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
         Some(cluster) => {
             let nodes = cluster.live_nodes().await;
             let node_count = cluster.ring_node_count().await;
+            let detector_snapshot = cluster.failure_detector().snapshot().await;
+            let peer_health = detector_snapshot
+                .into_iter()
+                .map(|(id, status, phi)| (id, PeerHealth { status, phi }))
+                .collect();
             Json(ClusterStatusResponse {
                 mode: "clustered",
                 self_node_id: cluster.self_node_id().to_string(),
                 gossip_addr: Some(cluster.gossip_addr().to_string()),
                 nodes,
                 node_count,
+                peer_health,
             })
         }
         None => Json(ClusterStatusResponse {
@@ -455,6 +503,7 @@ async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<Clus
             gossip_addr: None,
             nodes: vec![state.node_id.clone()],
             node_count: 1,
+            peer_health: std::collections::HashMap::new(),
         }),
     }
 }
@@ -505,11 +554,14 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
         let index = state.index.read().await;
         index.namespace_stats()
     };
-    let cluster_nodes = match &state.cluster {
-        Some(c) => c.ring_node_count().await,
-        None => 1,
+    let (cluster_nodes, peer_phi) = match &state.cluster {
+        Some(c) => (
+            c.ring_node_count().await,
+            c.failure_detector().snapshot().await,
+        ),
+        None => (1, Vec::new()),
     };
-    let body = state.metrics.render(&stats, cluster_nodes);
+    let body = state.metrics.render(&stats, cluster_nodes, &peer_phi);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, METRICS_CONTENT_TYPE)],
@@ -1016,6 +1068,48 @@ mod tests {
         let nodes = body["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0], "test-node");
+        // Single-node mode has no detector → peer_health field omitted (skip_serializing_if).
+        assert!(body.get("peer_health").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_cluster_status_includes_peer_health() {
+        // ClusterState::new requires a UDP socket + gossip handshake, which
+        // is too heavy for a unit test. Instead we exercise the shape: feed
+        // a `PhiAccrualDetector` directly, build the response the way the
+        // handler does, and assert it serializes with `peer_health` populated.
+        use crate::failure_detector::{PeerStatus as PS, PhiAccrualDetector};
+        let det = PhiAccrualDetector::new(8.0, 100, 100.0);
+        let now = std::time::Instant::now();
+        // Two heartbeats so phi is computable.
+        det.record_heartbeat_at("peer-A", now - std::time::Duration::from_millis(2000))
+            .await;
+        det.record_heartbeat_at("peer-A", now - std::time::Duration::from_millis(1000))
+            .await;
+        let snap = det.snapshot_at(now).await;
+        let peer_health: std::collections::HashMap<String, PeerHealth> = snap
+            .into_iter()
+            .map(|(id, status, phi)| (id, PeerHealth { status, phi }))
+            .collect();
+        let resp = ClusterStatusResponse {
+            mode: "clustered",
+            self_node_id: "self".into(),
+            gossip_addr: Some("0.0.0.0:4000".into()),
+            nodes: vec!["self".into(), "peer-A".into()],
+            node_count: 2,
+            peer_health,
+        };
+        let body = serde_json::to_value(&resp).unwrap();
+        let ph = body["peer_health"]
+            .as_object()
+            .expect("peer_health populated");
+        let entry = &ph["peer-A"];
+        assert!(entry["phi"].is_number());
+        // peer-A heartbeated 1s ago against ~1s mean — phi sits in the
+        // "alive" zone, well below threshold.
+        assert_eq!(entry["status"], "alive");
+        assert_eq!(entry["status"].as_str(), Some("alive"));
+        let _ = PS::Alive; // anchor the import so cargo's unused warning pass stays clean.
     }
 
     #[tokio::test]

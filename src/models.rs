@@ -108,4 +108,14 @@ pub struct ClusterStatusResponse {
     pub gossip_addr: Option<String>,
     pub nodes: Vec<String>,
     pub node_count: usize,
+    /// Phi accrual failure detector state (M21). Empty when cluster is
+    /// disabled or no peers have been observed yet.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub peer_health: HashMap<String, PeerHealth>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeerHealth {
+    pub status: crate::failure_detector::PeerStatus,
+    pub phi: f64,
 }

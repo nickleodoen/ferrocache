@@ -52,10 +52,33 @@ pub struct ClusterConfig {
     pub tls: ClusterTlsConfig,
     #[serde(default = "default_max_replication_retries")]
     pub max_replication_retries: usize,
+    /// Phi accrual failure detector threshold. Above this, a peer flips to
+    /// `Suspected`; above 2× this, to `Dead`. Cassandra/Akka default is 8.0.
+    #[serde(default = "default_phi_threshold")]
+    pub phi_threshold: f64,
+    /// Sliding-window length for heartbeat inter-arrival samples.
+    #[serde(default = "default_phi_window_size")]
+    pub phi_window_size: usize,
+    /// Floor on the std-dev of the inter-arrival window to keep the CDF
+    /// well-defined (and absorb tiny network jitter as "still normal").
+    #[serde(default = "default_phi_min_std_dev_ms")]
+    pub phi_min_std_dev_ms: f64,
 }
 
 fn default_max_replication_retries() -> usize {
     3
+}
+
+fn default_phi_threshold() -> f64 {
+    crate::failure_detector::DEFAULT_PHI_THRESHOLD
+}
+
+fn default_phi_window_size() -> usize {
+    crate::failure_detector::DEFAULT_WINDOW_SIZE
+}
+
+fn default_phi_min_std_dev_ms() -> f64 {
+    crate::failure_detector::DEFAULT_MIN_STD_DEV_MS
 }
 
 impl Default for ClusterConfig {
@@ -69,6 +92,9 @@ impl Default for ClusterConfig {
             replication_factor: 2,
             tls: ClusterTlsConfig::default(),
             max_replication_retries: default_max_replication_retries(),
+            phi_threshold: default_phi_threshold(),
+            phi_window_size: default_phi_window_size(),
+            phi_min_std_dev_ms: default_phi_min_std_dev_ms(),
         }
     }
 }
@@ -169,6 +195,15 @@ impl FerrocacheConfig {
                 "cluster.max_replication_retries",
                 defaults.cluster.max_replication_retries as i64,
             )?
+            .set_default("cluster.phi_threshold", defaults.cluster.phi_threshold)?
+            .set_default(
+                "cluster.phi_window_size",
+                defaults.cluster.phi_window_size as i64,
+            )?
+            .set_default(
+                "cluster.phi_min_std_dev_ms",
+                defaults.cluster.phi_min_std_dev_ms,
+            )?
             .set_default(
                 "compact_interval_inserts",
                 defaults.compact_interval_inserts as i64,
@@ -223,6 +258,9 @@ mod tests {
         assert!(c.cluster.tls.node_key_path.is_none());
         assert!(c.cluster.tls.internal_port.is_none());
         assert_eq!(c.cluster.max_replication_retries, 3);
+        assert!((c.cluster.phi_threshold - 8.0).abs() < 1e-9);
+        assert_eq!(c.cluster.phi_window_size, 100);
+        assert!((c.cluster.phi_min_std_dev_ms - 100.0).abs() < 1e-9);
         assert_eq!(c.wal_batch_size, 256);
         assert_eq!(c.wal_batch_timeout_ms, 1);
     }
