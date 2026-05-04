@@ -55,6 +55,15 @@ pub struct FullEntryResponse {
     pub response: String,
     pub query_text: String,
     pub model_id: String,
+    /// Access metadata travels with the entry on read repair (M24) so a
+    /// re-joined node receives the entry with the replica's access counts.
+    /// Old peers that don't send these fields default them to 0.
+    #[serde(default)]
+    pub inserted_at: u64,
+    #[serde(default)]
+    pub last_accessed_at: u64,
+    #[serde(default)]
+    pub access_count: u64,
 }
 
 /// Wire format for `POST /internal/read-repair`. Same shape as a normal
@@ -123,6 +132,29 @@ pub struct StatsHnsw {
 pub struct NamespaceStatsEntry {
     pub entry_count: usize,
     pub dimension: Option<usize>,
+    /// Access tracking aggregates (M24). All zero when the namespace is empty.
+    pub oldest_entry_ts: u64,
+    pub newest_entry_ts: u64,
+    pub total_accesses: u64,
+}
+
+/// `/admin/entry-stats` per-namespace top-N rollup (M24).
+#[derive(Debug, Serialize)]
+pub struct EntryStatsResponse {
+    pub namespaces: HashMap<String, NamespaceTopEntries>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NamespaceTopEntries {
+    pub top_entries: Vec<TopEntryRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopEntryRow {
+    pub uuid: String,
+    pub access_count: u64,
+    pub last_accessed_at: u64,
+    pub query_text_preview: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
@@ -7,11 +8,30 @@ use crate::config::HnswConfig;
 use crate::snapshot::SnapshotEntry;
 use crate::wal::WalEntry;
 
+/// Current Unix timestamp in seconds. Used for `inserted_at` /
+/// `last_accessed_at` stamps. Returns 0 if the system clock predates UNIX_EPOCH
+/// (impossible on a sane host, but we don't want to panic on it).
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct CacheEntry {
     pub uuid: String,
     pub embedding: Vec<f32>,
     pub response: String,
     pub query_text: String,
+    /// Unix timestamp seconds; set once on insert, never updated. Persisted in
+    /// the WAL so it survives restart.
+    pub inserted_at: u64,
+    /// Unix timestamp seconds; updated on every query hit. NOT in the WAL —
+    /// this is in-memory soft state, persisted only via snapshots.
+    pub last_accessed_at: u64,
+    /// Monotonically incremented on every query hit. NOT in the WAL — same
+    /// reasoning as `last_accessed_at`.
+    pub access_count: u64,
 }
 
 #[derive(Debug)]
@@ -19,12 +39,30 @@ pub struct QueryHit {
     pub id: String,
     pub response: String,
     pub similarity: f32,
+    /// Side-table internal id, exposed so the handler can call
+    /// `record_access` without a second lookup.
+    pub internal_id: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NamespaceStats {
     pub entry_count: usize,
     pub dimension: Option<usize>,
+    /// Min `inserted_at` across entries (0 if empty).
+    pub oldest_entry_ts: u64,
+    /// Max `inserted_at` across entries (0 if empty).
+    pub newest_entry_ts: u64,
+    /// Sum of `access_count` across all entries.
+    pub total_accesses: u64,
+}
+
+/// One Top-N entry surfaced by `/admin/entry-stats`.
+#[derive(Debug, Clone)]
+pub struct TopEntrySummary {
+    pub uuid: String,
+    pub access_count: u64,
+    pub last_accessed_at: u64,
+    pub query_text_preview: String,
 }
 
 /// One HNSW index + side-table, scoped to a single `model_id`.
@@ -49,6 +87,9 @@ pub struct FullEntry {
     pub response: String,
     pub query_text: String,
     pub model_id: String,
+    pub inserted_at: u64,
+    pub last_accessed_at: u64,
+    pub access_count: u64,
 }
 
 impl NamespacedIndex {
@@ -70,12 +111,16 @@ impl NamespacedIndex {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_with_uuid(
         &mut self,
         uuid: String,
         embedding: Vec<f32>,
         response: String,
         query_text: String,
+        inserted_at: u64,
+        last_accessed_at: u64,
+        access_count: u64,
     ) -> Result<()> {
         match self.dimension {
             None => self.dimension = Some(embedding.len()),
@@ -107,6 +152,9 @@ impl NamespacedIndex {
                 embedding,
                 response,
                 query_text,
+                inserted_at,
+                last_accessed_at,
+                access_count,
             },
         );
         Ok(())
@@ -143,15 +191,17 @@ impl NamespacedIndex {
             return Ok(None);
         }
 
+        let internal_id = n.get_origin_id();
         let entry = self
             .entries
-            .get(&n.get_origin_id())
-            .ok_or_else(|| anyhow!("neighbour id {} not in side-table", n.get_origin_id()))?;
+            .get(&internal_id)
+            .ok_or_else(|| anyhow!("neighbour id {} not in side-table", internal_id))?;
 
         Ok(Some(QueryHit {
             id: entry.uuid.clone(),
             response: entry.response.clone(),
             similarity,
+            internal_id,
         }))
     }
 
@@ -161,6 +211,15 @@ impl NamespacedIndex {
 
     pub fn dimension(&self) -> Option<usize> {
         self.dimension
+    }
+
+    /// Update access metadata for the given internal id. Called on every
+    /// query hit — tiny critical section under the index write lock.
+    fn record_access(&mut self, internal_id: usize) {
+        if let Some(entry) = self.entries.get_mut(&internal_id) {
+            entry.last_accessed_at = now_unix_secs();
+            entry.access_count = entry.access_count.saturating_add(1);
+        }
     }
 }
 
@@ -204,11 +263,15 @@ impl SemanticIndex {
         model_id: &str,
     ) -> Result<String> {
         let uuid = uuid::Uuid::new_v4().to_string();
+        let now = now_unix_secs();
         self.namespace_mut(model_id).insert_with_uuid(
             uuid.clone(),
             embedding,
             response,
             query_text,
+            now,
+            now,
+            0,
         )?;
         self.record_uuid(&uuid, model_id);
         Ok(uuid)
@@ -221,13 +284,21 @@ impl SemanticIndex {
             response,
             query_text,
             model_id,
+            inserted_at,
             ..
         } = entry;
+        // Pre-M24 WAL entries lack inserted_at and deserialize to 0; for the
+        // initial implementation we keep that 0 — it tags the entry as
+        // "older than anything stamped post-M24" which is the correct LRU
+        // ordering.
         self.namespace_mut(&model_id).insert_with_uuid(
             uuid.clone(),
             embedding,
             response,
             query_text,
+            inserted_at,
+            inserted_at,
+            0,
         )?;
         self.record_uuid(&uuid, &model_id);
         Ok(())
@@ -240,12 +311,18 @@ impl SemanticIndex {
             response,
             query_text,
             model_id,
+            inserted_at,
+            last_accessed_at,
+            access_count,
         } = entry;
         self.namespace_mut(&model_id).insert_with_uuid(
             uuid.clone(),
             embedding,
             response,
             query_text,
+            inserted_at,
+            last_accessed_at,
+            access_count,
         )?;
         self.record_uuid(&uuid, &model_id);
         Ok(())
@@ -264,7 +341,18 @@ impl SemanticIndex {
             response: entry.response.clone(),
             query_text: entry.query_text.clone(),
             model_id,
+            inserted_at: entry.inserted_at,
+            last_accessed_at: entry.last_accessed_at,
+            access_count: entry.access_count,
         })
+    }
+
+    /// Update access metadata for a query hit. Called by the query handler
+    /// under a brief write lock after the HNSW search resolved to a hit.
+    pub fn record_access(&mut self, model_id: &str, internal_id: usize) {
+        if let Some(ns) = self.namespaces.get_mut(model_id) {
+            ns.record_access(internal_id);
+        }
     }
 
     /// Flatten every namespace into a `Vec<SnapshotEntry>`. Used by
@@ -279,6 +367,9 @@ impl SemanticIndex {
                     response: entry.response.clone(),
                     query_text: entry.query_text.clone(),
                     model_id: model_id.clone(),
+                    inserted_at: entry.inserted_at,
+                    last_accessed_at: entry.last_accessed_at,
+                    access_count: entry.access_count,
                 });
             }
         }
@@ -305,15 +396,55 @@ impl SemanticIndex {
         self.namespaces
             .iter()
             .map(|(k, v)| {
+                let mut oldest: u64 = u64::MAX;
+                let mut newest: u64 = 0;
+                let mut total: u64 = 0;
+                let mut have_any = false;
+                for e in v.entries() {
+                    have_any = true;
+                    if e.inserted_at < oldest {
+                        oldest = e.inserted_at;
+                    }
+                    if e.inserted_at > newest {
+                        newest = e.inserted_at;
+                    }
+                    total = total.saturating_add(e.access_count);
+                }
+                let oldest_entry_ts = if have_any { oldest } else { 0 };
                 (
                     k.clone(),
                     NamespaceStats {
                         entry_count: v.entry_count(),
                         dimension: v.dimension(),
+                        oldest_entry_ts,
+                        newest_entry_ts: newest,
+                        total_accesses: total,
                     },
                 )
             })
             .collect()
+    }
+
+    /// Return the top-N most-accessed entries per namespace, sorted by
+    /// access_count descending. Used by `/admin/entry-stats`.
+    pub fn top_entries_per_namespace(&self, limit: usize) -> HashMap<String, Vec<TopEntrySummary>> {
+        let mut out = HashMap::with_capacity(self.namespaces.len());
+        for (model_id, ns) in &self.namespaces {
+            let mut entries: Vec<&CacheEntry> = ns.entries().collect();
+            entries.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+            entries.truncate(limit);
+            let summaries = entries
+                .into_iter()
+                .map(|e| TopEntrySummary {
+                    uuid: e.uuid.clone(),
+                    access_count: e.access_count,
+                    last_accessed_at: e.last_accessed_at,
+                    query_text_preview: preview_query_text(&e.query_text),
+                })
+                .collect();
+            out.insert(model_id.clone(), summaries);
+        }
+        out
     }
 
     /// Returns the dimension of the first namespace encountered, if any.
@@ -321,6 +452,15 @@ impl SemanticIndex {
     pub fn dimension(&self) -> Option<usize> {
         self.namespaces.values().find_map(|n| n.dimension())
     }
+}
+
+fn preview_query_text(s: &str) -> String {
+    const PREVIEW_LEN: usize = 50;
+    if s.chars().count() <= PREVIEW_LEN {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(PREVIEW_LEN).collect();
+    format!("{truncated}...")
 }
 
 #[cfg(test)]
@@ -331,6 +471,18 @@ mod tests {
 
     fn test_index() -> SemanticIndex {
         SemanticIndex::new(&HnswConfig::default())
+    }
+
+    fn wal_entry(uuid: &str, vec: Vec<f32>, model_id: &str) -> WalEntry {
+        WalEntry {
+            uuid: uuid.into(),
+            embedding: vec,
+            response: format!("r-{uuid}"),
+            query_text: format!("q-{uuid}"),
+            model_id: model_id.into(),
+            inserted_at: 0,
+            sequence: 0,
+        }
     }
 
     #[test]
@@ -490,6 +642,7 @@ mod tests {
             response: "the answer".into(),
             query_text: "the question".into(),
             model_id: M.into(),
+            inserted_at: 1234,
             sequence: 0,
         };
         idx.replay_entry(entry).unwrap();
@@ -499,6 +652,9 @@ mod tests {
         assert_eq!(got.response, "the answer");
         assert_eq!(got.query_text, "the question");
         assert_eq!(got.model_id, M);
+        assert_eq!(got.inserted_at, 1234);
+        assert_eq!(got.last_accessed_at, 1234);
+        assert_eq!(got.access_count, 0);
     }
 
     #[test]
@@ -510,47 +666,29 @@ mod tests {
     #[test]
     fn test_get_entry_by_uuid_cross_namespace() {
         let mut idx = test_index();
-        let a = WalEntry {
-            uuid: "u-a".into(),
-            embedding: vec![1.0, 0.0, 0.0],
-            response: "ra".into(),
-            query_text: "qa".into(),
-            model_id: "model-a::3".into(),
-            sequence: 0,
-        };
-        let b = WalEntry {
-            uuid: "u-b".into(),
-            embedding: vec![0.0, 1.0, 0.0],
-            response: "rb".into(),
-            query_text: "qb".into(),
-            model_id: "model-b::3".into(),
-            sequence: 0,
-        };
-        idx.replay_entry(a).unwrap();
-        idx.replay_entry(b).unwrap();
+        idx.replay_entry(wal_entry("u-a", vec![1.0, 0.0, 0.0], "model-a::3"))
+            .unwrap();
+        idx.replay_entry(wal_entry("u-b", vec![0.0, 1.0, 0.0], "model-b::3"))
+            .unwrap();
         let hit = idx.get_entry_by_uuid("u-b").unwrap();
         assert_eq!(hit.model_id, "model-b::3");
-        assert_eq!(hit.response, "rb");
+        assert_eq!(hit.response, "r-u-b");
     }
 
     #[test]
     fn test_uuid_to_namespace_populated_on_replay() {
         let mut idx = test_index();
-        idx.replay_entry(WalEntry {
-            uuid: "u1".into(),
-            embedding: vec![1.0, 0.0, 0.0],
-            response: "r".into(),
-            query_text: "q".into(),
-            model_id: "m::3".into(),
-            sequence: 0,
-        })
-        .unwrap();
+        idx.replay_entry(wal_entry("u1", vec![1.0, 0.0, 0.0], "m::3"))
+            .unwrap();
         idx.replay_snapshot_entry(SnapshotEntry {
             uuid: "u2".into(),
             embedding: vec![0.0, 1.0, 0.0],
             response: "r".into(),
             query_text: "q".into(),
             model_id: "m::3".into(),
+            inserted_at: 0,
+            last_accessed_at: 0,
+            access_count: 0,
         })
         .unwrap();
         assert_eq!(
@@ -569,14 +707,7 @@ mod tests {
         // (Important for read-repair — the coordinator may replay an entry
         // that was already inserted by another concurrent path.)
         let mut idx = test_index();
-        let mk = || WalEntry {
-            uuid: "dup".into(),
-            embedding: vec![1.0, 0.0, 0.0],
-            response: "r".into(),
-            query_text: "q".into(),
-            model_id: M.into(),
-            sequence: 0,
-        };
+        let mk = || wal_entry("dup", vec![1.0, 0.0, 0.0], M);
         idx.replay_entry(mk()).unwrap();
         idx.replay_entry(mk()).unwrap();
         assert_eq!(idx.entry_count(), 1);
@@ -625,5 +756,134 @@ mod tests {
             .unwrap()
             .expect("should hit");
         assert_eq!(hit_b.response, "model-b-resp");
+    }
+
+    // --- M24: access tracking ---------------------------------------------
+
+    #[test]
+    fn test_insert_sets_inserted_at() {
+        let before = now_unix_secs();
+        let mut idx = test_index();
+        let uuid = idx
+            .insert(vec![1.0, 0.0, 0.0], "r".into(), "q".into(), M)
+            .unwrap();
+        let after = now_unix_secs();
+        let entry = idx.get_entry_by_uuid(&uuid).unwrap();
+        assert!(
+            entry.inserted_at >= before && entry.inserted_at <= after + 1,
+            "inserted_at={} not in [{before}, {after}+1]",
+            entry.inserted_at
+        );
+    }
+
+    #[test]
+    fn test_insert_sets_initial_access_fields() {
+        let mut idx = test_index();
+        let uuid = idx
+            .insert(vec![1.0, 0.0, 0.0], "r".into(), "q".into(), M)
+            .unwrap();
+        let entry = idx.get_entry_by_uuid(&uuid).unwrap();
+        assert_eq!(entry.access_count, 0);
+        assert_eq!(entry.last_accessed_at, entry.inserted_at);
+    }
+
+    #[test]
+    fn test_record_access_increments_count() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let uuid = idx.insert(v.clone(), "r".into(), "q".into(), M).unwrap();
+        let hit = idx.query(&v, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, hit.internal_id);
+        assert_eq!(idx.get_entry_by_uuid(&uuid).unwrap().access_count, 1);
+        idx.record_access(M, hit.internal_id);
+        assert_eq!(idx.get_entry_by_uuid(&uuid).unwrap().access_count, 2);
+    }
+
+    #[test]
+    fn test_record_access_updates_last_accessed() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let uuid = idx.insert(v.clone(), "r".into(), "q".into(), M).unwrap();
+        let initial = idx.get_entry_by_uuid(&uuid).unwrap().last_accessed_at;
+        let hit = idx.query(&v, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, hit.internal_id);
+        let after = idx.get_entry_by_uuid(&uuid).unwrap().last_accessed_at;
+        assert!(
+            after >= initial,
+            "last_accessed_at went backwards: {after} < {initial}"
+        );
+    }
+
+    #[test]
+    fn test_inserted_at_does_not_change_on_access() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let uuid = idx.insert(v.clone(), "r".into(), "q".into(), M).unwrap();
+        let initial = idx.get_entry_by_uuid(&uuid).unwrap().inserted_at;
+        let hit = idx.query(&v, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, hit.internal_id);
+        idx.record_access(M, hit.internal_id);
+        assert_eq!(idx.get_entry_by_uuid(&uuid).unwrap().inserted_at, initial);
+    }
+
+    #[test]
+    fn test_namespace_stats_access_fields() {
+        let mut idx = test_index();
+        let v1 = vec![1.0_f32, 0.0, 0.0];
+        let v2 = vec![0.0_f32, 1.0, 0.0];
+        let v3 = vec![0.0_f32, 0.0, 1.0];
+        let _u1 = idx.insert(v1.clone(), "r1".into(), "q1".into(), M).unwrap();
+        let _u2 = idx.insert(v2.clone(), "r2".into(), "q2".into(), M).unwrap();
+        let _u3 = idx.insert(v3.clone(), "r3".into(), "q3".into(), M).unwrap();
+
+        // Access entry 1 twice, entry 2 once. Entry 3 untouched.
+        let h1 = idx.query(&v1, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, h1.internal_id);
+        idx.record_access(M, h1.internal_id);
+        let h2 = idx.query(&v2, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, h2.internal_id);
+
+        let stats = idx.namespace_stats();
+        let ns = stats.get(M).unwrap();
+        assert_eq!(ns.total_accesses, 3);
+        assert!(ns.oldest_entry_ts > 0);
+        assert!(ns.newest_entry_ts >= ns.oldest_entry_ts);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_access_fields() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "r".into(), "q".into(), M).unwrap();
+        let h = idx.query(&v, 0.9, M).unwrap().unwrap();
+        idx.record_access(M, h.internal_id);
+        idx.record_access(M, h.internal_id);
+        idx.record_access(M, h.internal_id);
+
+        let snap = idx.snapshot_entries();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].access_count, 3);
+        assert!(snap[0].last_accessed_at > 0);
+        assert!(snap[0].inserted_at > 0);
+    }
+
+    #[test]
+    fn test_replay_snapshot_preserves_access_fields() {
+        let mut idx = test_index();
+        idx.replay_snapshot_entry(SnapshotEntry {
+            uuid: "u1".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: M.into(),
+            inserted_at: 5000,
+            last_accessed_at: 6000,
+            access_count: 42,
+        })
+        .unwrap();
+        let entry = idx.get_entry_by_uuid("u1").unwrap();
+        assert_eq!(entry.inserted_at, 5000);
+        assert_eq!(entry.last_accessed_at, 6000);
+        assert_eq!(entry.access_count, 42);
     }
 }

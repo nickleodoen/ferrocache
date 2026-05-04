@@ -465,6 +465,9 @@ mod tests {
                     response: "from peer".into(),
                     query_text: "q".into(),
                     model_id: "m::3".into(),
+                    inserted_at: 0,
+                    last_accessed_at: 0,
+                    access_count: 0,
                 })
             }),
         );

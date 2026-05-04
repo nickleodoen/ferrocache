@@ -15,11 +15,13 @@ use tokio::sync::oneshot;
 use crate::auth::{AuthToken, auth_middleware};
 use crate::cluster::ClusterState;
 use crate::failure_detector::PeerStatus;
+use crate::index::now_unix_secs;
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
-    ClusterStatusResponse, CompactResponse, CountersResponse, ErrorResponse, FullEntryResponse,
-    HealthResponse, InsertRequest, InsertResponse, NamespaceStatsEntry, PeerHealth, QueryRequest,
-    QueryResponse, ReadRepairRequest, ReadRepairResponse, StatsHnsw, StatsResponse,
+    ClusterStatusResponse, CompactResponse, CountersResponse, EntryStatsResponse, ErrorResponse,
+    FullEntryResponse, HealthResponse, InsertRequest, InsertResponse, NamespaceStatsEntry,
+    NamespaceTopEntries, PeerHealth, QueryRequest, QueryResponse, ReadRepairRequest,
+    ReadRepairResponse, StatsHnsw, StatsResponse, TopEntryRow,
 };
 use crate::state::AppState;
 use crate::wal::{
@@ -74,6 +76,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats_handler))
         .route("/cluster/status", get(cluster_status_handler))
         .route("/admin/compact", post(compact_handler))
+        .route("/admin/entry-stats", get(entry_stats_handler))
         .route("/metrics", get(metrics_handler))
         // Read-repair internal endpoints (M23). Both follow the same auth
         // pattern as the public routes — they're cluster-internal calls
@@ -216,6 +219,13 @@ async fn process_query_locally(
     let elapsed = start.elapsed().as_secs_f64();
     match result {
         Ok(Some(hit)) => {
+            // M24: brief write lock to bump access metadata. The read lock
+            // above has dropped; the write lock is held only long enough for
+            // a HashMap lookup + two field writes. Misses skip this entirely.
+            {
+                let mut idx = state.index.write().await;
+                idx.record_access(model_id, hit.internal_id);
+            }
             state.metrics.record_query_hit(model_id, elapsed);
             tracing::info!(hit = true, similarity = hit.similarity, dim, "query");
             (
@@ -383,6 +393,11 @@ async fn perform_repair(
         query_text: full.query_text,
         model_id: full.model_id,
         sequence: 0, // stamped by the flush task
+        // M24: preserve the source's `inserted_at` so read-repair doesn't
+        // make this entry look freshly created. `last_accessed_at` and
+        // `access_count` are NOT in the WAL; they restart at zero on the
+        // repaired side, which is fine — the next query will bump them.
+        inserted_at: full.inserted_at,
     };
 
     let (tx, rx) = oneshot::channel();
@@ -557,6 +572,7 @@ async fn local_insert_inner(
         query_text: req.query_text.clone(),
         model_id: model_id.clone(),
         sequence: 0, // stamped by the flush task
+        inserted_at: now_unix_secs(),
     };
 
     let (tx, rx) = oneshot::channel();
@@ -632,6 +648,9 @@ async fn get_entry_handler(
                 response: e.response,
                 query_text: e.query_text,
                 model_id: e.model_id,
+                inserted_at: e.inserted_at,
+                last_accessed_at: e.last_accessed_at,
+                access_count: e.access_count,
             }),
         )
             .into_response(),
@@ -673,6 +692,9 @@ async fn read_repair_handler(
         query_text: req.query_text,
         model_id: req.model_id.clone(),
         sequence: 0,
+        // The /internal/read-repair caller didn't carry an inserted_at
+        // (the public ReadRepairRequest predates M24); stamp now.
+        inserted_at: now_unix_secs(),
     };
     let (tx, rx) = oneshot::channel();
     if state
@@ -792,6 +814,29 @@ async fn compact_handler(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn entry_stats_handler(State(state): State<Arc<AppState>>) -> Json<EntryStatsResponse> {
+    const TOP_N: usize = 10;
+    let index = state.index.read().await;
+    let raw = index.top_entries_per_namespace(TOP_N);
+    drop(index);
+    let namespaces = raw
+        .into_iter()
+        .map(|(k, rows)| {
+            let top_entries = rows
+                .into_iter()
+                .map(|r| TopEntryRow {
+                    uuid: r.uuid,
+                    access_count: r.access_count,
+                    last_accessed_at: r.last_accessed_at,
+                    query_text_preview: r.query_text_preview,
+                })
+                .collect();
+            (k, NamespaceTopEntries { top_entries })
+        })
+        .collect();
+    Json(EntryStatsResponse { namespaces })
+}
+
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let count = state.index.read().await.entry_count() as u64;
     Json(HealthResponse {
@@ -847,6 +892,9 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
                 NamespaceStatsEntry {
                     entry_count: v.entry_count,
                     dimension: v.dimension,
+                    oldest_entry_ts: v.oldest_entry_ts,
+                    newest_entry_ts: v.newest_entry_ts,
+                    total_accesses: v.total_accesses,
                 },
             )
         })
@@ -1752,6 +1800,7 @@ mod tests {
                     query_text: format!("q{i}"),
                     model_id: MID.to_string(),
                     sequence: 0,
+                    inserted_at: 0,
                 })
                 .await
                 .unwrap();
@@ -1900,5 +1949,124 @@ mod tests {
         assert_eq!(counters["queries_hit"], 1);
         assert_eq!(counters["inserts_total"], 1);
         assert!((counters["hit_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    // --- M24: access tracking ----------------------------------------------
+
+    async fn insert_via_http(app: &Router, vec: &[f32], uuid: &str) {
+        let payload = json!({
+            "embedding": vec,
+            "response": format!("r-{uuid}"),
+            "query_text": format!("the question for {uuid}"),
+            "model_id": MID,
+            "uuid": uuid,
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    async fn query_via_http(app: &Router, vec: &[f32]) {
+        let payload = json!({
+            "embedding": vec,
+            "threshold": 0.9,
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/query?local=true", payload))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_query_hit_updates_access_count() {
+        let (app, _, _dir) = test_app().await;
+        let v = [1.0_f32, 0.0, 0.0];
+        insert_via_http(&app, &v, "track-target").await;
+        query_via_http(&app, &v).await;
+        query_via_http(&app, &v).await;
+        let resp = app
+            .oneshot(get("/internal/entry/track-target?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["access_count"], 2);
+        assert!(body["last_accessed_at"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_miss_does_not_update_access() {
+        let (app, _, _dir) = test_app().await;
+        let v = [1.0_f32, 0.0, 0.0];
+        insert_via_http(&app, &v, "no-touch").await;
+        // Query with a sufficiently different vector — high threshold makes
+        // this a miss against a unit-x neighbour.
+        let payload = json!({
+            "embedding": [0.0_f32, 0.0, 1.0],
+            "threshold": 0.99,
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/query?local=true", payload))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(get("/internal/entry/no-touch?local=true"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["access_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_admin_entry_stats_endpoint() {
+        let (app, _, _dir) = test_app().await;
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [0.0_f32, 1.0, 0.0];
+        let c = [0.0_f32, 0.0, 1.0];
+        insert_via_http(&app, &a, "hot").await;
+        insert_via_http(&app, &b, "warm").await;
+        insert_via_http(&app, &c, "cold").await;
+        // hot accessed 3x, warm 1x, cold 0x
+        for _ in 0..3 {
+            query_via_http(&app, &a).await;
+        }
+        query_via_http(&app, &b).await;
+
+        let resp = app.oneshot(get("/admin/entry-stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let top = body["namespaces"][MID]["top_entries"].as_array().unwrap();
+        assert!(top.len() >= 2);
+        // Ordered by access_count descending.
+        assert_eq!(top[0]["uuid"], "hot");
+        assert_eq!(top[0]["access_count"], 3);
+        assert_eq!(top[1]["uuid"], "warm");
+        assert_eq!(top[1]["access_count"], 1);
+        assert!(top[0]["query_text_preview"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_stats_includes_access_fields() {
+        let (app, _, _dir) = test_app().await;
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [0.0_f32, 1.0, 0.0];
+        insert_via_http(&app, &a, "u-a").await;
+        insert_via_http(&app, &b, "u-b").await;
+        query_via_http(&app, &a).await;
+        query_via_http(&app, &a).await;
+        query_via_http(&app, &b).await;
+
+        let resp = app.oneshot(get("/stats")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        let ns = &body["namespaces"][MID];
+        assert_eq!(ns["total_accesses"], 3);
+        assert!(ns["oldest_entry_ts"].as_u64().unwrap() > 0);
+        assert!(ns["newest_entry_ts"].as_u64().unwrap() > 0);
+        assert!(ns["newest_entry_ts"].as_u64().unwrap() >= ns["oldest_entry_ts"].as_u64().unwrap());
     }
 }

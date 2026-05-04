@@ -623,6 +623,9 @@ mod tests {
             NamespaceStats {
                 entry_count: 7,
                 dimension: Some(3),
+                oldest_entry_ts: 0,
+                newest_entry_ts: 0,
+                total_accesses: 0,
             },
         );
         let body = m.render(&stats, 1, &Vec::new());

@@ -38,6 +38,13 @@ pub struct WalEntry {
     /// entries already captured in a snapshot. Old WAL entries default to 0.
     #[serde(default)]
     pub sequence: u64,
+    /// Unix timestamp seconds when the entry was first inserted (M24).
+    /// Pre-M24 WAL lines lack this and deserialize to 0 — treated as
+    /// "older than anything stamped post-M24" by future LRU eviction.
+    /// `last_accessed_at` and `access_count` are NOT persisted in the WAL —
+    /// they are in-memory soft state, snapshot-persisted only.
+    #[serde(default)]
+    pub inserted_at: u64,
 }
 
 pub struct Wal {
@@ -486,6 +493,7 @@ mod tests {
             query_text: format!("q-{uuid}"),
             model_id: "test-model::3".to_string(),
             sequence: 0,
+            inserted_at: 0,
         }
     }
 
@@ -581,6 +589,45 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].uuid, "old-1");
         assert_eq!(entries[0].model_id, LEGACY_NAMESPACE);
+    }
+
+    #[tokio::test]
+    async fn test_wal_inserted_at_roundtrip() {
+        // M24: append a WalEntry with a known inserted_at, replay, assert
+        // the timestamp survived.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        let mut e = sample("ts-roundtrip", "r");
+        e.inserted_at = 1_714_500_000;
+        wal.append(&e).await.unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inserted_at, 1_714_500_000);
+    }
+
+    #[tokio::test]
+    async fn test_wal_legacy_entry_defaults_inserted_at_zero() {
+        // M24: a manually-crafted legacy WAL line that lacks inserted_at
+        // must deserialize to 0 (serde default).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let legacy_json = r#"{"uuid":"old-2","embedding":[0.1,0.2,0.3],"response":"r","query_text":"q","model_id":"m::3","sequence":1}"#;
+        let mut f = File::create(&path).await.unwrap();
+        f.write_all(legacy_json.as_bytes()).await.unwrap();
+        f.write_all(b"\n").await.unwrap();
+        f.sync_data().await.unwrap();
+        drop(f);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inserted_at, 0);
     }
 
     #[tokio::test]
@@ -690,6 +737,7 @@ mod tests {
             query_text: format!("q-{uuid}"),
             model_id: "test-model::3".to_string(),
             sequence: 0,
+            inserted_at: 0,
         }
     }
 

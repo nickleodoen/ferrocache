@@ -21,6 +21,15 @@ pub struct SnapshotEntry {
     pub response: String,
     pub query_text: String,
     pub model_id: String,
+    /// Access tracking (M24). Snapshots preserve these across compaction
+    /// so a compaction cycle doesn't reset access counts. Pre-M24 snapshots
+    /// lack these fields and `#[serde(default)]` zeroes them.
+    #[serde(default)]
+    pub inserted_at: u64,
+    #[serde(default)]
+    pub last_accessed_at: u64,
+    #[serde(default)]
+    pub access_count: u64,
 }
 
 #[derive(Debug)]
@@ -163,6 +172,9 @@ mod tests {
             response: format!("resp-{i}"),
             query_text: format!("q-{i}"),
             model_id: "m::3".into(),
+            inserted_at: 0,
+            last_accessed_at: 0,
+            access_count: 0,
         }
     }
 
@@ -244,6 +256,7 @@ mod tests {
                 query_text: format!("q{i}"),
                 model_id: "m::3".into(),
                 sequence: 0,
+                inserted_at: 0,
             };
             wal.append(&we).await.unwrap();
             index.replay_entry(we).unwrap();
@@ -270,6 +283,7 @@ mod tests {
             query_text: "q4".into(),
             model_id: "m::3".into(),
             sequence: 0,
+            inserted_at: 0,
         };
         let s = wal.append(&we).await.unwrap();
         assert_eq!(s, 4);
