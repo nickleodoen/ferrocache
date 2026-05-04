@@ -41,6 +41,28 @@ pub fn effective_namespace(model_id: &str, cache_scope: Option<&str>) -> String 
     }
 }
 
+/// The base namespace used when `conversation_id` is absent OR as the
+/// fallback level of the M29 two-level lookup. Identical to
+/// `effective_namespace` — kept as a named alias so the two roles are
+/// distinguishable at call sites.
+pub fn base_namespace(model_id: &str, cache_scope: Option<&str>) -> String {
+    effective_namespace(model_id, cache_scope)
+}
+
+/// Conversation-scoped namespace key (M29). Composes with
+/// `effective_namespace`: starts from the base then appends `::conv_{id}`.
+/// The hardcoded `conv_` prefix prevents collision between conversation
+/// IDs and cache scopes — `conversation_id="abc"` is `"m::conv_abc"`,
+/// which can never collide with `cache_scope="abc"` → `"m::abc"`.
+pub fn conversation_namespace(
+    model_id: &str,
+    cache_scope: Option<&str>,
+    conversation_id: &str,
+) -> String {
+    let base = base_namespace(model_id, cache_scope);
+    format!("{base}::conv_{conversation_id}")
+}
+
 /// Current Unix timestamp in seconds. Used for `inserted_at` /
 /// `last_accessed_at` stamps. Returns 0 if the system clock predates UNIX_EPOCH
 /// (impossible on a sane host, but we don't want to panic on it).
@@ -567,6 +589,16 @@ impl SemanticIndex {
     }
 
     pub fn replay_entry(&mut self, entry: WalEntry) -> Result<()> {
+        // M25 tombstone: a tombstone WAL entry removes the referenced UUID
+        // instead of inserting. Without this branch, the runtime path that
+        // routes reaper-driven tombstones through the WAL channel (the
+        // flush task → `replay_entry`) would re-materialise a phantom empty
+        // entry under the just-deleted UUID. Returning `Ok(())` even when
+        // the UUID no longer exists keeps replay idempotent.
+        if entry.tombstone {
+            self.remove_by_uuid(&entry.uuid);
+            return Ok(());
+        }
         let WalEntry {
             uuid,
             embedding,
@@ -711,6 +743,33 @@ impl SemanticIndex {
             self.uuid_to_namespace.remove(uuid);
         }
         out
+    }
+
+    /// Drop conversation-scoped namespaces whose entries map AND evicted
+    /// set are both empty (M29). Conversation namespaces are recognised by
+    /// the hardcoded `::conv_` segment in the key. Base namespaces are
+    /// never pruned even when empty — they typically refill quickly and
+    /// pruning them would just churn allocations. Returns the keys removed.
+    pub fn prune_empty_namespaces(&mut self) -> Vec<String> {
+        let to_drop: Vec<String> = self
+            .namespaces
+            .iter()
+            .filter_map(|(key, ns)| {
+                if !key.contains("::conv_") {
+                    return None;
+                }
+                if ns.entries.is_empty() && ns.evicted_ids.is_empty() {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in &to_drop {
+            tracing::debug!(namespace = %key, "pruning empty conversation namespace");
+            self.namespaces.remove(key);
+        }
+        to_drop
     }
 
     /// Find every live entry in the namespace whose cosine similarity to
@@ -2044,5 +2103,143 @@ mod tests {
             .unwrap();
         let result = idx.query(&v, 0.50, &scoped).unwrap();
         assert!(result.is_none(), "scoped query saw unscoped entry");
+    }
+
+    // -- M29: conversation scoping -------------------------------------------
+
+    #[test]
+    fn test_conversation_namespace_function() {
+        assert_eq!(
+            conversation_namespace("m::3", None, "abc"),
+            "m::3::conv_abc"
+        );
+        assert_eq!(
+            conversation_namespace("m::3", Some("tenant_a"), "abc"),
+            "m::3::tenant_a::conv_abc"
+        );
+        // The conv_ prefix prevents collision between conversation_id and
+        // cache_scope: "abc" as conv_id is "::conv_abc", not "::abc".
+        assert_ne!(
+            conversation_namespace("m::3", None, "abc"),
+            effective_namespace("m::3", Some("abc"))
+        );
+    }
+
+    #[test]
+    fn test_conversation_insert_separate_namespace() {
+        let mut idx = test_index();
+        let conv_ns = conversation_namespace("m::3", None, "conv_1");
+        idx.insert(vec![1.0_f32, 0.0, 0.0], "r".into(), "q".into(), &conv_ns)
+            .unwrap();
+        assert!(idx.namespaces.contains_key("m::3::conv_conv_1"));
+        // The base namespace was never touched.
+        assert!(!idx.namespaces.contains_key("m::3"));
+    }
+
+    #[test]
+    fn test_conversation_priority_over_global() {
+        // Same vector inserted into both conversation and base namespace.
+        // A query that has a conversation_id should hit the conversation
+        // entry, not the global one. This drives the two-level lookup
+        // priority: conversation > global.
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let base = base_namespace("m::3", None);
+        let conv_ns = conversation_namespace("m::3", None, "conv_1");
+        idx.insert(v.clone(), "global-answer".into(), "q".into(), &base)
+            .unwrap();
+        idx.insert(v.clone(), "conv-answer".into(), "q".into(), &conv_ns)
+            .unwrap();
+        // Direct query in conv namespace returns conv-answer.
+        let hit = idx.query(&v, 0.50, &conv_ns).unwrap().expect("hit");
+        assert_eq!(hit.response, "conv-answer");
+    }
+
+    #[test]
+    fn test_no_conversation_id_no_fallback() {
+        // An entry inserted into a conversation namespace must NOT be
+        // visible to a non-conversation query — generic queries should
+        // never see context-specific answers.
+        let mut idx = test_index();
+        let conv_ns = conversation_namespace("m::3", None, "conv_1");
+        idx.insert(
+            vec![1.0_f32, 0.0, 0.0],
+            "context".into(),
+            "q".into(),
+            &conv_ns,
+        )
+        .unwrap();
+        // Plain query against the base namespace must miss.
+        let result = idx.query(&[1.0_f32, 0.0, 0.0], 0.50, "m::3").unwrap();
+        assert!(
+            result.is_none(),
+            "non-conversation query saw conversation entry"
+        );
+    }
+
+    #[test]
+    fn test_prune_empty_conversation_namespace() {
+        let mut idx = test_index();
+        let conv_ns = conversation_namespace("m::3", None, "conv_1");
+        let base = base_namespace("m::3", None);
+        let uuid = idx
+            .insert(vec![1.0_f32, 0.0, 0.0], "r".into(), "q".into(), &conv_ns)
+            .unwrap();
+        idx.insert(vec![0.0_f32, 1.0, 0.0], "r2".into(), "q2".into(), &base)
+            .unwrap();
+        // Force expire and reap.
+        let past = now_unix_secs().saturating_sub(10);
+        let ns_mut = idx.namespaces.get_mut(&conv_ns).unwrap();
+        let internal = *ns_mut.uuid_to_internal.get(&uuid).unwrap();
+        ns_mut.entries.get_mut(&internal).unwrap().expires_at = Some(past);
+        let expired = idx.collect_expired(now_unix_secs());
+        assert_eq!(expired.len(), 1);
+        // Rebuild clears the evicted_ids set; only after that can prune fire.
+        // This mirrors the reaper's prod sequence: collect_expired → rebuild
+        // (when ghost ratio crosses threshold) → prune_empty_namespaces.
+        idx.rebuild_dirty_namespaces(&HnswConfig::default());
+        let pruned = idx.prune_empty_namespaces();
+        assert!(pruned.iter().any(|s| s == &conv_ns));
+        assert!(!idx.namespaces.contains_key(&conv_ns));
+        // Base namespace survives even with no expired entries — it has
+        // a live entry, so retain returned true.
+        assert!(idx.namespaces.contains_key(&base));
+    }
+
+    #[test]
+    fn test_prune_does_not_remove_base_namespace() {
+        // Even an EMPTY base namespace should not be pruned — only conv ones.
+        let mut idx = test_index();
+        let base = base_namespace("m::3", None);
+        let uuid = idx
+            .insert(vec![1.0_f32, 0.0, 0.0], "r".into(), "q".into(), &base)
+            .unwrap();
+        // Remove the only entry; the namespace map still has the empty entry.
+        idx.remove_by_uuid(&uuid);
+        let pruned = idx.prune_empty_namespaces();
+        assert!(
+            pruned.is_empty(),
+            "prune touched base namespace: {pruned:?}"
+        );
+        assert!(idx.namespaces.contains_key(&base));
+    }
+
+    #[test]
+    fn test_prune_preserves_conv_namespace_with_evicted_ghosts() {
+        // A conversation namespace with no live entries but lingering
+        // evicted_ids (HNSW ghosts not yet rebuilt) must NOT be pruned —
+        // the ghost set is needed for query filtering until a rebuild.
+        let mut idx = test_index();
+        let conv_ns = conversation_namespace("m::3", None, "conv_g");
+        let uuid = idx
+            .insert(vec![1.0_f32, 0.0, 0.0], "r".into(), "q".into(), &conv_ns)
+            .unwrap();
+        idx.remove_by_uuid(&uuid); // entries empty, evicted_ids = {0}
+        let pruned = idx.prune_empty_namespaces();
+        assert!(
+            pruned.is_empty(),
+            "prune ran with ghosts present: {pruned:?}"
+        );
+        assert!(idx.namespaces.contains_key(&conv_ns));
     }
 }

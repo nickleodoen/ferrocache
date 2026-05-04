@@ -73,6 +73,7 @@ if _HAS_LLAMAINDEX:
         _threshold: float = PrivateAttr()
         _fail_open: bool = PrivateAttr()
         _cache_scope: Any = PrivateAttr()
+        _conversation_id: Any = PrivateAttr()
 
         def __init__(
             self,
@@ -84,6 +85,7 @@ if _HAS_LLAMAINDEX:
             fail_open: bool = True,
             auth_token: str | None = None,
             cache_scope: str | None = None,
+            conversation_id: str | None = None,
             **pydantic_kwargs: Any,
         ) -> None:
             super().__init__(**pydantic_kwargs)
@@ -103,6 +105,7 @@ if _HAS_LLAMAINDEX:
             self._embed_fn = embed_fn
             self._model_id = model_id
             self._cache_scope = cache_scope
+            self._conversation_id = conversation_id
 
         @property
         def metadata(self) -> LLMMetadata:
@@ -127,6 +130,7 @@ if _HAS_LLAMAINDEX:
                     model_id=self._model_id,
                     query_text=prompt,  # M27 exact-match pre-filter
                     cache_scope=self._cache_scope,
+                    conversation_id=self._conversation_id,
                 )
             except FerrocacheError as e:
                 if not self._fail_open:
@@ -146,6 +150,7 @@ if _HAS_LLAMAINDEX:
                     query_text=prompt,
                     model_id=self._model_id,
                     cache_scope=self._cache_scope,
+                    conversation_id=self._conversation_id,
                 )
             except (FerrocacheError, Exception) as e:
                 if not self._fail_open and isinstance(e, FerrocacheError):

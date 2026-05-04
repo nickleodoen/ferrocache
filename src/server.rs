@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use crate::auth::{AuthToken, auth_middleware};
 use crate::cluster::ClusterState;
 use crate::failure_detector::PeerStatus;
-use crate::index::{effective_namespace, now_unix_secs};
+use crate::index::{base_namespace, conversation_namespace, effective_namespace, now_unix_secs};
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
     ClusterStatusResponse, CompactResponse, CountersResponse, DeleteEntryResponse,
@@ -165,6 +165,7 @@ async fn query_handler(
                     response: None,
                     similarity: None,
                     exact_match: None,
+                    scope: None,
                 }),
             )
                 .into_response();
@@ -216,39 +217,91 @@ async fn process_query_locally(
         Some(s) if !s.trim().is_empty() => s,
         _ => return bad_request("model_id is required"),
     };
-    // M28: effective namespace incorporates `cache_scope` when present.
-    let ns = effective_namespace(model_id, req.cache_scope.as_deref());
     let now = now_unix_secs();
-    let result = {
+
+    // M29: when conversation_id is present, do a two-level lookup —
+    // conversation namespace first, base namespace as fallback. Empty /
+    // whitespace-only conversation_id is treated as absent so callers
+    // can set the field unconditionally without creating phantom scopes.
+    let conv_id = req
+        .conversation_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+    let base = base_namespace(model_id, req.cache_scope.as_deref());
+    let conv_ns =
+        conv_id.map(|cid| conversation_namespace(model_id, req.cache_scope.as_deref(), cid));
+
+    // First-level lookup: conversation namespace if present, else base.
+    let primary_ns: &str = conv_ns.as_deref().unwrap_or(&base);
+    let primary_result = {
         let index = state.index.read().await;
         index.query_with_text(
             &req.embedding,
             req.threshold,
-            &ns,
+            primary_ns,
             req.query_text.as_deref(),
             now,
         )
     };
+
+    // Fallback (only when we had a conversation_id and the conversation
+    // namespace missed). Errors from the primary still propagate as 400.
+    let (final_result, hit_ns_owned, hit_scope): (
+        Result<Option<crate::index::QueryHit>, anyhow::Error>,
+        String,
+        Option<&'static str>,
+    ) = match primary_result {
+        Ok(Some(hit)) => {
+            let scope = if conv_ns.is_some() {
+                Some("conversation")
+            } else {
+                None
+            };
+            (Ok(Some(hit)), primary_ns.to_string(), scope)
+        }
+        Ok(None) if conv_ns.is_some() => {
+            // Two-level fallback: try the base namespace.
+            let fallback = {
+                let index = state.index.read().await;
+                index.query_with_text(
+                    &req.embedding,
+                    req.threshold,
+                    &base,
+                    req.query_text.as_deref(),
+                    now,
+                )
+            };
+            match fallback {
+                Ok(Some(hit)) => (Ok(Some(hit)), base.clone(), Some("global")),
+                Ok(None) => (Ok(None), base.clone(), None),
+                Err(e) => (Err(e), base.clone(), None),
+            }
+        }
+        Ok(None) => (Ok(None), primary_ns.to_string(), None),
+        Err(e) => (Err(e), primary_ns.to_string(), None),
+    };
+
     let elapsed = start.elapsed().as_secs_f64();
-    match result {
+    match final_result {
         Ok(Some(hit)) => {
             // M24: brief write lock to bump access metadata. The read lock
             // above has dropped; the write lock is held only long enough for
             // a HashMap lookup + two field writes. Misses skip this entirely.
             {
                 let mut idx = state.index.write().await;
-                idx.record_access(&ns, hit.internal_id);
+                idx.record_access(&hit_ns_owned, hit.internal_id);
             }
-            state.metrics.record_query_hit(&ns, elapsed);
+            state.metrics.record_query_hit(&hit_ns_owned, elapsed);
             // M27: exact-match hits are ALSO regular hits. The new
             // counter is a subcategory, not an alternative.
             if hit.exact_match {
-                state.metrics.record_exact_match_hit(&ns);
+                state.metrics.record_exact_match_hit(&hit_ns_owned);
             }
             tracing::info!(
                 hit = true,
                 similarity = hit.similarity,
                 exact_match = hit.exact_match,
+                scope = ?hit_scope,
                 dim,
                 "query"
             );
@@ -260,12 +313,15 @@ async fn process_query_locally(
                     response: Some(hit.response),
                     similarity: Some(hit.similarity),
                     exact_match: Some(hit.exact_match),
+                    scope: hit_scope.map(|s| s.to_string()),
                 }),
             )
                 .into_response()
         }
         Ok(None) => {
-            state.metrics.record_query_miss(&ns, elapsed);
+            // On a true miss, we charge the miss to the base namespace —
+            // it's the canonical owner from the caller's perspective.
+            state.metrics.record_query_miss(&base, elapsed);
             tracing::info!(hit = false, dim, "query");
 
             // Read repair (M23): if we're the ring owner / coordinator and
@@ -279,7 +335,7 @@ async fn process_query_locally(
                 && state.read_repair_enabled
                 && state.replication_factor > 1
                 && let Some(cluster) = state.cluster.as_ref()
-                && let Some(repaired) = attempt_read_repair(state, cluster, &ns, &req).await
+                && let Some(repaired) = attempt_read_repair(state, cluster, &base, &req).await
             {
                 tracing::info!(hit = true, repaired = true, "query (repaired from replica)");
                 return (StatusCode::OK, Json(repaired)).into_response();
@@ -293,6 +349,7 @@ async fn process_query_locally(
                     response: None,
                     similarity: None,
                     exact_match: None,
+                    scope: None,
                 }),
             )
                 .into_response()
@@ -594,14 +651,33 @@ async fn local_insert_inner(
     // no separate `cache_scope` field on disk. On replay this name is
     // what populates the `SemanticIndex` namespace map, so query and
     // insert paths read the same key by construction.
-    let ns = effective_namespace(model_id, req.cache_scope.as_deref());
+    // M29: when `conversation_id` is present (and non-empty), the entry
+    // goes into the conversation namespace ONLY — the application has
+    // declared this answer is context-dependent.
+    let conv_id = req
+        .conversation_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+    let ns = match conv_id {
+        Some(cid) => conversation_namespace(model_id, req.cache_scope.as_deref(), cid),
+        None => effective_namespace(model_id, req.cache_scope.as_deref()),
+    };
 
     let uuid = req
         .uuid
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let inserted_at = now_unix_secs();
-    let expires_at = req.ttl_seconds.map(|t| inserted_at.saturating_add(t));
+    // M29: auto-TTL for conversation-scoped inserts. Explicit
+    // `ttl_seconds` always wins; otherwise fall back to the server-wide
+    // `conversation_ttl_seconds` config when the entry is in a
+    // conversation namespace.
+    let effective_ttl = match (conv_id, req.ttl_seconds) {
+        (_, Some(ttl)) => Some(ttl),
+        (Some(_), None) => state.conversation_ttl_seconds,
+        (None, None) => None,
+    };
+    let expires_at = effective_ttl.map(|t| inserted_at.saturating_add(t));
     let entry = WalEntry {
         uuid: uuid.clone(),
         embedding: req.embedding.clone(),
@@ -1227,6 +1303,7 @@ mod tests {
             None,
             0,    // no replication retries in tests
             true, // read_repair_enabled — no-op in tests since cluster is None
+            None, // conversation_ttl_seconds — overridden by build_state_with_conversation_ttl
         ))
     }
 
@@ -2343,6 +2420,7 @@ mod tests {
             None,
             0,
             true,
+            None, // conversation_ttl_seconds — these tests don't exercise auto-TTL
         ))
     }
 
@@ -2959,6 +3037,247 @@ mod tests {
         assert!(
             text.contains("ferrocache_evictions_total 0"),
             "expected no evictions in:\n{text}"
+        );
+    }
+
+    // -- M29: conversation scoping ------------------------------------------
+
+    async fn build_state_with_conversation_ttl(
+        wal_path: PathBuf,
+        conversation_ttl_seconds: Option<u64>,
+    ) -> Arc<AppState> {
+        let hnsw = HnswConfig::default();
+        let wal = Wal::open(&wal_path).await.unwrap();
+        let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+        let index = Arc::new(RwLock::new(SemanticIndex::new(&hnsw)));
+        let metrics = Arc::new(Metrics::new());
+        let gc = GroupCommitWal::spawn(
+            wal,
+            wal_path.clone(),
+            snapshot_path.clone(),
+            index.clone(),
+            metrics.clone(),
+            0,
+            GroupCommitConfig {
+                batch_size: 1,
+                batch_timeout: std::time::Duration::from_millis(0),
+                channel_capacity: 64,
+            },
+            hnsw.clone(),
+        );
+        Arc::new(AppState::new(
+            "test-node".to_string(),
+            index,
+            gc,
+            wal_path.to_string_lossy().into_owned(),
+            snapshot_path,
+            hnsw,
+            None,
+            None,
+            1,
+            metrics,
+            None,
+            0,
+            true,
+            conversation_ttl_seconds,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_query_with_conversation_id_scope_field() {
+        // Insert globally (no conversation). Query with conversation_id —
+        // the conversation namespace is empty, so the lookup falls back
+        // to the base. Response must carry `scope: "global"`.
+        let (app, _, _dir) = test_app().await;
+        let v = json!([1.0_f32, 0.0, 0.0]);
+        app.clone()
+            .oneshot(post_json(
+                "/insert?local=true",
+                json!({"embedding": v, "response": "g", "query_text": "q", "model_id": MID}),
+            ))
+            .await
+            .unwrap();
+        let q = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "conversation_id": "conv_1",
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["scope"], "global");
+    }
+
+    #[tokio::test]
+    async fn test_query_with_conversation_id_conversation_scope() {
+        // Insert WITH conversation_id, then query with the same id.
+        // Response must carry `scope: "conversation"`.
+        let (app, _, _dir) = test_app().await;
+        let v = json!([1.0_f32, 0.0, 0.0]);
+        app.clone()
+            .oneshot(post_json(
+                "/insert?local=true",
+                json!({
+                    "embedding": v,
+                    "response": "context-aware",
+                    "query_text": "q",
+                    "model_id": MID,
+                    "conversation_id": "conv_1",
+                }),
+            ))
+            .await
+            .unwrap();
+        let q = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "conversation_id": "conv_1",
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["response"], "context-aware");
+        assert_eq!(body["scope"], "conversation");
+    }
+
+    #[tokio::test]
+    async fn test_query_without_conversation_id_no_scope() {
+        let (app, _, _dir) = test_app().await;
+        let v = json!([1.0_f32, 0.0, 0.0]);
+        app.clone()
+            .oneshot(post_json(
+                "/insert?local=true",
+                json!({"embedding": v, "response": "r", "query_text": "q", "model_id": MID}),
+            ))
+            .await
+            .unwrap();
+        let q = json!({"embedding": v, "threshold": 0.50, "model_id": MID});
+        let resp = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert!(
+            body.get("scope").is_none() || body["scope"].is_null(),
+            "scope should be omitted when no conversation_id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_ttl_auto_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("convttl.wal");
+        let state = build_state_with_conversation_ttl(path, Some(10)).await;
+        let app = build_router(state.clone());
+
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "q",
+            "model_id": MID,
+            "conversation_id": "conv_1",
+        });
+        let now_at_insert = now_unix_secs();
+        let resp = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let uuid = body["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(get(&format!("/internal/entry/{uuid}")))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let expires_at = body["expires_at"].as_u64().expect("expires_at present");
+        assert!(
+            expires_at >= now_at_insert + 9 && expires_at <= now_at_insert + 11,
+            "expected expires_at ≈ now+10, got {expires_at} (now_at_insert={now_at_insert})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_ttl_overrides_conversation_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("convttl_override.wal");
+        let state = build_state_with_conversation_ttl(path, Some(10)).await;
+        let app = build_router(state.clone());
+
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "q",
+            "model_id": MID,
+            "conversation_id": "conv_1",
+            "ttl_seconds": 3600,
+        });
+        let now_at_insert = now_unix_secs();
+        let resp = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        let uuid = body_json(resp.into_body()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = app
+            .oneshot(get(&format!("/internal/entry/{uuid}")))
+            .await
+            .unwrap();
+        let expires_at = body_json(resp.into_body()).await["expires_at"]
+            .as_u64()
+            .expect("expires_at present");
+        // Explicit TTL wins, not the 10s conversation TTL.
+        assert!(
+            expires_at >= now_at_insert + 3590 && expires_at <= now_at_insert + 3610,
+            "explicit TTL ignored: expires_at={expires_at}, now={now_at_insert}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_insert_without_conversation_ttl_config() {
+        // conversation_ttl_seconds=None means conversation entries get no
+        // auto-TTL (live forever unless explicitly given one).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("convttl_off.wal");
+        let state = build_state_with_conversation_ttl(path, None).await;
+        let app = build_router(state.clone());
+
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "q",
+            "model_id": MID,
+            "conversation_id": "conv_1",
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        let uuid = body_json(resp.into_body()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = app
+            .oneshot(get(&format!("/internal/entry/{uuid}")))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(
+            body.get("expires_at").is_none() || body["expires_at"].is_null(),
+            "expected no expires_at when conversation_ttl_seconds=None: {body}"
         );
     }
 }

@@ -66,6 +66,7 @@ class FerrocacheTools:
         query_text: str,
         threshold: float | None = None,
         cache_scope: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         if not query_text:
             return {"error": "query_text is required"}
@@ -83,6 +84,7 @@ class FerrocacheTools:
                 model_id=self.model_id,
                 query_text=query_text,  # M27 exact-match pre-filter
                 cache_scope=cache_scope,
+                conversation_id=conversation_id,
             )
         except FerrocacheError as e:
             log.warning("ferrocache lookup failed: %s", e)
@@ -94,6 +96,7 @@ class FerrocacheTools:
         query_text: str,
         response: str,
         cache_scope: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         if not query_text:
             return {"error": "query_text is required"}
@@ -112,6 +115,7 @@ class FerrocacheTools:
                 query_text=query_text,
                 model_id=self.model_id,
                 cache_scope=cache_scope,
+                conversation_id=conversation_id,
             )
         except FerrocacheError as e:
             log.warning("ferrocache insert failed: %s", e)
@@ -159,6 +163,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "tenant, user, system prompt, or any user-defined key."
                     ),
                 },
+                "conversation_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional conversation id (M29) — triggers a two-level "
+                        "lookup: conversation namespace first, then the global "
+                        "(scope-only) namespace as fallback."
+                    ),
+                },
             },
             "required": ["query_text"],
         },
@@ -187,6 +199,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": (
                         "Optional cache scope (M28) — must match the scope "
                         "used at lookup time for the entry to be visible."
+                    ),
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional conversation id (M29) — entry goes to the "
+                        "conversation-scoped namespace ONLY; queries with the "
+                        "same id will see it via two-level lookup."
                     ),
                 },
             },
@@ -218,12 +238,14 @@ async def _dispatch_tool(
             query_text=arguments.get("query_text", ""),
             threshold=arguments.get("threshold"),
             cache_scope=arguments.get("cache_scope"),
+            conversation_id=arguments.get("conversation_id"),
         )
     if name == "semantic_cache_store":
         return await tools.store(
             query_text=arguments.get("query_text", ""),
             response=arguments.get("response", ""),
             cache_scope=arguments.get("cache_scope"),
+            conversation_id=arguments.get("conversation_id"),
         )
     if name == "cache_status":
         return await tools.status()

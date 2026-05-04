@@ -35,6 +35,9 @@ pub struct AppState {
     /// `false` makes a coordinator miss return immediately without
     /// touching replicas.
     pub read_repair_enabled: bool,
+    /// Auto-TTL for conversation-scoped inserts (M29). `None` = no
+    /// auto-TTL; explicit `ttl_seconds` on the request always wins.
+    pub conversation_ttl_seconds: Option<u64>,
 }
 
 impl AppState {
@@ -53,6 +56,7 @@ impl AppState {
         auth_token: Option<String>,
         max_replication_retries: usize,
         read_repair_enabled: bool,
+        conversation_ttl_seconds: Option<u64>,
     ) -> Self {
         Self {
             node_id,
@@ -68,6 +72,7 @@ impl AppState {
             auth_token,
             max_replication_retries,
             read_repair_enabled,
+            conversation_ttl_seconds,
         }
     }
 }

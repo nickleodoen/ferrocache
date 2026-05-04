@@ -22,6 +22,12 @@ pub struct QueryRequest {
     /// callers isolate by tenant, user, system prompt, temperature, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
+    /// Optional conversation id (M29). When present (and non-empty), query
+    /// does a two-level lookup: first the conversation namespace
+    /// `"{base}::conv_{id}"`, falling back to the base namespace
+    /// `effective_namespace(model_id, cache_scope)` on miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +43,11 @@ pub struct QueryResponse {
     /// `Some(false)` for an HNSW ANN hit; omitted from JSON on miss.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_match: Option<bool>,
+    /// Which namespace level produced the hit when `conversation_id` was
+    /// present on the request (M29): `"conversation"` or `"global"`.
+    /// Omitted when `conversation_id` was absent OR on miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +71,12 @@ pub struct InsertRequest {
     /// Optional cache scope (M28). See `QueryRequest.cache_scope`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
+    /// Optional conversation id (M29). When present, the entry is stored
+    /// under the conversation namespace `"{base}::conv_{id}"` instead of the
+    /// base namespace; queries with the same `conversation_id` see it via
+    /// the two-level lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

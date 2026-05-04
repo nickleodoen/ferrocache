@@ -297,6 +297,7 @@ mod tests {
                         response: Some("from peer".to_string()),
                         similarity: Some(0.97),
                         exact_match: None,
+                        scope: None,
                     })
                 },
             ),
@@ -312,6 +313,7 @@ mod tests {
                     model_id: Some("test::2".into()),
                     query_text: None,
                     cache_scope: None,
+                    conversation_id: None,
                 },
             )
             .await
@@ -352,6 +354,7 @@ mod tests {
                     uuid: Some("u".into()),
                     ttl_seconds: None,
                     cache_scope: None,
+                    conversation_id: None,
                 },
             )
             .await
@@ -387,6 +390,7 @@ mod tests {
                     uuid: Some("fixed-uuid".into()),
                     ttl_seconds: None,
                     cache_scope: None,
+                    conversation_id: None,
                 },
             )
             .await
@@ -451,6 +455,7 @@ mod tests {
             uuid: Some("u".into()),
             ttl_seconds: None,
             cache_scope: None,
+            conversation_id: None,
         }
     }
 

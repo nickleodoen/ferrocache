@@ -52,6 +52,7 @@ class FerrocacheClient:
         model_id: str,
         ttl_seconds: int | None = None,
         cache_scope: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "embedding": embedding,
@@ -65,6 +66,10 @@ class FerrocacheClient:
         # provided so older servers (pre-M28) just ignore the field.
         if cache_scope is not None:
             payload["cache_scope"] = cache_scope
+        # M29: optional conversation id. Inserts with a conversation_id go
+        # to the conversation-scoped namespace ONLY (not the global one).
+        if conversation_id is not None:
+            payload["conversation_id"] = conversation_id
         return self._post("/insert", payload)
 
     def delete_entry(self, uuid: str) -> dict[str, Any]:
@@ -97,6 +102,7 @@ class FerrocacheClient:
         model_id: str | None = None,
         query_text: str | None = None,
         cache_scope: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         if not model_id:
             raise ValueError("model_id is required")
@@ -113,6 +119,10 @@ class FerrocacheClient:
         # (pre-M28) just ignore the field.
         if cache_scope is not None:
             body["cache_scope"] = cache_scope
+        # M29: optional conversation id. Triggers two-level lookup —
+        # conversation namespace first, base namespace as fallback.
+        if conversation_id is not None:
+            body["conversation_id"] = conversation_id
         return self._post("/query", body)
 
     def health(self) -> dict[str, Any]:

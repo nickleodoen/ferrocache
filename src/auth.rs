@@ -119,6 +119,7 @@ mod tests {
             auth_token,
             0,
             true,
+            None, // conversation_ttl_seconds (M29) — auth tests don't use it
         ))
     }
 

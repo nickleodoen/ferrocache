@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use ferrocache::cluster::ClusterState;
-use ferrocache::config::FerrocacheConfig;
+use ferrocache::config::{FerrocacheConfig, HnswConfig};
 use ferrocache::index::{SemanticIndex, now_unix_secs};
 use ferrocache::metrics::Metrics;
 use ferrocache::router::ClusterRouter;
@@ -31,6 +31,7 @@ async fn expiry_reaper_loop(
     wal: GroupCommitWal,
     metrics: Arc<Metrics>,
     interval: Duration,
+    hnsw_config: HnswConfig,
 ) {
     let mut ticker = tokio::time::interval(interval);
     // Skip the immediate first tick — startup already ran one expiry pass.
@@ -38,10 +39,25 @@ async fn expiry_reaper_loop(
     loop {
         ticker.tick().await;
         let now = now_unix_secs();
-        let expired: Vec<(String, String)> = {
+        let (expired, pruned): (Vec<(String, String)>, Vec<String>) = {
             let mut idx = index.write().await;
-            idx.collect_expired(now)
+            let exp = idx.collect_expired(now);
+            // M25 → M29 sequence: collect_expired adds the freed internal_ids
+            // to each namespace's `evicted_ids`. Rebuilding namespaces whose
+            // ghost ratio crossed the threshold clears those ids — required
+            // before `prune_empty_namespaces` can recognise a fully drained
+            // conversation namespace as empty. Both run under the same write
+            // lock so the eviction-rebuild-prune sequence is atomic.
+            idx.rebuild_dirty_namespaces(&hnsw_config);
+            let pruned = idx.prune_empty_namespaces();
+            (exp, pruned)
         };
+        if !pruned.is_empty() {
+            tracing::info!(
+                count = pruned.len(),
+                "TTL reaper: pruned empty conversation namespaces"
+            );
+        }
         if expired.is_empty() {
             continue;
         }
@@ -319,9 +335,17 @@ async fn main() -> anyhow::Result<()> {
         let reaper_index = index_arc.clone();
         let reaper_metrics = metrics.clone();
         let reaper_wal = wal_handle.clone();
+        let reaper_hnsw = config.hnsw.clone();
         let interval = Duration::from_secs(config.expire_scan_interval_secs);
         tokio::spawn(async move {
-            expiry_reaper_loop(reaper_index, reaper_wal, reaper_metrics, interval).await;
+            expiry_reaper_loop(
+                reaper_index,
+                reaper_wal,
+                reaper_metrics,
+                interval,
+                reaper_hnsw,
+            )
+            .await;
         });
         tracing::info!(
             interval_secs = config.expire_scan_interval_secs,
@@ -345,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
         config.auth_token.clone(),
         config.cluster.max_replication_retries,
         config.cluster.read_repair_enabled,
+        config.conversation_ttl_seconds,
     ));
     let app = server::build_router(state.clone());
 

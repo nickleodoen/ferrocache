@@ -31,6 +31,12 @@ pub struct FerrocacheConfig {
     /// writes tombstones. Default 60s; set to 0 to disable.
     #[serde(default = "default_expire_scan_interval_secs")]
     pub expire_scan_interval_secs: u64,
+    /// Conversation TTL (M29). When set, every insert with a non-empty
+    /// `conversation_id` and no explicit `ttl_seconds` gets this TTL
+    /// stamped automatically. Explicit `ttl_seconds` always wins. Unset
+    /// disables auto-TTL entirely (conversation entries live forever).
+    #[serde(default)]
+    pub conversation_ttl_seconds: Option<u64>,
 }
 
 fn default_compact_interval_inserts() -> u64 {
@@ -183,6 +189,7 @@ impl Default for FerrocacheConfig {
             wal_batch_size: default_wal_batch_size(),
             wal_batch_timeout_ms: default_wal_batch_timeout_ms(),
             expire_scan_interval_secs: default_expire_scan_interval_secs(),
+            conversation_ttl_seconds: None,
         }
     }
 }
@@ -319,5 +326,6 @@ mod tests {
         assert_eq!(c.wal_batch_size, 256);
         assert_eq!(c.wal_batch_timeout_ms, 1);
         assert_eq!(c.expire_scan_interval_secs, 60);
+        assert!(c.conversation_ttl_seconds.is_none());
     }
 }
