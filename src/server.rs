@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use crate::auth::{AuthToken, auth_middleware};
 use crate::cluster::ClusterState;
 use crate::failure_detector::PeerStatus;
-use crate::index::now_unix_secs;
+use crate::index::{effective_namespace, now_unix_secs};
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
     ClusterStatusResponse, CompactResponse, CountersResponse, DeleteEntryResponse,
@@ -216,13 +216,15 @@ async fn process_query_locally(
         Some(s) if !s.trim().is_empty() => s,
         _ => return bad_request("model_id is required"),
     };
+    // M28: effective namespace incorporates `cache_scope` when present.
+    let ns = effective_namespace(model_id, req.cache_scope.as_deref());
     let now = now_unix_secs();
     let result = {
         let index = state.index.read().await;
         index.query_with_text(
             &req.embedding,
             req.threshold,
-            model_id,
+            &ns,
             req.query_text.as_deref(),
             now,
         )
@@ -235,13 +237,13 @@ async fn process_query_locally(
             // a HashMap lookup + two field writes. Misses skip this entirely.
             {
                 let mut idx = state.index.write().await;
-                idx.record_access(model_id, hit.internal_id);
+                idx.record_access(&ns, hit.internal_id);
             }
-            state.metrics.record_query_hit(model_id, elapsed);
+            state.metrics.record_query_hit(&ns, elapsed);
             // M27: exact-match hits are ALSO regular hits. The new
             // counter is a subcategory, not an alternative.
             if hit.exact_match {
-                state.metrics.record_exact_match_hit(model_id);
+                state.metrics.record_exact_match_hit(&ns);
             }
             tracing::info!(
                 hit = true,
@@ -263,7 +265,7 @@ async fn process_query_locally(
                 .into_response()
         }
         Ok(None) => {
-            state.metrics.record_query_miss(model_id, elapsed);
+            state.metrics.record_query_miss(&ns, elapsed);
             tracing::info!(hit = false, dim, "query");
 
             // Read repair (M23): if we're the ring owner / coordinator and
@@ -277,7 +279,7 @@ async fn process_query_locally(
                 && state.read_repair_enabled
                 && state.replication_factor > 1
                 && let Some(cluster) = state.cluster.as_ref()
-                && let Some(repaired) = attempt_read_repair(state, cluster, model_id, &req).await
+                && let Some(repaired) = attempt_read_repair(state, cluster, &ns, &req).await
             {
                 tracing::info!(hit = true, repaired = true, "query (repaired from replica)");
                 return (StatusCode::OK, Json(repaired)).into_response();
@@ -585,9 +587,14 @@ async fn local_insert_inner(
     let start = std::time::Instant::now();
     let dim = req.embedding.len();
     let model_id = match req.model_id.as_deref() {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
+        Some(s) if !s.trim().is_empty() => s,
         _ => return Err(bad_request("model_id is required")),
     };
+    // M28: the WAL entry stores the EFFECTIVE namespace as `model_id` —
+    // no separate `cache_scope` field on disk. On replay this name is
+    // what populates the `SemanticIndex` namespace map, so query and
+    // insert paths read the same key by construction.
+    let ns = effective_namespace(model_id, req.cache_scope.as_deref());
 
     let uuid = req
         .uuid
@@ -600,7 +607,7 @@ async fn local_insert_inner(
         embedding: req.embedding.clone(),
         response: req.response.clone(),
         query_text: req.query_text.clone(),
-        model_id: model_id.clone(),
+        model_id: ns.clone(),
         sequence: 0, // stamped by the flush task
         inserted_at,
         tombstone: false,
@@ -660,7 +667,7 @@ async fn local_insert_inner(
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    state.metrics.record_insert(&model_id, elapsed);
+    state.metrics.record_insert(&ns, elapsed);
 
     tracing::info!(id = %uuid, dim, "inserted");
     Ok(uuid)
@@ -988,17 +995,19 @@ async fn invalidate_handler(
         ));
     }
     let model_id = req.model_id.clone().expect("validated above");
+    // M28: scope-aware namespace.
+    let ns = effective_namespace(&model_id, req.cache_scope.as_deref());
 
     // Find + remove under one write lock.
     let now = now_unix_secs();
     let removed_uuids: Vec<String> = {
         let mut idx = state.index.write().await;
-        idx.invalidate_similar(&req.embedding, req.threshold, &model_id, now)
+        idx.invalidate_similar(&req.embedding, req.threshold, &ns, now)
     };
 
     // Tombstones for each invalidated entry.
     for uuid in &removed_uuids {
-        let tomb = WalEntry::tombstone_entry(uuid.clone(), model_id.clone());
+        let tomb = WalEntry::tombstone_entry(uuid.clone(), ns.clone());
         let (tx, rx) = oneshot::channel();
         if state
             .wal
@@ -1012,7 +1021,7 @@ async fn invalidate_handler(
         {
             let _ = rx.await;
         }
-        state.metrics.record_invalidation(&model_id);
+        state.metrics.record_invalidation(&ns);
     }
 
     // Cluster fan-out: each peer computes its own matches.
@@ -1036,7 +1045,7 @@ async fn invalidate_handler(
 
     tracing::info!(
         invalidated = removed_uuids.len(),
-        model_id = %model_id,
+        namespace = %ns,
         "invalidate completed"
     );
     (
@@ -2755,6 +2764,181 @@ mod tests {
             text.contains("ferrocache_exact_match_hits_total 2"),
             "{text}"
         );
+    }
+
+    // -- M28: cache_scope + tenant isolation -----------------------------------
+
+    #[tokio::test]
+    async fn test_insert_with_cache_scope() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "q",
+            "model_id": MID,
+            "cache_scope": "tenant_a",
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app.oneshot(get("/stats")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        let ns_key = format!("{MID}::tenant_a");
+        assert!(
+            body["namespaces"].get(&ns_key).is_some(),
+            "expected scoped namespace {ns_key} in stats: {body}"
+        );
+        assert_eq!(body["namespaces"][&ns_key]["entry_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_scope_isolation_http() {
+        let (app, _, _dir) = test_app().await;
+        let v = json!([1.0_f32, 0.0, 0.0]);
+        // Insert into tenant_a's scope.
+        let insert = json!({
+            "embedding": v,
+            "response": "for-a",
+            "query_text": "q",
+            "model_id": MID,
+            "cache_scope": "tenant_a",
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", insert))
+            .await
+            .unwrap();
+
+        // Query as tenant_b — must miss.
+        let q_b = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "cache_scope": "tenant_b",
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/query?local=true", q_b))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], false, "cross-tenant leakage: {body}");
+
+        // Query as tenant_a — must hit.
+        let q_a = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "cache_scope": "tenant_a",
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q_a))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["response"], "for-a");
+    }
+
+    #[tokio::test]
+    async fn test_query_no_scope_backward_compat() {
+        // Pre-M28 callers omit cache_scope entirely — behaviour unchanged.
+        let (app, _, _dir) = test_app().await;
+        let insert = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "legacy",
+            "query_text": "q",
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", insert))
+            .await
+            .unwrap();
+        let q = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.50,
+            "model_id": MID,
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["response"], "legacy");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_with_scope() {
+        let (app, _, _dir) = test_app().await;
+        // One entry in tenant_a, one without scope. Same embedding.
+        let v = json!([1.0_f32, 0.0, 0.0]);
+        for body in [
+            json!({
+                "embedding": v,
+                "response": "scoped",
+                "query_text": "q-scoped",
+                "model_id": MID,
+                "cache_scope": "tenant_a",
+            }),
+            json!({
+                "embedding": v,
+                "response": "unscoped",
+                "query_text": "q-unscoped",
+                "model_id": MID,
+            }),
+        ] {
+            app.clone()
+                .oneshot(post_json("/insert?local=true", body))
+                .await
+                .unwrap();
+        }
+
+        // Invalidate within tenant_a scope only.
+        let inv = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "cache_scope": "tenant_a",
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/admin/invalidate?local=true", inv))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["invalidated_count"], 1);
+
+        // tenant_a → miss, unscoped → still hit.
+        let q_a = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+            "cache_scope": "tenant_a",
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_json("/query?local=true", q_a))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], false);
+
+        let q_u = json!({
+            "embedding": v,
+            "threshold": 0.50,
+            "model_id": MID,
+        });
+        let resp = app
+            .oneshot(post_json("/query?local=true", q_u))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["response"], "unscoped");
     }
 
     #[tokio::test]

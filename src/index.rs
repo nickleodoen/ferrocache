@@ -29,6 +29,18 @@ pub fn normalize_query_text(text: &str) -> String {
         .join(" ")
 }
 
+/// Compute the effective namespace key for an insert/query/invalidate (M28).
+/// When `cache_scope` is `Some(non-empty-after-trim)`, returns
+/// `"{model_id}::{cache_scope}"`. Otherwise returns `model_id` unchanged.
+/// Empty/whitespace-only scope is treated as absent so callers passing
+/// `cache_scope: ""` don't end up in a separate `"m::"` namespace.
+pub fn effective_namespace(model_id: &str, cache_scope: Option<&str>) -> String {
+    match cache_scope {
+        Some(scope) if !scope.trim().is_empty() => format!("{model_id}::{scope}"),
+        _ => model_id.to_string(),
+    }
+}
+
 /// Current Unix timestamp in seconds. Used for `inserted_at` /
 /// `last_accessed_at` stamps. Returns 0 if the system clock predates UNIX_EPOCH
 /// (impossible on a sane host, but we don't want to panic on it).
@@ -1946,5 +1958,91 @@ mod tests {
         assert!(!ns.exact_match_index.contains_key("evict-text"));
         assert!(!ns.exact_match_index.contains_key("expire-text"));
         assert!(!ns.exact_match_index.contains_key("inv-text"));
+    }
+
+    // -- M28: cache_scope + tenant isolation -----------------------------------
+
+    #[test]
+    fn test_effective_namespace_function() {
+        assert_eq!(effective_namespace("m", None), "m");
+        assert_eq!(effective_namespace("m", Some("s")), "m::s");
+        // Empty / whitespace-only scope is treated as absent — defensive
+        // against callers that pass `cache_scope: ""`.
+        assert_eq!(effective_namespace("m", Some("")), "m");
+        assert_eq!(effective_namespace("m", Some("  ")), "m");
+        assert_eq!(effective_namespace("m", Some("\t\n")), "m");
+        // Multi-segment model_id stays intact.
+        assert_eq!(
+            effective_namespace("all-MiniLM-L6-v2::384", Some("tenant_abc")),
+            "all-MiniLM-L6-v2::384::tenant_abc"
+        );
+    }
+
+    #[test]
+    fn test_scoped_insert_creates_separate_namespace() {
+        let mut idx = test_index();
+        let ns_a = effective_namespace("m::3", Some("tenant_a"));
+        let ns_b = effective_namespace("m::3", Some("tenant_b"));
+        idx.insert(vec![1.0_f32, 0.0, 0.0], "ra".into(), "qa".into(), &ns_a)
+            .unwrap();
+        idx.insert(vec![0.0_f32, 1.0, 0.0], "rb".into(), "qb".into(), &ns_b)
+            .unwrap();
+        assert!(idx.namespaces.contains_key("m::3::tenant_a"));
+        assert!(idx.namespaces.contains_key("m::3::tenant_b"));
+        assert_eq!(idx.namespaces.len(), 2);
+    }
+
+    #[test]
+    fn test_scoped_query_isolates() {
+        let mut idx = test_index();
+        let ns_a = effective_namespace("m::3", Some("tenant_a"));
+        let ns_b = effective_namespace("m::3", Some("tenant_b"));
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "tenant_a's answer".into(), "q".into(), &ns_a)
+            .unwrap();
+        // tenant_b queries with the same vector — different namespace,
+        // namespace doesn't even exist yet, so it's a miss.
+        let result = idx.query(&v, 0.50, &ns_b).unwrap();
+        assert!(result.is_none(), "cross-tenant leakage: {result:?}");
+    }
+
+    #[test]
+    fn test_scoped_query_same_scope_hits() {
+        let mut idx = test_index();
+        let ns_a = effective_namespace("m::3", Some("tenant_a"));
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let uuid = idx
+            .insert(v.clone(), "answer".into(), "q".into(), &ns_a)
+            .unwrap();
+        let hit = idx.query(&v, 0.50, &ns_a).unwrap().expect("should hit");
+        assert_eq!(hit.id, uuid);
+        assert_eq!(hit.response, "answer");
+    }
+
+    #[test]
+    fn test_unscoped_backward_compat() {
+        let mut idx = test_index();
+        // No scope → effective namespace = model_id verbatim, no `::` suffix.
+        let ns = effective_namespace("m::3", None);
+        assert_eq!(ns, "m::3");
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "r".into(), "q".into(), &ns).unwrap();
+        let hit = idx.query(&v, 0.50, &ns).unwrap().expect("hit");
+        assert_eq!(hit.response, "r");
+    }
+
+    #[test]
+    fn test_scoped_does_not_see_unscoped() {
+        // Inserting WITHOUT scope creates the unscoped namespace. A query
+        // WITH scope looks at a different namespace and must miss — the
+        // absence of a scope IS a distinct scope.
+        let mut idx = test_index();
+        let unscoped = effective_namespace("m::3", None);
+        let scoped = effective_namespace("m::3", Some("any"));
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "shared?".into(), "q".into(), &unscoped)
+            .unwrap();
+        let result = idx.query(&v, 0.50, &scoped).unwrap();
+        assert!(result.is_none(), "scoped query saw unscoped entry");
     }
 }

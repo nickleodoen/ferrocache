@@ -61,7 +61,12 @@ class FerrocacheTools:
         self.model_id = model_id
         self.default_threshold = default_threshold
 
-    async def lookup(self, query_text: str, threshold: float | None = None) -> dict[str, Any]:
+    async def lookup(
+        self,
+        query_text: str,
+        threshold: float | None = None,
+        cache_scope: str | None = None,
+    ) -> dict[str, Any]:
         if not query_text:
             return {"error": "query_text is required"}
         t = threshold if threshold is not None else self.default_threshold
@@ -77,13 +82,19 @@ class FerrocacheTools:
                 threshold=t,
                 model_id=self.model_id,
                 query_text=query_text,  # M27 exact-match pre-filter
+                cache_scope=cache_scope,
             )
         except FerrocacheError as e:
             log.warning("ferrocache lookup failed: %s", e)
             return {"error": f"ferrocache unreachable: {e}"}
         return result
 
-    async def store(self, query_text: str, response: str) -> dict[str, Any]:
+    async def store(
+        self,
+        query_text: str,
+        response: str,
+        cache_scope: str | None = None,
+    ) -> dict[str, Any]:
         if not query_text:
             return {"error": "query_text is required"}
         if not response:
@@ -100,6 +111,7 @@ class FerrocacheTools:
                 response=response,
                 query_text=query_text,
                 model_id=self.model_id,
+                cache_scope=cache_scope,
             )
         except FerrocacheError as e:
             log.warning("ferrocache insert failed: %s", e)
@@ -140,6 +152,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "number",
                     "description": "Similarity threshold 0.0-1.0 (default: 0.92)",
                 },
+                "cache_scope": {
+                    "type": "string",
+                    "description": (
+                        "Optional cache scope (M28) — isolates the lookup by "
+                        "tenant, user, system prompt, or any user-defined key."
+                    ),
+                },
             },
             "required": ["query_text"],
         },
@@ -162,6 +181,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "response": {
                     "type": "string",
                     "description": "The response to cache",
+                },
+                "cache_scope": {
+                    "type": "string",
+                    "description": (
+                        "Optional cache scope (M28) — must match the scope "
+                        "used at lookup time for the entry to be visible."
+                    ),
                 },
             },
             "required": ["query_text", "response"],
@@ -191,11 +217,13 @@ async def _dispatch_tool(
         return await tools.lookup(
             query_text=arguments.get("query_text", ""),
             threshold=arguments.get("threshold"),
+            cache_scope=arguments.get("cache_scope"),
         )
     if name == "semantic_cache_store":
         return await tools.store(
             query_text=arguments.get("query_text", ""),
             response=arguments.get("response", ""),
+            cache_scope=arguments.get("cache_scope"),
         )
     if name == "cache_status":
         return await tools.status()

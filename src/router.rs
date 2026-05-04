@@ -311,6 +311,7 @@ mod tests {
                     threshold: 0.9,
                     model_id: Some("test::2".into()),
                     query_text: None,
+                    cache_scope: None,
                 },
             )
             .await
@@ -350,6 +351,7 @@ mod tests {
                     model_id: Some("test::2".into()),
                     uuid: Some("u".into()),
                     ttl_seconds: None,
+                    cache_scope: None,
                 },
             )
             .await
@@ -384,6 +386,7 @@ mod tests {
                     model_id: Some("test::2".into()),
                     uuid: Some("fixed-uuid".into()),
                     ttl_seconds: None,
+                    cache_scope: None,
                 },
             )
             .await
@@ -447,6 +450,7 @@ mod tests {
             model_id: Some("t::2".into()),
             uuid: Some("u".into()),
             ttl_seconds: None,
+            cache_scope: None,
         }
     }
 

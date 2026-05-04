@@ -17,6 +17,11 @@ pub struct QueryRequest {
     /// pre-M27 callers omit this field and behaviour is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_text: Option<String>,
+    /// Optional cache scope (M28). When present (and non-empty), the
+    /// effective namespace becomes `"{model_id}::{cache_scope}"`. Lets
+    /// callers isolate by tenant, user, system prompt, temperature, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +57,9 @@ pub struct InsertRequest {
     /// the deadline return miss and a background reaper writes a tombstone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
+    /// Optional cache scope (M28). See `QueryRequest.cache_scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +128,9 @@ pub struct InvalidateRequest {
     pub threshold: f32,
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Optional cache scope (M28). See `QueryRequest.cache_scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

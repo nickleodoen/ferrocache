@@ -56,6 +56,7 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
         model_id: str | None = None,
         fail_open: bool = True,
         auth_token: str | None = None,
+        cache_scope: str | None = None,
     ) -> None:
         if not _HAS_LANGCHAIN:
             raise _missing_langchain()
@@ -73,6 +74,7 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
         embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
         self._embed_fn = embed_fn
         self._model_id = model_id
+        self._cache_scope = cache_scope
 
     def lookup(self, prompt: str, llm_string: str) -> Sequence[Generation] | None:
         try:
@@ -87,6 +89,7 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
                 threshold=self._threshold,
                 model_id=self._model_id,
                 query_text=prompt,  # M27 exact-match pre-filter
+                cache_scope=self._cache_scope,
             )
         except FerrocacheError as e:
             if not self._fail_open:
@@ -129,6 +132,7 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
                 response=text,
                 query_text=prompt,
                 model_id=self._model_id,
+                cache_scope=self._cache_scope,
             )
         except FerrocacheError as e:
             if not self._fail_open:

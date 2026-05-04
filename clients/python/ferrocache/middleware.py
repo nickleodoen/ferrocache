@@ -150,6 +150,7 @@ def _intercept(
     threshold: float,
     fail_open: bool,
     kwargs: dict[str, Any],
+    cache_scope: str | None = None,
 ) -> Any:
     messages = kwargs.get("messages") or []
     model = kwargs.get("model", "unknown")
@@ -179,6 +180,7 @@ def _intercept(
             threshold=threshold,
             model_id=model_id,
             query_text=prompt,
+            cache_scope=cache_scope,
         )
     except FerrocacheError as e:
         if not fail_open:
@@ -210,6 +212,7 @@ def _intercept(
             response=text,
             query_text=prompt,
             model_id=model_id,
+            cache_scope=cache_scope,
         )
     except FerrocacheError as e:
         if not fail_open:
@@ -267,6 +270,7 @@ class _WrappedOpenAICompletions:
         model_id: str,
         threshold: float,
         fail_open: bool,
+        cache_scope: str | None = None,
     ) -> None:
         self._real = real
         self._cache = cache
@@ -274,6 +278,7 @@ class _WrappedOpenAICompletions:
         self._model_id = model_id
         self._threshold = threshold
         self._fail_open = fail_open
+        self._cache_scope = cache_scope
 
     def create(self, **kwargs: Any) -> Any:
         return _intercept(
@@ -285,6 +290,7 @@ class _WrappedOpenAICompletions:
             self._threshold,
             self._fail_open,
             kwargs,
+            cache_scope=self._cache_scope,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -309,6 +315,7 @@ class WrappedOpenAIClient:
         model_id: str,
         threshold: float,
         fail_open: bool,
+        cache_scope: str | None = None,
     ) -> None:
         self._real = real
         self.chat = _WrappedOpenAIChat(
@@ -318,6 +325,7 @@ class WrappedOpenAIClient:
             model_id=model_id,
             threshold=threshold,
             fail_open=fail_open,
+            cache_scope=cache_scope,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -332,10 +340,12 @@ def wrap_openai(
     model_id: str | None = None,
     fail_open: bool = True,
     auth_token: str | None = None,
+    cache_scope: str | None = None,
 ) -> WrappedOpenAIClient:
     """Wrap an `openai.OpenAI()` client so chat.completions.create checks ferrocache first.
 
     `auth_token` (or env `FERROCACHE_AUTH_TOKEN`) is forwarded to the cache.
+    `cache_scope` (M28) isolates this client's cache by tenant/user/system-prompt.
     """
     cache = FerrocacheClient(_resolve_url(cache_url), auth_token=auth_token)
     embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
@@ -346,6 +356,7 @@ def wrap_openai(
         model_id=model_id,
         threshold=_resolve_threshold(threshold),
         fail_open=fail_open,
+        cache_scope=cache_scope,
     )
 
 
@@ -371,6 +382,7 @@ class _WrappedAnthropicMessages:
         model_id: str,
         threshold: float,
         fail_open: bool,
+        cache_scope: str | None = None,
     ) -> None:
         self._real = real
         self._cache = cache
@@ -378,6 +390,7 @@ class _WrappedAnthropicMessages:
         self._model_id = model_id
         self._threshold = threshold
         self._fail_open = fail_open
+        self._cache_scope = cache_scope
 
     def create(self, **kwargs: Any) -> Any:
         return _intercept(
@@ -389,6 +402,7 @@ class _WrappedAnthropicMessages:
             self._threshold,
             self._fail_open,
             kwargs,
+            cache_scope=self._cache_scope,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -404,6 +418,7 @@ class WrappedAnthropicClient:
         model_id: str,
         threshold: float,
         fail_open: bool,
+        cache_scope: str | None = None,
     ) -> None:
         self._real = real
         self.messages = _WrappedAnthropicMessages(
@@ -413,6 +428,7 @@ class WrappedAnthropicClient:
             model_id=model_id,
             threshold=threshold,
             fail_open=fail_open,
+            cache_scope=cache_scope,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -427,10 +443,12 @@ def wrap_anthropic(
     model_id: str | None = None,
     fail_open: bool = True,
     auth_token: str | None = None,
+    cache_scope: str | None = None,
 ) -> WrappedAnthropicClient:
     """Wrap an `anthropic.Anthropic()` client so messages.create checks ferrocache first.
 
     `auth_token` (or env `FERROCACHE_AUTH_TOKEN`) is forwarded to the cache.
+    `cache_scope` (M28) isolates this client's cache by tenant/user/system-prompt.
     """
     cache = FerrocacheClient(_resolve_url(cache_url), auth_token=auth_token)
     embed_fn, model_id = _resolve_embed_and_model_id(embed_fn, model_id)
@@ -441,6 +459,7 @@ def wrap_anthropic(
         model_id=model_id,
         threshold=_resolve_threshold(threshold),
         fail_open=fail_open,
+        cache_scope=cache_scope,
     )
 
 

@@ -51,6 +51,7 @@ class FerrocacheClient:
         query_text: str,
         model_id: str,
         ttl_seconds: int | None = None,
+        cache_scope: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "embedding": embedding,
@@ -60,6 +61,10 @@ class FerrocacheClient:
         }
         if ttl_seconds is not None:
             payload["ttl_seconds"] = int(ttl_seconds)
+        # M28: optional tenant/scope isolation. Sent only when explicitly
+        # provided so older servers (pre-M28) just ignore the field.
+        if cache_scope is not None:
+            payload["cache_scope"] = cache_scope
         return self._post("/insert", payload)
 
     def delete_entry(self, uuid: str) -> dict[str, Any]:
@@ -73,16 +78,17 @@ class FerrocacheClient:
         embedding: list[float],
         threshold: float,
         model_id: str,
+        cache_scope: str | None = None,
     ) -> dict[str, Any]:
         """Evict all entries with cosine similarity >= threshold (M26)."""
-        return self._post(
-            "/admin/invalidate",
-            {
-                "embedding": embedding,
-                "threshold": threshold,
-                "model_id": model_id,
-            },
-        )
+        body: dict[str, Any] = {
+            "embedding": embedding,
+            "threshold": threshold,
+            "model_id": model_id,
+        }
+        if cache_scope is not None:
+            body["cache_scope"] = cache_scope
+        return self._post("/admin/invalidate", body)
 
     def query(
         self,
@@ -90,6 +96,7 @@ class FerrocacheClient:
         threshold: float = 0.92,
         model_id: str | None = None,
         query_text: str | None = None,
+        cache_scope: str | None = None,
     ) -> dict[str, Any]:
         if not model_id:
             raise ValueError("model_id is required")
@@ -102,6 +109,10 @@ class FerrocacheClient:
         # so older servers (pre-M27) just ignore the field.
         if query_text is not None:
             body["query_text"] = query_text
+        # M28: optional cache scope. Sent only when set so older servers
+        # (pre-M28) just ignore the field.
+        if cache_scope is not None:
+            body["cache_scope"] = cache_scope
         return self._post("/query", body)
 
     def health(self) -> dict[str, Any]:
