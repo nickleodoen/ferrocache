@@ -118,6 +118,10 @@ pub struct CountersResponse {
     pub compactions: u64,
     pub read_repairs: u64,
     pub read_repair_failures: u64,
+    /// LRU evictions across all namespaces (M25).
+    pub evictions_total: u64,
+    /// HNSW rebuilds (M25).
+    pub index_rebuilds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +140,8 @@ pub struct NamespaceStatsEntry {
     pub oldest_entry_ts: u64,
     pub newest_entry_ts: u64,
     pub total_accesses: u64,
+    /// HNSW ghost nodes (evicted but still in the graph) — M25.
+    pub evicted_ghost_count: usize,
 }
 
 /// `/admin/entry-stats` per-namespace top-N rollup (M24).

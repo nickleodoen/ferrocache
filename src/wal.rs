@@ -8,6 +8,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
+use crate::config::HnswConfig;
 use crate::index::SemanticIndex;
 use crate::metrics::Metrics;
 use crate::snapshot;
@@ -45,6 +46,34 @@ pub struct WalEntry {
     /// they are in-memory soft state, snapshot-persisted only.
     #[serde(default)]
     pub inserted_at: u64,
+    /// Tombstone marker (M25). When `true`, this WAL entry records a
+    /// deletion: on replay, the entry with `uuid` is removed from the
+    /// index instead of inserted. `embedding`, `response`, `query_text`
+    /// are empty/default for tombstones — only `uuid`, `model_id`,
+    /// `tombstone`, and `sequence` matter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tombstone: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl WalEntry {
+    /// Build a tombstone WalEntry for the given UUID + namespace. Sequence
+    /// is stamped by the flush task before append.
+    pub fn tombstone_entry(uuid: String, model_id: String) -> Self {
+        Self {
+            uuid,
+            embedding: Vec::new(),
+            response: String::new(),
+            query_text: String::new(),
+            model_id,
+            sequence: 0,
+            inserted_at: 0,
+            tombstone: true,
+        }
+    }
 }
 
 pub struct Wal {
@@ -261,6 +290,7 @@ impl GroupCommitWal {
     /// The task takes ownership of `wal` (no other code path may write to
     /// the WAL afterwards) and a clone of the index/metrics. It exits
     /// cleanly when all `GroupCommitWal` clones are dropped.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         wal: Wal,
         wal_path: PathBuf,
@@ -269,6 +299,7 @@ impl GroupCommitWal {
         metrics: Arc<Metrics>,
         compact_interval_inserts: u64,
         config: GroupCommitConfig,
+        hnsw_config: HnswConfig,
     ) -> Self {
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let cfg = config;
@@ -281,6 +312,7 @@ impl GroupCommitWal {
             metrics,
             compact_interval_inserts,
             cfg,
+            hnsw_config,
         ));
         Self { sender: tx }
     }
@@ -296,6 +328,7 @@ async fn flush_loop(
     metrics: Arc<Metrics>,
     compact_interval_inserts: u64,
     config: GroupCommitConfig,
+    hnsw_config: HnswConfig,
 ) {
     let batch_cap = config.batch_size.max(1);
     let mut inserts_since_compact: u64 = 0;
@@ -339,6 +372,12 @@ async fn flush_loop(
         }
 
         flush_insert_batch(&mut wal, &index, &mut inserts_since_compact, batch).await;
+
+        // M25: enforce per-namespace LRU cap. Runs only when configured;
+        // when None, behavior is identical to pre-M25.
+        if let Some(max_entries) = hnsw_config.max_entries_per_namespace {
+            evict_to_cap_step(&mut wal, &index, &metrics, &hnsw_config, max_entries).await;
+        }
 
         // Auto-compact after threshold (the flush task is the sole writer,
         // so the counter doesn't need locking).
@@ -446,6 +485,81 @@ async fn flush_insert_batch(
     }
 }
 
+/// M25 eviction step. Acquires the index write lock once, evicts to cap,
+/// rebuilds dirty namespaces, then writes a single batch of tombstone WAL
+/// entries with one fsync. Skips writing entirely when nothing was evicted.
+async fn evict_to_cap_step(
+    wal: &mut Wal,
+    index: &Arc<RwLock<SemanticIndex>>,
+    metrics: &Arc<Metrics>,
+    hnsw_config: &HnswConfig,
+    max_entries: usize,
+) {
+    let (evicted, rebuilt_namespaces) = {
+        let mut idx = index.write().await;
+        let evicted = idx.evict_to_cap(max_entries);
+        let rebuilt = idx.rebuild_dirty_namespaces(hnsw_config);
+        (evicted, rebuilt)
+    };
+
+    if evicted.is_empty() && rebuilt_namespaces.is_empty() {
+        return;
+    }
+
+    for e in &evicted {
+        metrics.record_eviction(&e.model_id);
+    }
+    for _ in &rebuilt_namespaces {
+        metrics.record_rebuild();
+    }
+
+    if evicted.is_empty() {
+        return;
+    }
+
+    // Build + stamp tombstone WAL entries, then one write + one fsync.
+    let mut buf: Vec<u8> = Vec::with_capacity(evicted.len() * 128);
+    let mut allocation_failed = false;
+    for e in &evicted {
+        let seq = match wal.next_sequence() {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(error = %err, "WAL sequence overflow during tombstone batch");
+                allocation_failed = true;
+                break;
+            }
+        };
+        let mut tomb = WalEntry::tombstone_entry(e.uuid.clone(), e.model_id.clone());
+        tomb.sequence = seq;
+        match serde_json::to_vec(&tomb) {
+            Ok(mut line) => {
+                line.push(b'\n');
+                buf.extend_from_slice(&line);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "tombstone serialize failed");
+                allocation_failed = true;
+                break;
+            }
+        }
+    }
+
+    if allocation_failed {
+        // The in-memory eviction already happened; without a tombstone, a
+        // restart will see the entry reappear from the WAL/snapshot. The
+        // next eviction pass will re-evict it. Log loudly and move on.
+        tracing::error!(
+            evicted = evicted.len(),
+            "skipped tombstone batch — evictions may not survive restart"
+        );
+        return;
+    }
+
+    if let Err(err) = wal.write_batch_bytes(&buf).await {
+        tracing::error!(error = %err, "tombstone WAL write failed; evictions may not survive restart");
+    }
+}
+
 async fn run_compact(
     wal: &mut Wal,
     index: &Arc<RwLock<SemanticIndex>>,
@@ -494,6 +608,7 @@ mod tests {
             model_id: "test-model::3".to_string(),
             sequence: 0,
             inserted_at: 0,
+            tombstone: false,
         }
     }
 
@@ -628,6 +743,88 @@ mod tests {
         let entries = Wal::replay(&path).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].inserted_at, 0);
+        assert!(!entries[0].tombstone);
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_wal_roundtrip() {
+        // M25: write a tombstone WAL entry, replay, assert flag survives.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        let tomb = WalEntry::tombstone_entry("dead-uuid".into(), "m::3".into());
+        wal.append(&tomb).await.unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].tombstone);
+        assert_eq!(entries[0].uuid, "dead-uuid");
+        assert_eq!(entries[0].model_id, "m::3");
+        assert!(entries[0].embedding.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_prevents_reappearance() {
+        // M25: insert + tombstone both in WAL → on replay, entry is gone.
+        use crate::config::HnswConfig;
+        use crate::index::SemanticIndex;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        wal.append(&sample("u-doomed", "r")).await.unwrap();
+        let mut tomb = WalEntry::tombstone_entry("u-doomed".into(), "test-model::3".into());
+        // Caller stamps sequence; append would overwrite anyway.
+        tomb.sequence = 0;
+        wal.append(&tomb).await.unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        let mut idx = SemanticIndex::new(&HnswConfig::default());
+        for e in entries {
+            if e.tombstone {
+                idx.remove_by_uuid(&e.uuid);
+            } else {
+                idx.replay_entry(e).unwrap();
+            }
+        }
+        assert!(idx.get_entry_by_uuid("u-doomed").is_none());
+        assert_eq!(idx.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_after_snapshot() {
+        // M25: snapshot has u-snap; WAL tail tombstones it. Replay
+        // snapshot first, then WAL tail → u-snap is gone.
+        use crate::config::HnswConfig;
+        use crate::index::SemanticIndex;
+        use crate::snapshot::SnapshotEntry;
+
+        let mut idx = SemanticIndex::new(&HnswConfig::default());
+        idx.replay_snapshot_entry(SnapshotEntry {
+            uuid: "u-snap".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "from snapshot".into(),
+            query_text: "q".into(),
+            model_id: "test-model::3".into(),
+            inserted_at: 1000,
+            last_accessed_at: 1000,
+            access_count: 0,
+            tombstone: false,
+        })
+        .unwrap();
+        assert!(idx.get_entry_by_uuid("u-snap").is_some());
+
+        // Now process a tombstone (as if from the WAL tail).
+        let tomb = WalEntry::tombstone_entry("u-snap".into(), "test-model::3".into());
+        assert!(tomb.tombstone);
+        idx.remove_by_uuid(&tomb.uuid);
+        assert!(idx.get_entry_by_uuid("u-snap").is_none());
     }
 
     #[tokio::test]
@@ -723,9 +920,10 @@ mod tests {
     ) -> (GroupCommitWal, Arc<RwLock<SemanticIndex>>) {
         let snap = path.with_extension("snap");
         let wal = Wal::open(&path).await.unwrap();
-        let index = Arc::new(RwLock::new(SemanticIndex::new(&HnswConfig::default())));
+        let hnsw = HnswConfig::default();
+        let index = Arc::new(RwLock::new(SemanticIndex::new(&hnsw)));
         let metrics = Arc::new(Metrics::new());
-        let gc = GroupCommitWal::spawn(wal, path, snap, index.clone(), metrics, 0, config);
+        let gc = GroupCommitWal::spawn(wal, path, snap, index.clone(), metrics, 0, config, hnsw);
         (gc, index)
     }
 
@@ -738,6 +936,7 @@ mod tests {
             model_id: "test-model::3".to_string(),
             sequence: 0,
             inserted_at: 0,
+            tombstone: false,
         }
     }
 

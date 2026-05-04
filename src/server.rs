@@ -398,6 +398,7 @@ async fn perform_repair(
         // `access_count` are NOT in the WAL; they restart at zero on the
         // repaired side, which is fine — the next query will bump them.
         inserted_at: full.inserted_at,
+        tombstone: false,
     };
 
     let (tx, rx) = oneshot::channel();
@@ -573,6 +574,7 @@ async fn local_insert_inner(
         model_id: model_id.clone(),
         sequence: 0, // stamped by the flush task
         inserted_at: now_unix_secs(),
+        tombstone: false,
     };
 
     let (tx, rx) = oneshot::channel();
@@ -695,6 +697,7 @@ async fn read_repair_handler(
         // The /internal/read-repair caller didn't carry an inserted_at
         // (the public ReadRepairRequest predates M24); stamp now.
         inserted_at: now_unix_secs(),
+        tombstone: false,
     };
     let (tx, rx) = oneshot::channel();
     if state
@@ -895,6 +898,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
                     oldest_entry_ts: v.oldest_entry_ts,
                     newest_entry_ts: v.newest_entry_ts,
                     total_accesses: v.total_accesses,
+                    evicted_ghost_count: v.evicted_ghost_count,
                 },
             )
         })
@@ -912,6 +916,8 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
         compactions: m.compactions_total.load(Ordering::Relaxed),
         read_repairs: m.read_repairs_total.load(Ordering::Relaxed),
         read_repair_failures: m.read_repair_failures_total.load(Ordering::Relaxed),
+        evictions_total: m.evictions_total.load(Ordering::Relaxed),
+        index_rebuilds: m.index_rebuilds_total.load(Ordering::Relaxed),
     };
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
@@ -983,6 +989,7 @@ mod tests {
                 batch_timeout: std::time::Duration::from_millis(0),
                 channel_capacity: 64,
             },
+            hnsw.clone(),
         );
         Arc::new(AppState::new(
             "test-node".to_string(),
@@ -1801,6 +1808,7 @@ mod tests {
                     model_id: MID.to_string(),
                     sequence: 0,
                     inserted_at: 0,
+                    tombstone: false,
                 })
                 .await
                 .unwrap();
@@ -2068,5 +2076,142 @@ mod tests {
         assert!(ns["oldest_entry_ts"].as_u64().unwrap() > 0);
         assert!(ns["newest_entry_ts"].as_u64().unwrap() > 0);
         assert!(ns["newest_entry_ts"].as_u64().unwrap() >= ns["oldest_entry_ts"].as_u64().unwrap());
+    }
+
+    // --- M25: eviction at the HTTP boundary --------------------------------
+
+    async fn build_state_with_max_entries(
+        wal_path: PathBuf,
+        max_entries: Option<usize>,
+    ) -> Arc<AppState> {
+        let hnsw = HnswConfig {
+            max_entries_per_namespace: max_entries,
+            ..HnswConfig::default()
+        };
+        let wal = Wal::open(&wal_path).await.unwrap();
+        let snapshot_path = crate::snapshot::snapshot_path_for(&wal_path.to_string_lossy());
+        let index = Arc::new(RwLock::new(SemanticIndex::new(&hnsw)));
+        let metrics = Arc::new(Metrics::new());
+        let gc = GroupCommitWal::spawn(
+            wal,
+            wal_path.clone(),
+            snapshot_path.clone(),
+            index.clone(),
+            metrics.clone(),
+            0,
+            GroupCommitConfig {
+                batch_size: 1,
+                batch_timeout: std::time::Duration::from_millis(0),
+                channel_capacity: 64,
+            },
+            hnsw.clone(),
+        );
+        Arc::new(AppState::new(
+            "test-node".to_string(),
+            index,
+            gc,
+            wal_path.to_string_lossy().into_owned(),
+            snapshot_path,
+            hnsw,
+            None,
+            None,
+            1,
+            metrics,
+            None,
+            0,
+            true,
+        ))
+    }
+
+    /// Insert N orthogonal-ish unit vectors via HTTP. Each insert routes
+    /// through the WAL flush task, so by the time the response returns the
+    /// eviction step (if any) has run.
+    async fn insert_n_distinct(app: &Router, n: usize) {
+        for i in 0..n {
+            let mut v = vec![0.0_f32; 8];
+            v[i % 8] = 1.0;
+            v[(i + 1) % 8] = 0.001 * (i as f32 + 1.0); // tiny perturbation for uniqueness
+            let payload = json!({
+                "embedding": v,
+                "response": format!("r{i}"),
+                "query_text": format!("q{i}"),
+                "model_id": MID,
+                "uuid": format!("u{i}"),
+            });
+            let r = app
+                .clone()
+                .oneshot(post_json("/insert?local=true", payload))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "insert {i} failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eviction_on_max_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ev.wal");
+        let state = build_state_with_max_entries(path.clone(), Some(3)).await;
+        let app = build_router(state.clone());
+
+        insert_n_distinct(&app, 4).await;
+
+        // Health reports live entry count.
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["entry_count"], 3, "health: {body}");
+
+        // The first inserted entry (u0) should have been evicted.
+        let resp = app
+            .clone()
+            .oneshot(get("/internal/entry/u0?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The newest entry (u3) survives.
+        let resp = app
+            .oneshot(get("/internal/entry/u3?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evm.wal");
+        let state = build_state_with_max_entries(path, Some(2)).await;
+        let app = build_router(state.clone());
+        insert_n_distinct(&app, 5).await;
+
+        // 3 evictions expected (5 inserts - cap of 2).
+        let resp = app.oneshot(get("/metrics")).await.unwrap();
+        let text = body_text(resp.into_body()).await;
+        assert!(
+            text.contains("ferrocache_evictions_total 3"),
+            "evictions metric not 3 in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_eviction_without_max_entries() {
+        // max_entries = None → all inserts survive, no evictions.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noev.wal");
+        let state = build_state_with_max_entries(path, None).await;
+        let app = build_router(state.clone());
+        insert_n_distinct(&app, 8).await;
+
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["entry_count"], 8);
+
+        let resp = app.oneshot(get("/metrics")).await.unwrap();
+        let text = body_text(resp.into_body()).await;
+        assert!(
+            text.contains("ferrocache_evictions_total 0"),
+            "expected no evictions in:\n{text}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -7,6 +7,16 @@ use hnsw_rs::prelude::*;
 use crate::config::HnswConfig;
 use crate::snapshot::SnapshotEntry;
 use crate::wal::WalEntry;
+
+/// Default rebuild trigger: when the fraction of evicted-but-still-in-graph
+/// nodes exceeds this, rebuild the HNSW from scratch using only live entries
+/// to reclaim graph connectivity wasted by ghosts.
+pub const DEFAULT_EVICTED_FRACTION_REBUILD: f64 = 0.20;
+
+/// Cap on the extra HNSW neighbors we ask for to compensate for evicted
+/// ghosts in the search results. Beyond this, a rebuild is overdue and we
+/// don't want to scan a long candidate list on every query.
+const MAX_EVICTION_OVERSCAN: usize = 8;
 
 /// Current Unix timestamp in seconds. Used for `inserted_at` /
 /// `last_accessed_at` stamps. Returns 0 if the system clock predates UNIX_EPOCH
@@ -54,6 +64,19 @@ pub struct NamespaceStats {
     pub newest_entry_ts: u64,
     /// Sum of `access_count` across all entries.
     pub total_accesses: u64,
+    /// HNSW internal IDs evicted but still inert in the graph (M25). A
+    /// rebuild reclaims this space. Useful for operators to spot a stuck
+    /// rebuild or unusually high churn.
+    pub evicted_ghost_count: usize,
+}
+
+/// One entry that was just evicted by `evict_lru`. The flush task uses
+/// `(uuid, model_id)` to write a tombstone WAL entry so the eviction
+/// survives a restart.
+#[derive(Debug, Clone)]
+pub struct EvictedEntry {
+    pub uuid: String,
+    pub model_id: String,
 }
 
 /// One Top-N entry surfaced by `/admin/entry-stats`.
@@ -73,9 +96,17 @@ pub struct NamespacedIndex {
     /// Reverse map (M23): UUID → side-table internal id, so read-repair
     /// fetch-by-UUID is O(1) instead of a linear scan over `entries`.
     uuid_to_internal: HashMap<String, usize>,
+    /// HNSW internal IDs that have been evicted (M25). The HNSW graph
+    /// has no removal API, so the node stays in the graph as an inert
+    /// ghost; queries filter against this set before threshold checks.
+    /// Cleared on rebuild.
+    evicted_ids: HashSet<usize>,
     next_id: usize,
     dimension: Option<usize>,
     ef_search: usize,
+    /// Rebuild trigger threshold: when `evicted_ids.len() / total > this`,
+    /// `needs_rebuild()` returns true. Default 0.20.
+    evicted_fraction_rebuild: f64,
 }
 
 /// Full cache entry including its namespace — what `/internal/entry/{uuid}`
@@ -105,9 +136,11 @@ impl NamespacedIndex {
             hnsw,
             entries: HashMap::new(),
             uuid_to_internal: HashMap::new(),
+            evicted_ids: HashSet::new(),
             next_id: 0,
             dimension: None,
             ef_search: cfg.ef_search,
+            evicted_fraction_rebuild: DEFAULT_EVICTED_FRACTION_REBUILD,
         }
     }
 
@@ -181,28 +214,34 @@ impl NamespacedIndex {
             ));
         }
 
-        let neighbours = self.hnsw.search(embedding, 1, self.ef_search);
-        let Some(n) = neighbours.first() else {
-            return Ok(None);
-        };
+        // Ask for extra candidates so eviction-filtering doesn't turn a hit
+        // into a miss. Capped because beyond ~8 ghosts a rebuild is overdue.
+        let want = 1 + self.evicted_ids.len().min(MAX_EVICTION_OVERSCAN);
+        let neighbours = self.hnsw.search(embedding, want, self.ef_search);
 
-        let similarity = 1.0 - n.get_distance();
-        if similarity < threshold {
-            return Ok(None);
+        for n in neighbours {
+            let internal_id = n.get_origin_id();
+            // Skip ghost nodes (evicted-but-still-in-graph).
+            if self.evicted_ids.contains(&internal_id) {
+                continue;
+            }
+            let similarity = 1.0 - n.get_distance();
+            if similarity < threshold {
+                // Best non-evicted candidate falls below threshold — miss.
+                return Ok(None);
+            }
+            let entry = self
+                .entries
+                .get(&internal_id)
+                .ok_or_else(|| anyhow!("neighbour id {} not in side-table", internal_id))?;
+            return Ok(Some(QueryHit {
+                id: entry.uuid.clone(),
+                response: entry.response.clone(),
+                similarity,
+                internal_id,
+            }));
         }
-
-        let internal_id = n.get_origin_id();
-        let entry = self
-            .entries
-            .get(&internal_id)
-            .ok_or_else(|| anyhow!("neighbour id {} not in side-table", internal_id))?;
-
-        Ok(Some(QueryHit {
-            id: entry.uuid.clone(),
-            response: entry.response.clone(),
-            similarity,
-            internal_id,
-        }))
+        Ok(None)
     }
 
     pub fn entry_count(&self) -> usize {
@@ -220,6 +259,86 @@ impl NamespacedIndex {
             entry.last_accessed_at = now_unix_secs();
             entry.access_count = entry.access_count.saturating_add(1);
         }
+    }
+
+    pub fn evicted_ghost_count(&self) -> usize {
+        self.evicted_ids.len()
+    }
+
+    /// Evict the entry with the smallest `last_accessed_at`. O(n) scan; fine
+    /// for a cache that runs evictions per insert batch (cap-bounded), not
+    /// per request. Returns the evicted (uuid, model_id) so the caller can
+    /// write a tombstone to the WAL.
+    ///
+    /// Tie-break: when `last_accessed_at` (and `inserted_at`) match — typical
+    /// when several entries land within the same wall-clock second — fall
+    /// through to the side-table internal id, which is monotonic with insert
+    /// order. That gives FIFO eviction on ties, matching the intuitive
+    /// "oldest entry first" semantics.
+    pub fn evict_lru(&mut self, model_id: &str) -> Option<EvictedEntry> {
+        let (&evict_id, _) = self
+            .entries
+            .iter()
+            .min_by_key(|(id, e)| (e.last_accessed_at, e.inserted_at, **id))?;
+        let entry = self.entries.remove(&evict_id)?;
+        self.uuid_to_internal.remove(&entry.uuid);
+        self.evicted_ids.insert(evict_id);
+        Some(EvictedEntry {
+            uuid: entry.uuid,
+            model_id: model_id.to_string(),
+        })
+    }
+
+    /// Remove the entry with the given UUID. Used for explicit deletion
+    /// (M25 tombstone replay). Returns `true` if the entry existed.
+    pub fn remove_by_uuid(&mut self, uuid: &str) -> bool {
+        let Some(internal_id) = self.uuid_to_internal.remove(uuid) else {
+            return false;
+        };
+        self.entries.remove(&internal_id);
+        self.evicted_ids.insert(internal_id);
+        true
+    }
+
+    /// True when a HNSW rebuild would meaningfully reclaim space. Threshold
+    /// is `evicted_fraction_rebuild` of `(live + evicted)`.
+    pub fn needs_rebuild(&self) -> bool {
+        let total = self.entries.len() + self.evicted_ids.len();
+        if total == 0 {
+            return false;
+        }
+        (self.evicted_ids.len() as f64 / total as f64) > self.evicted_fraction_rebuild
+    }
+
+    /// Rebuild the HNSW from scratch using only live entries. Reclaims the
+    /// memory + graph connectivity wasted by ghosts. Internal IDs are
+    /// reassigned; `uuid_to_internal` is updated; `evicted_ids` is cleared.
+    pub fn rebuild(&mut self, hnsw_config: &HnswConfig) {
+        let new_hnsw = Hnsw::<f32, DistCosine>::new(
+            hnsw_config.max_nb_connection,
+            hnsw_config.max_elements,
+            hnsw_config.max_layer,
+            hnsw_config.ef_construction,
+            DistCosine,
+        );
+
+        let mut new_entries: HashMap<usize, CacheEntry> = HashMap::new();
+        let mut new_uuid_to_internal: HashMap<String, usize> = HashMap::new();
+        let mut new_next_id: usize = 0;
+        for (_, entry) in self.entries.drain() {
+            let id = new_next_id;
+            new_next_id += 1;
+            new_hnsw.insert((&entry.embedding, id));
+            new_uuid_to_internal.insert(entry.uuid.clone(), id);
+            new_entries.insert(id, entry);
+        }
+
+        self.hnsw = new_hnsw;
+        self.entries = new_entries;
+        self.uuid_to_internal = new_uuid_to_internal;
+        self.next_id = new_next_id;
+        self.evicted_ids.clear();
+        tracing::info!(live_entries = new_next_id, "HNSW rebuild complete");
     }
 }
 
@@ -314,6 +433,7 @@ impl SemanticIndex {
             inserted_at,
             last_accessed_at,
             access_count,
+            tombstone: _, // snapshots only carry live entries by construction
         } = entry;
         self.namespace_mut(&model_id).insert_with_uuid(
             uuid.clone(),
@@ -355,6 +475,53 @@ impl SemanticIndex {
         }
     }
 
+    /// Remove the entry with the given UUID from any namespace. Called by
+    /// WAL tombstone replay (M25). Returns `true` if the entry existed.
+    pub fn remove_by_uuid(&mut self, uuid: &str) -> bool {
+        let Some(model_id) = self.uuid_to_namespace.remove(uuid) else {
+            return false;
+        };
+        let Some(ns) = self.namespaces.get_mut(&model_id) else {
+            return false;
+        };
+        ns.remove_by_uuid(uuid)
+    }
+
+    /// For each namespace exceeding `max_entries`, evict the least-recently-
+    /// used entries until at cap. Returns the evicted entries so the caller
+    /// (the flush task) can write tombstone WAL entries.
+    pub fn evict_to_cap(&mut self, max_entries: usize) -> Vec<EvictedEntry> {
+        let mut evicted: Vec<EvictedEntry> = Vec::new();
+        for (model_id, ns) in self.namespaces.iter_mut() {
+            while ns.entry_count() > max_entries {
+                let Some(e) = ns.evict_lru(model_id) else {
+                    break;
+                };
+                evicted.push(e);
+            }
+        }
+        // Mirror the eviction at the top-level uuid → namespace map so
+        // `get_entry_by_uuid` doesn't keep returning a ghost.
+        for e in &evicted {
+            self.uuid_to_namespace.remove(&e.uuid);
+        }
+        evicted
+    }
+
+    /// Rebuild every namespace whose ghost ratio is above the trigger
+    /// threshold. Returns the model_ids that were rebuilt so the caller
+    /// can bump per-namespace metrics.
+    pub fn rebuild_dirty_namespaces(&mut self, hnsw_config: &HnswConfig) -> Vec<String> {
+        let mut rebuilt: Vec<String> = Vec::new();
+        for (model_id, ns) in self.namespaces.iter_mut() {
+            if ns.needs_rebuild() {
+                ns.rebuild(hnsw_config);
+                rebuilt.push(model_id.clone());
+            }
+        }
+        rebuilt
+    }
+
     /// Flatten every namespace into a `Vec<SnapshotEntry>`. Used by
     /// compaction; the result is a complete picture of in-memory state.
     pub fn snapshot_entries(&self) -> Vec<SnapshotEntry> {
@@ -370,6 +537,7 @@ impl SemanticIndex {
                     inserted_at: entry.inserted_at,
                     last_accessed_at: entry.last_accessed_at,
                     access_count: entry.access_count,
+                    tombstone: false,
                 });
             }
         }
@@ -419,6 +587,7 @@ impl SemanticIndex {
                         oldest_entry_ts,
                         newest_entry_ts: newest,
                         total_accesses: total,
+                        evicted_ghost_count: v.evicted_ghost_count(),
                     },
                 )
             })
@@ -431,7 +600,7 @@ impl SemanticIndex {
         let mut out = HashMap::with_capacity(self.namespaces.len());
         for (model_id, ns) in &self.namespaces {
             let mut entries: Vec<&CacheEntry> = ns.entries().collect();
-            entries.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+            entries.sort_by_key(|b| std::cmp::Reverse(b.access_count));
             entries.truncate(limit);
             let summaries = entries
                 .into_iter()
@@ -482,6 +651,7 @@ mod tests {
             model_id: model_id.into(),
             inserted_at: 0,
             sequence: 0,
+            tombstone: false,
         }
     }
 
@@ -644,6 +814,7 @@ mod tests {
             model_id: M.into(),
             inserted_at: 1234,
             sequence: 0,
+            tombstone: false,
         };
         idx.replay_entry(entry).unwrap();
         let got = idx.get_entry_by_uuid("fixed-uuid").unwrap();
@@ -689,6 +860,7 @@ mod tests {
             inserted_at: 0,
             last_accessed_at: 0,
             access_count: 0,
+            tombstone: false,
         })
         .unwrap();
         assert_eq!(
@@ -879,11 +1051,254 @@ mod tests {
             inserted_at: 5000,
             last_accessed_at: 6000,
             access_count: 42,
+            tombstone: false,
         })
         .unwrap();
         let entry = idx.get_entry_by_uuid("u1").unwrap();
         assert_eq!(entry.inserted_at, 5000);
         assert_eq!(entry.last_accessed_at, 6000);
         assert_eq!(entry.access_count, 42);
+    }
+
+    // --- M25: LRU eviction + lazy deletion + rebuild ---------------------
+
+    /// Helper: stamp `last_accessed_at` directly on the entry so eviction
+    /// ordering tests don't depend on `now_unix_secs()` time resolution.
+    fn set_access_ts(idx: &mut SemanticIndex, model_id: &str, uuid: &str, ts: u64) {
+        let ns = idx.namespaces.get_mut(model_id).unwrap();
+        let internal_id = *ns.uuid_to_internal.get(uuid).unwrap();
+        let entry = ns.entries.get_mut(&internal_id).unwrap();
+        entry.last_accessed_at = ts;
+    }
+
+    #[test]
+    fn test_evict_lru_removes_oldest() {
+        let mut idx = test_index();
+        let u1 = idx
+            .insert(vec![1.0, 0.0, 0.0], "r1".into(), "q1".into(), M)
+            .unwrap();
+        let u2 = idx
+            .insert(vec![0.0, 1.0, 0.0], "r2".into(), "q2".into(), M)
+            .unwrap();
+        let u3 = idx
+            .insert(vec![0.0, 0.0, 1.0], "r3".into(), "q3".into(), M)
+            .unwrap();
+        // u1 oldest, u2 middle, u3 newest by access time.
+        set_access_ts(&mut idx, M, &u1, 100);
+        set_access_ts(&mut idx, M, &u2, 200);
+        set_access_ts(&mut idx, M, &u3, 300);
+
+        let ns = idx.namespaces.get_mut(M).unwrap();
+        let evicted = ns.evict_lru(M).unwrap();
+        assert_eq!(evicted.uuid, u1);
+        assert_eq!(evicted.model_id, M);
+        assert!(!ns.uuid_to_internal.contains_key(&u1));
+        // The internal id for u1 was 0 (insertion order), now in evicted_ids.
+        assert!(ns.evicted_ids.contains(&0));
+    }
+
+    #[test]
+    fn test_evict_lru_empty_namespace() {
+        let mut idx = test_index();
+        // Force the namespace to exist but be empty by inserting then removing.
+        let u = idx
+            .insert(vec![1.0, 0.0, 0.0], "r".into(), "q".into(), M)
+            .unwrap();
+        idx.remove_by_uuid(&u);
+        let ns = idx.namespaces.get_mut(M).unwrap();
+        assert!(ns.evict_lru(M).is_none());
+    }
+
+    #[test]
+    fn test_query_filters_evicted() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let uuid = idx.insert(v.clone(), "r".into(), "q".into(), M).unwrap();
+        // Evict via top-level remove (same effect as evict_lru for this test).
+        assert!(idx.remove_by_uuid(&uuid));
+        let result = idx.query(&v, 0.9, M).unwrap();
+        assert!(
+            result.is_none(),
+            "query must not return ghost: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_query_finds_next_best_after_eviction() {
+        let mut idx = test_index();
+        // A and B both unit-length; A is identical to the probe.
+        let a_vec = vec![1.0_f32, 0.0, 0.0];
+        let b_vec = {
+            // 70/30 mix with A so cosine similarity is ~0.92 (above 0.90 threshold)
+            let v = [0.9_f32, 0.43589, 0.0];
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            vec![v[0] / n, v[1] / n, v[2] / n]
+        };
+        let a = idx
+            .insert(a_vec.clone(), "ra".into(), "qa".into(), M)
+            .unwrap();
+        let _b = idx
+            .insert(b_vec.clone(), "rb".into(), "qb".into(), M)
+            .unwrap();
+        // Evict A.
+        idx.remove_by_uuid(&a);
+        // Probe at A's vector with a threshold B can clear.
+        let hit = idx
+            .query(&a_vec, 0.85, M)
+            .unwrap()
+            .expect("B should be the next-best non-ghost match");
+        assert_eq!(hit.response, "rb");
+    }
+
+    #[test]
+    fn test_needs_rebuild_threshold() {
+        let mut idx = test_index();
+        // 10 inserts; HNSW dimension auto-detects from the first.
+        for i in 0..10u32 {
+            let mut v = vec![0.0_f32; 3];
+            v[(i % 3) as usize] = 1.0 + (i as f32) * 0.001;
+            idx.insert(v, format!("r{i}"), format!("q{i}"), M).unwrap();
+        }
+        let live_uuids: Vec<String> = idx
+            .namespaces
+            .get(M)
+            .unwrap()
+            .entries
+            .values()
+            .map(|e| e.uuid.clone())
+            .collect();
+
+        // Evict 1: ratio = 1/10 = 0.10 → not over.
+        idx.remove_by_uuid(&live_uuids[0]);
+        assert!(!idx.namespaces.get(M).unwrap().needs_rebuild());
+        // Evict 2: ratio = 2/10 = 0.20 (not strictly over).
+        idx.remove_by_uuid(&live_uuids[1]);
+        assert!(!idx.namespaces.get(M).unwrap().needs_rebuild());
+        // Evict 3: ratio = 3/10 = 0.30 → over.
+        idx.remove_by_uuid(&live_uuids[2]);
+        assert!(idx.namespaces.get(M).unwrap().needs_rebuild());
+    }
+
+    #[test]
+    fn test_rebuild_clears_evicted_ids() {
+        let mut idx = test_index();
+        for i in 0..5u32 {
+            let mut v = vec![0.0_f32; 3];
+            v[(i % 3) as usize] = 1.0 + (i as f32) * 0.01;
+            idx.insert(v, format!("r{i}"), format!("q{i}"), M).unwrap();
+        }
+        let to_evict: Vec<String> = idx
+            .namespaces
+            .get(M)
+            .unwrap()
+            .entries
+            .values()
+            .take(2)
+            .map(|e| e.uuid.clone())
+            .collect();
+        for u in &to_evict {
+            idx.remove_by_uuid(u);
+        }
+        assert_eq!(idx.namespaces.get(M).unwrap().evicted_ids.len(), 2);
+        idx.rebuild_dirty_namespaces(&HnswConfig::default());
+        // Even though the threshold may not have been crossed, calling
+        // rebuild explicitly should clear ghosts. Force it:
+        idx.namespaces
+            .get_mut(M)
+            .unwrap()
+            .rebuild(&HnswConfig::default());
+        let ns = idx.namespaces.get(M).unwrap();
+        assert!(ns.evicted_ids.is_empty());
+        assert_eq!(ns.entries.len(), 3);
+        // Live entries remain queryable.
+        let any_live_uuid = ns.entries.values().next().unwrap().uuid.clone();
+        let entry = idx.get_entry_by_uuid(&any_live_uuid).unwrap();
+        assert_eq!(entry.uuid, any_live_uuid);
+    }
+
+    #[test]
+    fn test_rebuild_reassigns_internal_ids() {
+        let mut idx = test_index();
+        for i in 0..5u32 {
+            let mut v = vec![0.0_f32; 3];
+            v[(i % 3) as usize] = 1.0 + (i as f32) * 0.01;
+            idx.insert(v, format!("r{i}"), format!("q{i}"), M).unwrap();
+        }
+        let evict_uuid = idx
+            .namespaces
+            .get(M)
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .uuid
+            .clone();
+        idx.remove_by_uuid(&evict_uuid);
+
+        idx.namespaces
+            .get_mut(M)
+            .unwrap()
+            .rebuild(&HnswConfig::default());
+
+        let ns = idx.namespaces.get(M).unwrap();
+        // After rebuild, internal IDs are 0..live_count.
+        let mut ids: Vec<usize> = ns.entries.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(ns.next_id, 4);
+        // uuid_to_internal mappings match entries.
+        for (uuid, &id) in &ns.uuid_to_internal {
+            assert_eq!(ns.entries.get(&id).unwrap().uuid, *uuid);
+        }
+    }
+
+    #[test]
+    fn test_remove_by_uuid() {
+        let mut idx = test_index();
+        let u = idx
+            .insert(vec![1.0, 0.0, 0.0], "r".into(), "q".into(), M)
+            .unwrap();
+        let prev_id = *idx
+            .namespaces
+            .get(M)
+            .unwrap()
+            .uuid_to_internal
+            .get(&u)
+            .unwrap();
+        assert!(idx.remove_by_uuid(&u));
+        let ns = idx.namespaces.get(M).unwrap();
+        assert!(!ns.uuid_to_internal.contains_key(&u));
+        assert!(!ns.entries.contains_key(&prev_id));
+        assert!(ns.evicted_ids.contains(&prev_id));
+        assert!(idx.get_entry_by_uuid(&u).is_none());
+        // Idempotent — second call returns false.
+        assert!(!idx.remove_by_uuid(&u));
+    }
+
+    #[test]
+    fn test_eviction_preserves_most_accessed() {
+        let mut idx = test_index();
+        let mut uuids: Vec<String> = Vec::new();
+        for i in 0..5u32 {
+            let mut v = vec![0.0_f32; 3];
+            v[(i % 3) as usize] = 1.0 + (i as f32) * 0.01;
+            uuids.push(idx.insert(v, format!("r{i}"), format!("q{i}"), M).unwrap());
+        }
+        // Make uuids[2] the most-recently-accessed; uuids[0] and [1] oldest.
+        for (i, u) in uuids.iter().enumerate() {
+            set_access_ts(&mut idx, M, u, 100 + i as u64 * 10);
+        }
+        set_access_ts(&mut idx, M, &uuids[2], 9_999);
+
+        let evicted = idx.evict_to_cap(3);
+        assert_eq!(evicted.len(), 2);
+        let evicted_uuids: HashSet<String> = evicted.iter().map(|e| e.uuid.clone()).collect();
+        // uuids[2] survives; the two oldest (uuids[0], uuids[1]) are evicted.
+        assert!(idx.get_entry_by_uuid(&uuids[2]).is_some());
+        assert!(evicted_uuids.contains(&uuids[0]));
+        assert!(evicted_uuids.contains(&uuids[1]));
+        assert!(idx.get_entry_by_uuid(&uuids[0]).is_none());
+        assert!(idx.get_entry_by_uuid(&uuids[1]).is_none());
     }
 }

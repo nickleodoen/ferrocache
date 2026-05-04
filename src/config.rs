@@ -153,6 +153,12 @@ pub struct HnswConfig {
     pub ef_construction: usize,
     pub ef_search: usize,
     pub default_threshold: f32,
+    /// LRU eviction cap per namespace (M25). When `None`, the namespace is
+    /// unlimited (pre-M25 behavior). When `Some(N)`, the flush task evicts
+    /// the least-recently-accessed entries after each insert batch until
+    /// the namespace holds ≤ N live entries.
+    #[serde(default)]
+    pub max_entries_per_namespace: Option<usize>,
 }
 
 impl Default for FerrocacheConfig {
@@ -180,6 +186,7 @@ impl Default for HnswConfig {
             ef_construction: 200,
             ef_search: 32,
             default_threshold: 0.92,
+            max_entries_per_namespace: None,
         }
     }
 }
@@ -275,6 +282,7 @@ mod tests {
         assert_eq!(c.hnsw.ef_construction, 200);
         assert_eq!(c.hnsw.ef_search, 32);
         assert!((c.hnsw.default_threshold - 0.92).abs() < 1e-6);
+        assert!(c.hnsw.max_entries_per_namespace.is_none());
         assert!(!c.cluster.enabled);
         assert_eq!(c.cluster.gossip_addr, "0.0.0.0:4000");
         assert_eq!(c.cluster.api_addr, "0.0.0.0:3000");

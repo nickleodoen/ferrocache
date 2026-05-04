@@ -38,6 +38,7 @@ fn make_entry(seed: u64) -> WalEntry {
         model_id: MODEL_ID.to_string(),
         sequence: 0,
         inserted_at: 0,
+        tombstone: false,
     }
 }
 

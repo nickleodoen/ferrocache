@@ -78,6 +78,8 @@ pub struct NamespaceMetrics {
     pub queries_hit: AtomicU64,
     pub queries_miss: AtomicU64,
     pub inserts: AtomicU64,
+    /// LRU evictions per namespace (M25).
+    pub evictions: AtomicU64,
 }
 
 pub struct Metrics {
@@ -99,6 +101,12 @@ pub struct Metrics {
     /// returned 404 for the UUID, WAL channel closed, etc.). Tracked
     /// separately so it can be alerted on without polluting `repairs_total`.
     pub read_repair_failures_total: AtomicU64,
+    /// Total LRU evictions across all namespaces (M25). Per-namespace
+    /// counts live on `NamespaceMetrics.evictions`.
+    pub evictions_total: AtomicU64,
+    /// HNSW rebuilds completed (M25). Each rebuild reclaims graph
+    /// connectivity wasted by ghost (evicted) nodes.
+    pub index_rebuilds_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
     pub insert_duration: LatencyHistogram,
@@ -118,6 +126,8 @@ impl Metrics {
             ring_changes_total: AtomicU64::new(0),
             read_repairs_total: AtomicU64::new(0),
             read_repair_failures_total: AtomicU64::new(0),
+            evictions_total: AtomicU64::new(0),
+            index_rebuilds_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
             insert_duration: LatencyHistogram::new(),
@@ -210,6 +220,23 @@ impl Metrics {
     pub fn record_read_repair_failure(&self) {
         self.read_repair_failures_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_eviction(&self, namespace: &str) {
+        self.evictions_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_metrics.read().unwrap().get(namespace) {
+            ns.evictions.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut w = self.namespace_metrics.write().unwrap();
+        w.entry(namespace.to_string())
+            .or_default()
+            .evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rebuild(&self) {
+        self.index_rebuilds_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -320,6 +347,20 @@ impl Metrics {
             "Read repair attempts that failed (replica unreachable, entry missing, etc).",
             read_repair_failures,
         );
+        let evictions = self.evictions_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_evictions_total",
+            "Total LRU evictions across all namespaces.",
+            evictions,
+        );
+        let rebuilds = self.index_rebuilds_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_index_rebuilds_total",
+            "HNSW index rebuilds (one per namespace whose ghost ratio exceeded the trigger).",
+            rebuilds,
+        );
 
         let total_entries: usize = index_stats.values().map(|s| s.entry_count).sum();
         write_gauge_u64(
@@ -410,6 +451,41 @@ impl Metrics {
                 "ferrocache_namespace_inserts{{namespace=\"{}\"}} {}",
                 escape_label(k),
                 v
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_evictions LRU evictions per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_evictions counter");
+        for k in &all_ns {
+            let v = ns_metrics
+                .get(k)
+                .map(|n| n.evictions.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_evictions{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                v
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_evicted_ghosts Ghost (evicted-but-still-in-graph) HNSW nodes per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_evicted_ghosts gauge");
+        for k in &ns_keys {
+            let stats = &index_stats[*k];
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_evicted_ghosts{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                stats.evicted_ghost_count
             );
         }
         out.push('\n');
@@ -626,6 +702,7 @@ mod tests {
                 oldest_entry_ts: 0,
                 newest_entry_ts: 0,
                 total_accesses: 0,
+                evicted_ghost_count: 0,
             },
         );
         let body = m.render(&stats, 1, &Vec::new());

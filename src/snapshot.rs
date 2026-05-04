@@ -30,6 +30,13 @@ pub struct SnapshotEntry {
     pub last_accessed_at: u64,
     #[serde(default)]
     pub access_count: u64,
+    /// Defensive forward-compat (M25). Snapshots only carry live entries —
+    /// `snapshot_entries()` iterates the side-table, which excludes
+    /// evicted entries by construction — so this is always `false` in
+    /// practice. Included so a future `tombstone-aware` snapshot format
+    /// stays bincode-compatible without a version bump.
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 #[derive(Debug)]
@@ -175,6 +182,7 @@ mod tests {
             inserted_at: 0,
             last_accessed_at: 0,
             access_count: 0,
+            tombstone: false,
         }
     }
 
@@ -257,6 +265,7 @@ mod tests {
                 model_id: "m::3".into(),
                 sequence: 0,
                 inserted_at: 0,
+                tombstone: false,
             };
             wal.append(&we).await.unwrap();
             index.replay_entry(we).unwrap();
@@ -284,6 +293,7 @@ mod tests {
             model_id: "m::3".into(),
             sequence: 0,
             inserted_at: 0,
+            tombstone: false,
         };
         let s = wal.append(&we).await.unwrap();
         assert_eq!(s, 4);

@@ -85,12 +85,20 @@ async fn main() -> anyhow::Result<()> {
     let mut max_seq = snapshot_sequence.unwrap_or(0);
     let watermark = snapshot_sequence.unwrap_or(0);
     let only_tail = snapshot_sequence.is_some();
+    let mut tombstones_applied = 0usize;
     for entry in entries {
         if only_tail && entry.sequence <= watermark {
             continue;
         }
         if entry.sequence > max_seq {
             max_seq = entry.sequence;
+        }
+        if entry.tombstone {
+            // M25: a tombstone removes the entry instead of inserting it.
+            if index.remove_by_uuid(&entry.uuid) {
+                tombstones_applied += 1;
+            }
+            continue;
         }
         match index.replay_entry(entry) {
             Ok(()) => replayed += 1,
@@ -99,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(
         wal_tail_entries = replayed,
+        tombstones_applied,
         snapshot_watermark = watermark,
         "startup replay complete"
     );
@@ -213,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
         config.compact_interval_inserts,
         group_commit_config,
+        config.hnsw.clone(),
     );
 
     let state = Arc::new(AppState::new(

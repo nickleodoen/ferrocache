@@ -103,6 +103,7 @@ mod tests {
                 batch_timeout: std::time::Duration::from_millis(0),
                 channel_capacity: 64,
             },
+            hnsw.clone(),
         );
         Arc::new(AppState::new(
             "test-node".to_string(),
