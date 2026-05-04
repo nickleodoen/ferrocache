@@ -11,6 +11,12 @@ pub struct QueryRequest {
     /// rather than a serde rejection.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Optional original query text (M27). When present, the server tries
+    /// an O(1) exact-match lookup against normalized stored `query_text`
+    /// values BEFORE running the HNSW ANN search. Backward-compatible:
+    /// pre-M27 callers omit this field and behaviour is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +28,10 @@ pub struct QueryResponse {
     pub response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity: Option<f32>,
+    /// `Some(true)` if the hit came from the M27 exact-match pre-filter;
+    /// `Some(false)` for an HNSW ANN hit; omitted from JSON on miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_match: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +172,9 @@ pub struct CountersResponse {
     pub deletions_total: u64,
     /// Semantic invalidations via `POST /admin/invalidate` (M26).
     pub invalidations_total: u64,
+    /// M27: queries resolved by the exact-match pre-filter. Additive
+    /// to `queries_hit` — every exact-match is also a hit.
+    pub exact_match_hits_total: u64,
 }
 
 #[derive(Debug, Serialize)]

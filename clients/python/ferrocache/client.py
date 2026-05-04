@@ -89,13 +89,20 @@ class FerrocacheClient:
         embedding: list[float],
         threshold: float = 0.92,
         model_id: str | None = None,
+        query_text: str | None = None,
     ) -> dict[str, Any]:
         if not model_id:
             raise ValueError("model_id is required")
-        return self._post(
-            "/query",
-            {"embedding": embedding, "threshold": threshold, "model_id": model_id},
-        )
+        body: dict[str, Any] = {
+            "embedding": embedding,
+            "threshold": threshold,
+            "model_id": model_id,
+        }
+        # M27: optional exact-match pre-filter input. Sent only when set
+        # so older servers (pre-M27) just ignore the field.
+        if query_text is not None:
+            body["query_text"] = query_text
+        return self._post("/query", body)
 
     def health(self) -> dict[str, Any]:
         return self._get("/health")

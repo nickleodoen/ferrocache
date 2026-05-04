@@ -171,7 +171,15 @@ def _intercept(
     )
 
     try:
-        result = cache.query(embedding=embedding, threshold=threshold, model_id=model_id)
+        # M27: pass query_text so the server can short-circuit via the
+        # exact-match pre-filter when the user asks the same question
+        # verbatim (case/space-insensitive).
+        result = cache.query(
+            embedding=embedding,
+            threshold=threshold,
+            model_id=model_id,
+            query_text=prompt,
+        )
     except FerrocacheError as e:
         if not fail_open:
             raise

@@ -18,6 +18,17 @@ pub const DEFAULT_EVICTED_FRACTION_REBUILD: f64 = 0.20;
 /// don't want to scan a long candidate list on every query.
 const MAX_EVICTION_OVERSCAN: usize = 8;
 
+/// Normalize a `query_text` for exact-match indexing (M27). Lowercases,
+/// trims, and collapses internal whitespace runs to a single space.
+/// Deterministic and locale-independent — no Unicode normalization on
+/// purpose, so behaviour stays predictable for cache operators.
+pub fn normalize_query_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Current Unix timestamp in seconds. Used for `inserted_at` /
 /// `last_accessed_at` stamps. Returns 0 if the system clock predates UNIX_EPOCH
 /// (impossible on a sane host, but we don't want to panic on it).
@@ -54,6 +65,10 @@ pub struct QueryHit {
     /// Side-table internal id, exposed so the handler can call
     /// `record_access` without a second lookup.
     pub internal_id: usize,
+    /// `true` when the hit came from the M27 exact-match pre-filter
+    /// (i.e. `query_text` matched a stored entry's normalized form).
+    /// `false` for HNSW ANN hits.
+    pub exact_match: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +118,10 @@ pub struct NamespacedIndex {
     /// ghost; queries filter against this set before threshold checks.
     /// Cleared on rebuild.
     evicted_ids: HashSet<usize>,
+    /// Exact-match pre-filter (M27): normalized `query_text` → owning
+    /// UUID. Checked before HNSW search; O(1) hit when the user's text
+    /// matches a stored entry. Cleaned up on every removal path.
+    exact_match_index: HashMap<String, String>,
     next_id: usize,
     dimension: Option<usize>,
     ef_search: usize,
@@ -140,6 +159,7 @@ impl NamespacedIndex {
             entries: HashMap::new(),
             uuid_to_internal: HashMap::new(),
             evicted_ids: HashSet::new(),
+            exact_match_index: HashMap::new(),
             next_id: 0,
             dimension: None,
             ef_search: cfg.ef_search,
@@ -182,6 +202,13 @@ impl NamespacedIndex {
         self.next_id += 1;
         self.hnsw.insert((&embedding, id));
         self.uuid_to_internal.insert(uuid.clone(), id);
+        // M27: register normalized query_text → uuid. Empty after
+        // normalization (whitespace-only) is skipped — would otherwise
+        // make every "" query match.
+        let normalized = normalize_query_text(&query_text);
+        if !normalized.is_empty() {
+            self.exact_match_index.insert(normalized, uuid.clone());
+        }
         self.entries.insert(
             id,
             CacheEntry {
@@ -198,6 +225,33 @@ impl NamespacedIndex {
         Ok(())
     }
 
+    /// Internal: remove the entry with the given internal id and clean
+    /// up every side map (uuid_to_internal, evicted_ids, exact_match_index).
+    /// This is the single removal point — every public removal path
+    /// (`evict_lru`, `remove_by_uuid`, `remove_internal`,
+    /// `collect_expired_within`) funnels through it.
+    ///
+    /// The exact-match cleanup includes a UUID ownership check: if a
+    /// later insert with the same normalized text overwrote this entry's
+    /// mapping, removing it would clobber the live mapping. We only
+    /// remove the key when its current value still references the
+    /// dropped UUID.
+    fn drop_entry(&mut self, internal_id: usize) -> Option<CacheEntry> {
+        let entry = self.entries.remove(&internal_id)?;
+        self.uuid_to_internal.remove(&entry.uuid);
+        self.evicted_ids.insert(internal_id);
+        let normalized = normalize_query_text(&entry.query_text);
+        if !normalized.is_empty()
+            && self
+                .exact_match_index
+                .get(&normalized)
+                .is_some_and(|u| u == &entry.uuid)
+        {
+            self.exact_match_index.remove(&normalized);
+        }
+        Some(entry)
+    }
+
     pub fn get_by_uuid(&self, uuid: &str) -> Option<&CacheEntry> {
         let id = self.uuid_to_internal.get(uuid)?;
         self.entries.get(id)
@@ -207,7 +261,47 @@ impl NamespacedIndex {
         self.entries.values()
     }
 
+    /// Backward-compat wrapper: HNSW-only path with no exact-match
+    /// pre-filter. Used by tests + any caller that doesn't have a
+    /// `query_text` to look up by.
     pub fn query(&self, embedding: &[f32], threshold: f32) -> Result<Option<QueryHit>> {
+        self.query_with_text(embedding, threshold, None, now_unix_secs())
+    }
+
+    /// Full M27 query path: try the exact-match pre-filter first when
+    /// `query_text` is `Some`, then fall through to HNSW ANN search.
+    /// `now` is passed in (not read from the wall clock) so the same
+    /// instant evaluates every candidate consistently in one call.
+    pub fn query_with_text(
+        &self,
+        embedding: &[f32],
+        threshold: f32,
+        query_text: Option<&str>,
+        now: u64,
+    ) -> Result<Option<QueryHit>> {
+        // M27 exact-match pre-filter — runs BEFORE the HNSW search. A
+        // miss falls through silently. Conditions for a hit: normalized
+        // text key exists → UUID resolves to an internal id → not in
+        // `evicted_ids` → entry still in side-table → not expired.
+        if let Some(text) = query_text {
+            let normalized = normalize_query_text(text);
+            if !normalized.is_empty()
+                && let Some(uuid) = self.exact_match_index.get(&normalized)
+                && let Some(&internal_id) = self.uuid_to_internal.get(uuid)
+                && !self.evicted_ids.contains(&internal_id)
+                && let Some(entry) = self.entries.get(&internal_id)
+                && entry.expires_at.is_none_or(|exp| now <= exp)
+            {
+                return Ok(Some(QueryHit {
+                    id: entry.uuid.clone(),
+                    response: entry.response.clone(),
+                    similarity: 1.0,
+                    internal_id,
+                    exact_match: true,
+                }));
+            }
+        }
+
         let Some(d) = self.dimension else {
             return Ok(None);
         };
@@ -224,7 +318,6 @@ impl NamespacedIndex {
         let want = 1 + self.evicted_ids.len().min(MAX_EVICTION_OVERSCAN);
         let neighbours = self.hnsw.search(embedding, want, self.ef_search);
 
-        let now = now_unix_secs();
         for n in neighbours {
             let internal_id = n.get_origin_id();
             // Skip ghost nodes (evicted-but-still-in-graph).
@@ -253,6 +346,7 @@ impl NamespacedIndex {
                 response: entry.response.clone(),
                 similarity,
                 internal_id,
+                exact_match: false,
             }));
         }
         Ok(None)
@@ -318,9 +412,7 @@ impl NamespacedIndex {
             .collect();
         let mut out: Vec<(String, usize)> = Vec::with_capacity(expired_ids.len());
         for id in expired_ids {
-            if let Some(entry) = self.entries.remove(&id) {
-                self.uuid_to_internal.remove(&entry.uuid);
-                self.evicted_ids.insert(id);
+            if let Some(entry) = self.drop_entry(id) {
                 out.push((entry.uuid, id));
             }
         }
@@ -342,9 +434,7 @@ impl NamespacedIndex {
             .entries
             .iter()
             .min_by_key(|(id, e)| (e.last_accessed_at, e.inserted_at, **id))?;
-        let entry = self.entries.remove(&evict_id)?;
-        self.uuid_to_internal.remove(&entry.uuid);
-        self.evicted_ids.insert(evict_id);
+        let entry = self.drop_entry(evict_id)?;
         Some(EvictedEntry {
             uuid: entry.uuid,
             model_id: model_id.to_string(),
@@ -354,20 +444,16 @@ impl NamespacedIndex {
     /// Remove the entry with the given UUID. Used for explicit deletion
     /// (M25 tombstone replay). Returns `true` if the entry existed.
     pub fn remove_by_uuid(&mut self, uuid: &str) -> bool {
-        let Some(internal_id) = self.uuid_to_internal.remove(uuid) else {
+        let Some(&internal_id) = self.uuid_to_internal.get(uuid) else {
             return false;
         };
-        self.entries.remove(&internal_id);
-        self.evicted_ids.insert(internal_id);
-        true
+        self.drop_entry(internal_id).is_some()
     }
 
     /// Remove a known internal id (M26). Used by `/admin/invalidate`,
     /// which already has the id from `find_similar`.
     pub fn remove_internal(&mut self, internal_id: usize) -> Option<String> {
-        let entry = self.entries.remove(&internal_id)?;
-        self.uuid_to_internal.remove(&entry.uuid);
-        self.evicted_ids.insert(internal_id);
+        let entry = self.drop_entry(internal_id)?;
         Some(entry.uuid)
     }
 
@@ -693,8 +779,22 @@ impl SemanticIndex {
         threshold: f32,
         model_id: &str,
     ) -> Result<Option<QueryHit>> {
+        self.query_with_text(embedding, threshold, model_id, None, now_unix_secs())
+    }
+
+    /// Full M27 query path with exact-match pre-filter. The handler
+    /// passes `now` once so the same instant evaluates expiry on every
+    /// candidate.
+    pub fn query_with_text(
+        &self,
+        embedding: &[f32],
+        threshold: f32,
+        model_id: &str,
+        query_text: Option<&str>,
+        now: u64,
+    ) -> Result<Option<QueryHit>> {
         match self.namespaces.get(model_id) {
-            Some(ns) => ns.query(embedding, threshold),
+            Some(ns) => ns.query_with_text(embedding, threshold, query_text, now),
             None => Ok(None),
         }
     }
@@ -1618,5 +1718,233 @@ mod tests {
         assert!(evicted_uuids.contains(&uuids[1]));
         assert!(idx.get_entry_by_uuid(&uuids[0]).is_none());
         assert!(idx.get_entry_by_uuid(&uuids[1]).is_none());
+    }
+
+    // --- M27: exact-match pre-filter ---------------------------------------
+
+    #[test]
+    fn test_normalize_query_text() {
+        // Lowercase + trim + collapse whitespace runs.
+        assert_eq!(normalize_query_text("Hello"), "hello");
+        assert_eq!(
+            normalize_query_text("  What is\tthe  Capital   of  France?  "),
+            "what is the capital of france?"
+        );
+        assert_eq!(normalize_query_text(""), "");
+        assert_eq!(normalize_query_text("   "), "");
+        assert_eq!(normalize_query_text("a\nb\nc"), "a b c");
+    }
+
+    #[test]
+    fn test_exact_match_hit() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(
+            v.clone(),
+            "Paris".into(),
+            "What is the capital of France?".into(),
+            M,
+        )
+        .unwrap();
+        // Query with a totally different embedding — the exact-match
+        // pre-filter should still hit because the text matches.
+        let now = now_unix_secs();
+        let hit = idx
+            .query_with_text(
+                &[0.0_f32, 0.0, 1.0], // orthogonal — would miss in HNSW
+                0.99,
+                M,
+                Some("What is the capital of France?"),
+                now,
+            )
+            .unwrap()
+            .expect("exact-match hit");
+        assert!(hit.exact_match);
+        assert_eq!(hit.similarity, 1.0);
+        assert_eq!(hit.response, "Paris");
+    }
+
+    #[test]
+    fn test_exact_match_normalization() {
+        let mut idx = test_index();
+        idx.insert(
+            vec![1.0_f32, 0.0, 0.0],
+            "Paris".into(),
+            "What is the capital of France?".into(),
+            M,
+        )
+        .unwrap();
+        let now = now_unix_secs();
+        // Different case + extra whitespace + missing punctuation in the
+        // wrong place — case + space normalisation should still hit, but
+        // missing punctuation alone shouldn't (we don't strip punctuation).
+        let hit = idx
+            .query_with_text(
+                &[0.0_f32, 0.0, 1.0],
+                0.99,
+                M,
+                Some("  WHAT  IS\t the capital   of  france?  "),
+                now,
+            )
+            .unwrap()
+            .expect("normalized exact-match");
+        assert!(hit.exact_match);
+        assert_eq!(hit.response, "Paris");
+    }
+
+    #[test]
+    fn test_exact_match_miss_falls_through_to_ann() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "answer".into(), "X".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        // query_text "Y" doesn't match stored "X", but the embedding
+        // matches → ANN hit, exact_match=false.
+        let hit = idx
+            .query_with_text(&v, 0.9, M, Some("Y"), now)
+            .unwrap()
+            .expect("ANN hit");
+        assert!(!hit.exact_match);
+        assert!(hit.similarity > 0.99);
+    }
+
+    #[test]
+    fn test_exact_match_evicted_falls_through() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "r".into(), "evict-me".into(), M)
+            .unwrap();
+        idx.remove_by_uuid(&u);
+        let now = now_unix_secs();
+        let result = idx
+            .query_with_text(&v, 0.9, M, Some("evict-me"), now)
+            .unwrap();
+        assert!(result.is_none(), "evicted entry must not match");
+    }
+
+    #[test]
+    fn test_exact_match_expired_falls_through() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "r".into(), "ttl-text".into(), M)
+            .unwrap();
+        // Force expiry into the past.
+        let past = now_unix_secs().saturating_sub(10);
+        set_expires_at(&mut idx, M, &u, Some(past));
+        let now = now_unix_secs();
+        let result = idx
+            .query_with_text(&v, 0.9, M, Some("ttl-text"), now)
+            .unwrap();
+        assert!(result.is_none(), "expired entry must not match");
+    }
+
+    #[test]
+    fn test_query_without_query_text_uses_ann() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "r".into(), "some text".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        // No query_text → exact-match pre-filter is skipped entirely.
+        let hit = idx
+            .query_with_text(&v, 0.9, M, None, now)
+            .unwrap()
+            .expect("ANN hit");
+        assert!(!hit.exact_match);
+    }
+
+    #[test]
+    fn test_exact_match_index_cleaned_on_delete() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "r".into(), "delete-me".into(), M)
+            .unwrap();
+        // Sanity: pre-filter hits before delete.
+        let now = now_unix_secs();
+        assert!(
+            idx.query_with_text(&[0.0_f32, 0.0, 1.0], 0.99, M, Some("delete-me"), now)
+                .unwrap()
+                .is_some()
+        );
+        // Delete via the user-facing path (writes a tombstone in prod;
+        // tests just call the index method directly).
+        assert!(idx.remove_by_uuid(&u));
+        // After delete, the same probe must miss — exact-match index
+        // was cleaned up by `drop_entry`.
+        assert!(
+            idx.query_with_text(&[0.0_f32, 0.0, 1.0], 0.99, M, Some("delete-me"), now)
+                .unwrap()
+                .is_none()
+        );
+        // And the inner map no longer has the key.
+        let ns = idx.namespaces.get(M).unwrap();
+        assert!(!ns.exact_match_index.contains_key("delete-me"));
+    }
+
+    #[test]
+    fn test_exact_match_index_ownership_check() {
+        // Insert A with text "test", delete A, insert B with same text.
+        // The exact-match index must point to B's UUID, not the dead one.
+        let mut idx = test_index();
+        let a = idx
+            .insert(vec![1.0_f32, 0.0, 0.0], "A".into(), "test".into(), M)
+            .unwrap();
+        idx.remove_by_uuid(&a);
+        let b = idx
+            .insert(vec![0.0_f32, 1.0, 0.0], "B".into(), "test".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        let hit = idx
+            .query_with_text(&[0.0_f32, 0.0, 1.0], 0.99, M, Some("test"), now)
+            .unwrap()
+            .expect("must hit B, not the deleted A");
+        assert_eq!(hit.id, b);
+        assert_eq!(hit.response, "B");
+    }
+
+    #[test]
+    fn test_exact_match_survives_multi_path_removal() {
+        // M25 evict_lru, M26 collect_expired, and M26 invalidate_similar
+        // all need to clean up the exact-match index. Verify each.
+        let mut idx = test_index();
+        let v1 = vec![1.0_f32, 0.0, 0.0];
+        let u_evict = idx
+            .insert(v1.clone(), "evict".into(), "evict-text".into(), M)
+            .unwrap();
+        let u_expire = idx
+            .insert(
+                vec![0.0_f32, 1.0, 0.0],
+                "expire".into(),
+                "expire-text".into(),
+                M,
+            )
+            .unwrap();
+        let u_inv = idx
+            .insert(vec![0.0_f32, 0.0, 1.0], "inv".into(), "inv-text".into(), M)
+            .unwrap();
+
+        // Path 1: evict_lru — make u_evict the LRU and call evict_lru.
+        set_access_ts(&mut idx, M, &u_evict, 100);
+        set_access_ts(&mut idx, M, &u_expire, 200);
+        set_access_ts(&mut idx, M, &u_inv, 300);
+        idx.namespaces.get_mut(M).unwrap().evict_lru(M).unwrap();
+
+        // Path 2: collect_expired — force u_expire into the past.
+        let past = now_unix_secs().saturating_sub(10);
+        set_expires_at(&mut idx, M, &u_expire, Some(past));
+        idx.collect_expired(now_unix_secs());
+
+        // Path 3: invalidate_similar — match u_inv exactly.
+        idx.invalidate_similar(&[0.0_f32, 0.0, 1.0], 0.99, M, now_unix_secs());
+
+        // None of the three texts should be in the exact-match index.
+        let ns = idx.namespaces.get(M).unwrap();
+        assert!(!ns.exact_match_index.contains_key("evict-text"));
+        assert!(!ns.exact_match_index.contains_key("expire-text"));
+        assert!(!ns.exact_match_index.contains_key("inv-text"));
     }
 }

@@ -86,6 +86,8 @@ pub struct NamespaceMetrics {
     pub deletions: AtomicU64,
     /// Semantic invalidations per namespace (M26).
     pub invalidations: AtomicU64,
+    /// Exact-match pre-filter hits per namespace (M27).
+    pub exact_match_hits: AtomicU64,
 }
 
 pub struct Metrics {
@@ -119,6 +121,9 @@ pub struct Metrics {
     pub deletions_total: AtomicU64,
     /// Semantic invalidations across all namespaces (M26).
     pub invalidations_total: AtomicU64,
+    /// Exact-match pre-filter hits across all namespaces (M27). Additive
+    /// to `queries_hit` — every exact-match is also a regular hit.
+    pub exact_match_hits_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
     pub insert_duration: LatencyHistogram,
@@ -143,6 +148,7 @@ impl Metrics {
             expirations_total: AtomicU64::new(0),
             deletions_total: AtomicU64::new(0),
             invalidations_total: AtomicU64::new(0),
+            exact_match_hits_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
             insert_duration: LatencyHistogram::new(),
@@ -293,6 +299,19 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_exact_match_hit(&self, namespace: &str) {
+        self.exact_match_hits_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_metrics.read().unwrap().get(namespace) {
+            ns.exact_match_hits.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut w = self.namespace_metrics.write().unwrap();
+        w.entry(namespace.to_string())
+            .or_default()
+            .exact_match_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn hit_rate(&self) -> f64 {
         let total = self.queries_total.load(Ordering::Relaxed);
         if total == 0 {
@@ -435,6 +454,13 @@ impl Metrics {
             "ferrocache_invalidations_total",
             "Total entries removed by semantic invalidation (POST /admin/invalidate).",
             invalidations,
+        );
+        let exact_match_hits = self.exact_match_hits_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_exact_match_hits_total",
+            "Queries resolved by the exact-match pre-filter (subset of queries_hit).",
+            exact_match_hits,
         );
 
         let total_entries: usize = index_stats.values().map(|s| s.entry_count).sum();
@@ -616,6 +642,25 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "ferrocache_namespace_invalidations{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                v
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_exact_match_hits Exact-match pre-filter hits per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_exact_match_hits counter");
+        for k in &all_ns {
+            let v = ns_metrics
+                .get(k)
+                .map(|n| n.exact_match_hits.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_exact_match_hits{{namespace=\"{}\"}} {}",
                 escape_label(k),
                 v
             );

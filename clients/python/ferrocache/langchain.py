@@ -86,6 +86,7 @@ class FerrocacheCache(BaseCache):  # type: ignore[misc]
                 embedding=embedding,
                 threshold=self._threshold,
                 model_id=self._model_id,
+                query_text=prompt,  # M27 exact-match pre-filter
             )
         except FerrocacheError as e:
             if not self._fail_open:

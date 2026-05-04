@@ -76,6 +76,7 @@ class FerrocacheTools:
                 embedding=embedding,
                 threshold=t,
                 model_id=self.model_id,
+                query_text=query_text,  # M27 exact-match pre-filter
             )
         except FerrocacheError as e:
             log.warning("ferrocache lookup failed: %s", e)

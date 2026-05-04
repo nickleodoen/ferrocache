@@ -296,6 +296,7 @@ mod tests {
                         id: Some("u-42".to_string()),
                         response: Some("from peer".to_string()),
                         similarity: Some(0.97),
+                        exact_match: None,
                     })
                 },
             ),
@@ -309,6 +310,7 @@ mod tests {
                     embedding: vec![1.0, 0.0],
                     threshold: 0.9,
                     model_id: Some("test::2".into()),
+                    query_text: None,
                 },
             )
             .await

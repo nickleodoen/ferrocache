@@ -164,6 +164,7 @@ async fn query_handler(
                     id: None,
                     response: None,
                     similarity: None,
+                    exact_match: None,
                 }),
             )
                 .into_response();
@@ -215,9 +216,16 @@ async fn process_query_locally(
         Some(s) if !s.trim().is_empty() => s,
         _ => return bad_request("model_id is required"),
     };
+    let now = now_unix_secs();
     let result = {
         let index = state.index.read().await;
-        index.query(&req.embedding, req.threshold, model_id)
+        index.query_with_text(
+            &req.embedding,
+            req.threshold,
+            model_id,
+            req.query_text.as_deref(),
+            now,
+        )
     };
     let elapsed = start.elapsed().as_secs_f64();
     match result {
@@ -230,7 +238,18 @@ async fn process_query_locally(
                 idx.record_access(model_id, hit.internal_id);
             }
             state.metrics.record_query_hit(model_id, elapsed);
-            tracing::info!(hit = true, similarity = hit.similarity, dim, "query");
+            // M27: exact-match hits are ALSO regular hits. The new
+            // counter is a subcategory, not an alternative.
+            if hit.exact_match {
+                state.metrics.record_exact_match_hit(model_id);
+            }
+            tracing::info!(
+                hit = true,
+                similarity = hit.similarity,
+                exact_match = hit.exact_match,
+                dim,
+                "query"
+            );
             (
                 StatusCode::OK,
                 Json(QueryResponse {
@@ -238,6 +257,7 @@ async fn process_query_locally(
                     id: Some(hit.id),
                     response: Some(hit.response),
                     similarity: Some(hit.similarity),
+                    exact_match: Some(hit.exact_match),
                 }),
             )
                 .into_response()
@@ -270,6 +290,7 @@ async fn process_query_locally(
                     id: None,
                     response: None,
                     similarity: None,
+                    exact_match: None,
                 }),
             )
                 .into_response()
@@ -1109,6 +1130,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
         expirations_total: m.expirations_total.load(Ordering::Relaxed),
         deletions_total: m.deletions_total.load(Ordering::Relaxed),
         invalidations_total: m.invalidations_total.load(Ordering::Relaxed),
+        exact_match_hits_total: m.exact_match_hits_total.load(Ordering::Relaxed),
     };
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
@@ -2635,6 +2657,104 @@ mod tests {
         let r = app.oneshot(get("/metrics")).await.unwrap();
         let text = body_text(r.into_body()).await;
         assert!(text.contains("ferrocache_invalidations_total 2"), "{text}");
+    }
+
+    // --- M27: exact-match pre-filter via HTTP -----------------------------
+
+    #[tokio::test]
+    async fn test_exact_match_via_http() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "Paris",
+            "query_text": "What is the capital of France?",
+            "model_id": MID,
+            "uuid": "exact-target",
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+
+        // Probe with a totally different embedding. Pre-filter wins.
+        let q = json!({
+            "embedding": [0.0_f32, 0.0, 1.0],
+            "threshold": 0.99,
+            "model_id": MID,
+            "query_text": "WHAT IS THE CAPITAL OF FRANCE?",
+        });
+        let r = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = body_json(r.into_body()).await;
+        assert_eq!(body["hit"], true);
+        assert_eq!(body["exact_match"], true);
+        assert_eq!(body["id"], "exact-target");
+        assert!((body["similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_query_without_query_text_omits_exact_match() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "indexed",
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        let q = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.9,
+            "model_id": MID,
+        });
+        let r = app
+            .oneshot(post_json("/query?local=true", q))
+            .await
+            .unwrap();
+        let body = body_json(r.into_body()).await;
+        assert_eq!(body["hit"], true);
+        // ANN hit reports exact_match: false.
+        assert_eq!(body["exact_match"], false);
+    }
+
+    #[tokio::test]
+    async fn test_exact_match_metric() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "r",
+            "query_text": "metric-text",
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        // Two queries with the exact text → 2 exact-match hits.
+        for _ in 0..2 {
+            let q = json!({
+                "embedding": [0.0_f32, 0.0, 1.0],
+                "threshold": 0.99,
+                "model_id": MID,
+                "query_text": "metric-text",
+            });
+            app.clone()
+                .oneshot(post_json("/query?local=true", q))
+                .await
+                .unwrap();
+        }
+        let r = app.oneshot(get("/metrics")).await.unwrap();
+        let text = body_text(r.into_body()).await;
+        assert!(
+            text.contains("ferrocache_exact_match_hits_total 2"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
