@@ -37,6 +37,10 @@ pub struct SnapshotEntry {
     /// stays bincode-compatible without a version bump.
     #[serde(default)]
     pub tombstone: bool,
+    /// Per-entry TTL deadline (M26). Unix seconds; `None` means no expiry.
+    /// Survives compaction so a snapshotted entry's expiry is preserved.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -183,6 +187,7 @@ mod tests {
             last_accessed_at: 0,
             access_count: 0,
             tombstone: false,
+            expires_at: None,
         }
     }
 
@@ -266,6 +271,7 @@ mod tests {
                 sequence: 0,
                 inserted_at: 0,
                 tombstone: false,
+                expires_at: None,
             };
             wal.append(&we).await.unwrap();
             index.replay_entry(we).unwrap();
@@ -294,6 +300,7 @@ mod tests {
             sequence: 0,
             inserted_at: 0,
             tombstone: false,
+            expires_at: None,
         };
         let s = wal.append(&we).await.unwrap();
         assert_eq!(s, 4);

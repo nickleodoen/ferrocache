@@ -7,7 +7,8 @@ use reqwest::Client;
 
 use crate::metrics::Metrics;
 use crate::models::{
-    FullEntryResponse, InsertRequest, InsertResponse, QueryRequest, QueryResponse,
+    FullEntryResponse, InsertRequest, InsertResponse, InvalidateRequest, InvalidateResponse,
+    QueryRequest, QueryResponse,
 };
 use crate::tls::TlsBundle;
 
@@ -129,6 +130,42 @@ impl ClusterRouter {
         let resp = resp.error_for_status()?;
         let body = resp.json::<FullEntryResponse>().await?;
         Ok(Some(body))
+    }
+
+    /// Fire-and-forget delete forward (M26). Returns the HTTP status so
+    /// the caller can distinguish 200 (peer had the entry) from 404
+    /// (peer didn't — idempotent success). Never retries: the local
+    /// node already removed the entry, so a slow/down peer is allowed
+    /// to miss this and pick up the tombstone on next replay or the
+    /// next time the user does anything.
+    pub async fn forward_delete_entry(
+        &self,
+        target_addr: &str,
+        uuid: &str,
+    ) -> reqwest::Result<reqwest::StatusCode> {
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/entry/{uuid}?local=true");
+        let resp = self.with_auth(self.client.delete(&url)).send().await?;
+        Ok(resp.status())
+    }
+
+    /// Forward `/admin/invalidate` to a peer (M26). Each replica computes
+    /// its own matches against the same embedding+threshold; we don't
+    /// share the UUID list because it'd assume every replica has the
+    /// same internal state (which is true today but a fragile contract).
+    pub async fn forward_invalidate(
+        &self,
+        target_addr: &str,
+        req: &InvalidateRequest,
+    ) -> reqwest::Result<InvalidateResponse> {
+        let scheme = self.scheme();
+        let url = format!("{scheme}://{target_addr}/admin/invalidate?local=true");
+        let resp = self
+            .with_auth(self.client.post(&url).json(req))
+            .send()
+            .await?;
+        let resp = resp.error_for_status()?;
+        resp.json::<InvalidateResponse>().await
     }
 
     /// Forward an /insert to a peer (single attempt). See `forward_query`
@@ -310,6 +347,7 @@ mod tests {
                     query_text: "q".into(),
                     model_id: Some("test::2".into()),
                     uuid: Some("u".into()),
+                    ttl_seconds: None,
                 },
             )
             .await
@@ -343,6 +381,7 @@ mod tests {
                     query_text: "q".into(),
                     model_id: Some("test::2".into()),
                     uuid: Some("fixed-uuid".into()),
+                    ttl_seconds: None,
                 },
             )
             .await
@@ -405,6 +444,7 @@ mod tests {
             query_text: "q".into(),
             model_id: Some("t::2".into()),
             uuid: Some("u".into()),
+            ttl_seconds: None,
         }
     }
 
@@ -468,6 +508,7 @@ mod tests {
                     inserted_at: 0,
                     last_accessed_at: 0,
                     access_count: 0,
+                    expires_at: None,
                 })
             }),
         );

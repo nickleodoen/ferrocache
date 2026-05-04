@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::future::join_all;
 use serde::Deserialize;
@@ -18,8 +18,9 @@ use crate::failure_detector::PeerStatus;
 use crate::index::now_unix_secs;
 use crate::metrics::METRICS_CONTENT_TYPE;
 use crate::models::{
-    ClusterStatusResponse, CompactResponse, CountersResponse, EntryStatsResponse, ErrorResponse,
-    FullEntryResponse, HealthResponse, InsertRequest, InsertResponse, NamespaceStatsEntry,
+    ClusterStatusResponse, CompactResponse, CountersResponse, DeleteEntryResponse,
+    EntryStatsResponse, ErrorResponse, FullEntryResponse, HealthResponse, InsertRequest,
+    InsertResponse, InvalidateRequest, InvalidateResponse, NamespaceStatsEntry,
     NamespaceTopEntries, PeerHealth, QueryRequest, QueryResponse, ReadRepairRequest,
     ReadRepairResponse, StatsHnsw, StatsResponse, TopEntryRow,
 };
@@ -77,6 +78,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/cluster/status", get(cluster_status_handler))
         .route("/admin/compact", post(compact_handler))
         .route("/admin/entry-stats", get(entry_stats_handler))
+        .route("/admin/invalidate", post(invalidate_handler))
+        .route("/entry/:uuid", delete(delete_entry_handler))
         .route("/metrics", get(metrics_handler))
         // Read-repair internal endpoints (M23). Both follow the same auth
         // pattern as the public routes — they're cluster-internal calls
@@ -399,6 +402,9 @@ async fn perform_repair(
         // repaired side, which is fine — the next query will bump them.
         inserted_at: full.inserted_at,
         tombstone: false,
+        // M26: TTL deadline rides through read-repair too — evicting on
+        // schedule is more important than which node owns the timer.
+        expires_at: full.expires_at,
     };
 
     let (tx, rx) = oneshot::channel();
@@ -566,6 +572,8 @@ async fn local_insert_inner(
         .uuid
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let inserted_at = now_unix_secs();
+    let expires_at = req.ttl_seconds.map(|t| inserted_at.saturating_add(t));
     let entry = WalEntry {
         uuid: uuid.clone(),
         embedding: req.embedding.clone(),
@@ -573,8 +581,9 @@ async fn local_insert_inner(
         query_text: req.query_text.clone(),
         model_id: model_id.clone(),
         sequence: 0, // stamped by the flush task
-        inserted_at: now_unix_secs(),
+        inserted_at,
         tombstone: false,
+        expires_at,
     };
 
     let (tx, rx) = oneshot::channel();
@@ -653,6 +662,7 @@ async fn get_entry_handler(
                 inserted_at: e.inserted_at,
                 last_accessed_at: e.last_accessed_at,
                 access_count: e.access_count,
+                expires_at: e.expires_at,
             }),
         )
             .into_response(),
@@ -698,6 +708,7 @@ async fn read_repair_handler(
         // (the public ReadRepairRequest predates M24); stamp now.
         inserted_at: now_unix_secs(),
         tombstone: false,
+        expires_at: None,
     };
     let (tx, rx) = oneshot::channel();
     if state
@@ -840,6 +851,183 @@ async fn entry_stats_handler(State(state): State<Arc<AppState>>) -> Json<EntrySt
     Json(EntryStatsResponse { namespaces })
 }
 
+fn not_found(msg: impl Into<String>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: msg.into() }),
+    )
+        .into_response()
+}
+
+/// `DELETE /entry/:uuid` (M26). Removes the entry locally, writes a
+/// tombstone through the WAL channel, and (when not `?local=true`) fans
+/// out the same delete to every peer in the ring. Replica 404 is treated
+/// as idempotent success — the entry just didn't live there.
+async fn delete_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Path(uuid): Path<String>,
+    Query(params): Query<LocalParam>,
+) -> Response {
+    if uuid.trim().is_empty() {
+        return bad_request("uuid is required");
+    }
+
+    // Resolve the namespace under a read lock first — cheap, doesn't block
+    // queries.
+    let model_id = {
+        let idx = state.index.read().await;
+        idx.namespace_for(&uuid).map(str::to_string)
+    };
+
+    let Some(model_id) = model_id else {
+        // Even on a 404 we still fan out — peers might still have it. But
+        // for the common case (UUID just doesn't exist anywhere), this
+        // returns immediately.
+        return not_found("entry not found");
+    };
+
+    // Local removal under write lock.
+    {
+        let mut idx = state.index.write().await;
+        idx.remove_by_uuid(&uuid);
+    }
+
+    // Tombstone via the WAL channel — the flush task batches it into the
+    // next group fsync. We wait for the oneshot so the response is only
+    // returned after the tombstone is durable.
+    let tomb = WalEntry::tombstone_entry(uuid.clone(), model_id.clone());
+    let (tx, rx) = oneshot::channel();
+    if state
+        .wal
+        .sender()
+        .send(WalCommand::Insert(WalInsertRequest {
+            entry: tomb,
+            respond: tx,
+        }))
+        .await
+        .is_err()
+    {
+        tracing::error!("WAL channel closed during delete");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "persistence failed".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let _ = rx.await;
+
+    state.metrics.record_deletion(&model_id);
+
+    // Cluster fan-out (skip when local-only). We don't know which peers
+    // hold a replica without an embedding, so blast to all live peers.
+    // Replica 404 is fine.
+    if !params.is_local()
+        && let Some(cluster) = state.cluster.as_ref()
+        && let Some(router) = state.router.as_ref()
+    {
+        let peers = cluster.all_peer_addrs().await;
+        for (peer_id, peer_addr) in peers {
+            if cluster.peer_status(&peer_id).await == PeerStatus::Dead {
+                continue;
+            }
+            match router.forward_delete_entry(&peer_addr, &uuid).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, error = %e, "delete forward failed");
+                }
+            }
+        }
+    }
+
+    tracing::info!(%uuid, model_id = %model_id, "entry deleted");
+    (StatusCode::OK, Json(DeleteEntryResponse { deleted: true })).into_response()
+}
+
+/// `POST /admin/invalidate` (M26). Sweeps the namespace for entries with
+/// cosine similarity ≥ threshold, evicts them, writes tombstones, and
+/// fans out the same request to peers (each replica computes its own
+/// matches, which should be identical assuming the cluster is in sync).
+async fn invalidate_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LocalParam>,
+    Json(req): Json<InvalidateRequest>,
+) -> Response {
+    if let Err(msg) = validate_embedding(&req.embedding) {
+        return bad_request(msg);
+    }
+    if let Err(msg) = validate_model_id(req.model_id.as_deref()) {
+        return bad_request(msg);
+    }
+    if !(0.0..=1.0).contains(&req.threshold) {
+        return bad_request(format!(
+            "threshold {} out of range [0.0, 1.0]",
+            req.threshold
+        ));
+    }
+    let model_id = req.model_id.clone().expect("validated above");
+
+    // Find + remove under one write lock.
+    let now = now_unix_secs();
+    let removed_uuids: Vec<String> = {
+        let mut idx = state.index.write().await;
+        idx.invalidate_similar(&req.embedding, req.threshold, &model_id, now)
+    };
+
+    // Tombstones for each invalidated entry.
+    for uuid in &removed_uuids {
+        let tomb = WalEntry::tombstone_entry(uuid.clone(), model_id.clone());
+        let (tx, rx) = oneshot::channel();
+        if state
+            .wal
+            .sender()
+            .send(WalCommand::Insert(WalInsertRequest {
+                entry: tomb,
+                respond: tx,
+            }))
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+        state.metrics.record_invalidation(&model_id);
+    }
+
+    // Cluster fan-out: each peer computes its own matches.
+    if !params.is_local()
+        && let Some(cluster) = state.cluster.as_ref()
+        && let Some(router) = state.router.as_ref()
+    {
+        let peers = cluster.all_peer_addrs().await;
+        for (peer_id, peer_addr) in peers {
+            if cluster.peer_status(&peer_id).await == PeerStatus::Dead {
+                continue;
+            }
+            match router.forward_invalidate(&peer_addr, &req).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, error = %e, "invalidate forward failed");
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        invalidated = removed_uuids.len(),
+        model_id = %model_id,
+        "invalidate completed"
+    );
+    (
+        StatusCode::OK,
+        Json(InvalidateResponse {
+            invalidated_count: removed_uuids.len(),
+            uuids: removed_uuids,
+        }),
+    )
+        .into_response()
+}
+
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let count = state.index.read().await.entry_count() as u64;
     Json(HealthResponse {
@@ -918,6 +1106,9 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse
         read_repair_failures: m.read_repair_failures_total.load(Ordering::Relaxed),
         evictions_total: m.evictions_total.load(Ordering::Relaxed),
         index_rebuilds: m.index_rebuilds_total.load(Ordering::Relaxed),
+        expirations_total: m.expirations_total.load(Ordering::Relaxed),
+        deletions_total: m.deletions_total.load(Ordering::Relaxed),
+        invalidations_total: m.invalidations_total.load(Ordering::Relaxed),
     };
     Json(StatsResponse {
         entry_count: index.entry_count() as u64,
@@ -1809,6 +2000,7 @@ mod tests {
                     sequence: 0,
                     inserted_at: 0,
                     tombstone: false,
+                    expires_at: None,
                 })
                 .await
                 .unwrap();
@@ -2192,6 +2384,257 @@ mod tests {
             text.contains("ferrocache_evictions_total 3"),
             "evictions metric not 3 in:\n{text}"
         );
+    }
+
+    // --- M26: TTL + delete + invalidate -----------------------------------
+
+    #[tokio::test]
+    async fn test_insert_with_ttl() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "ephemeral",
+            "query_text": "q",
+            "model_id": MID,
+            "uuid": "ttl-target",
+            "ttl_seconds": 3600,
+        });
+        let r = app
+            .clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let r = app
+            .oneshot(get("/internal/entry/ttl-target?local=true"))
+            .await
+            .unwrap();
+        let body = body_json(r.into_body()).await;
+        let exp = body["expires_at"].as_u64().unwrap();
+        let inserted_at = body["inserted_at"].as_u64().unwrap();
+        assert_eq!(exp, inserted_at + 3600);
+    }
+
+    #[tokio::test]
+    async fn test_insert_without_ttl_no_expiry() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "forever",
+            "query_text": "q",
+            "model_id": MID,
+            "uuid": "no-ttl",
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+        let r = app
+            .oneshot(get("/internal/entry/no-ttl?local=true"))
+            .await
+            .unwrap();
+        let body = body_json(r.into_body()).await;
+        // Skip-serializing-if-none means the field is absent.
+        assert!(body.get("expires_at").is_none_or(|v| v.is_null()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_entry_success() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "response": "doomed",
+            "query_text": "q",
+            "model_id": MID,
+            "uuid": "del-1",
+        });
+        app.clone()
+            .oneshot(post_json("/insert?local=true", payload))
+            .await
+            .unwrap();
+
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/entry/del-1?local=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = body_json(r.into_body()).await;
+        assert_eq!(body["deleted"], true);
+
+        // Entry is gone.
+        let r = app
+            .oneshot(get("/internal/entry/del-1?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_entry_not_found() {
+        let (app, _, _dir) = test_app().await;
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/entry/nonexistent?local=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_removes_similar() {
+        let (app, _, _dir) = test_app().await;
+        let r2 = std::f32::consts::FRAC_1_SQRT_2;
+        // A and B sit in the +x/+xy region (sim ≥ 0.70 to probe). C is orthogonal.
+        for (uuid, vec) in [
+            ("A", vec![1.0_f32, 0.0, 0.0]),
+            ("B", vec![r2, r2, 0.0]),
+            ("C", vec![0.0_f32, 0.0, 1.0]),
+        ] {
+            let payload = json!({
+                "embedding": vec,
+                "response": format!("r-{uuid}"),
+                "query_text": "q",
+                "model_id": MID,
+                "uuid": uuid,
+            });
+            app.clone()
+                .oneshot(post_json("/insert?local=true", payload))
+                .await
+                .unwrap();
+        }
+
+        let inv = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.70,
+            "model_id": MID,
+        });
+        let r = app
+            .clone()
+            .oneshot(post_json("/admin/invalidate?local=true", inv))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = body_json(r.into_body()).await;
+        assert_eq!(body["invalidated_count"], 2);
+
+        // C survives.
+        let r = app
+            .clone()
+            .oneshot(get("/internal/entry/C?local=true"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        // A and B are gone.
+        for uuid in ["A", "B"] {
+            let r = app
+                .clone()
+                .oneshot(get(&format!("/internal/entry/{uuid}?local=true")))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{uuid} should be gone");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_requires_model_id() {
+        let (app, _, _dir) = test_app().await;
+        let payload = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.9,
+        });
+        let r = app
+            .oneshot(post_json("/admin/invalidate?local=true", payload))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_expired_entry_survives_restart() {
+        // Insert with a manually-stamped past expires_at via WAL append +
+        // tombstone, then replay into a fresh index. The tombstone wins,
+        // so the entry is gone after restart.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("expsr.wal");
+
+        let mut wal = Wal::open(&wal_path).await.unwrap();
+        // 1) An entry with an already-elapsed TTL.
+        wal.append(&WalEntry {
+            uuid: "ephemeral".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            response: "r".into(),
+            query_text: "q".into(),
+            model_id: MID.into(),
+            sequence: 0,
+            inserted_at: 100,
+            tombstone: false,
+            expires_at: Some(101), // expired ages ago
+        })
+        .await
+        .unwrap();
+        // 2) The reaper would have written a tombstone — simulate.
+        wal.append(&WalEntry::tombstone_entry("ephemeral".into(), MID.into()))
+            .await
+            .unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&wal_path).await.unwrap();
+        let mut idx = SemanticIndex::new(&HnswConfig::default());
+        for e in entries {
+            if e.tombstone {
+                idx.remove_by_uuid(&e.uuid);
+            } else {
+                let _ = idx.replay_entry(e);
+            }
+        }
+        assert!(
+            idx.get_entry_by_uuid("ephemeral").is_none(),
+            "tombstone wins on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_metric() {
+        let (app, _, _dir) = test_app().await;
+        // Insert two similar entries.
+        for uuid in ["m1", "m2"] {
+            let payload = json!({
+                "embedding": [1.0_f32, 0.0, 0.0],
+                "response": "r",
+                "query_text": "q",
+                "model_id": MID,
+                "uuid": uuid,
+            });
+            app.clone()
+                .oneshot(post_json("/insert?local=true", payload))
+                .await
+                .unwrap();
+        }
+        let inv = json!({
+            "embedding": [1.0_f32, 0.0, 0.0],
+            "threshold": 0.95,
+            "model_id": MID,
+        });
+        app.clone()
+            .oneshot(post_json("/admin/invalidate?local=true", inv))
+            .await
+            .unwrap();
+        let r = app.oneshot(get("/metrics")).await.unwrap();
+        let text = body_text(r.into_body()).await;
+        assert!(text.contains("ferrocache_invalidations_total 2"), "{text}");
     }
 
     #[tokio::test]

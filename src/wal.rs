@@ -53,6 +53,11 @@ pub struct WalEntry {
     /// `tombstone`, and `sequence` matter.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tombstone: bool,
+    /// Per-entry TTL deadline (M26). Unix seconds; `None` means no expiry.
+    /// Computed at insert time from `inserted_at + ttl_seconds`. Pre-M26
+    /// WAL entries default to `None` via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -72,6 +77,7 @@ impl WalEntry {
             sequence: 0,
             inserted_at: 0,
             tombstone: true,
+            expires_at: None,
         }
     }
 }
@@ -609,6 +615,7 @@ mod tests {
             sequence: 0,
             inserted_at: 0,
             tombstone: false,
+            expires_at: None,
         }
     }
 
@@ -798,6 +805,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wal_expires_at_roundtrip() {
+        // M26: append entry with explicit expires_at, replay, assert round-trip.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut wal = Wal::open(&path).await.unwrap();
+        let mut e = sample("with-ttl", "r");
+        e.expires_at = Some(1_714_500_000);
+        wal.append(&e).await.unwrap();
+        // Also append one without TTL to verify it stays None.
+        let e2 = sample("no-ttl", "r2");
+        wal.append(&e2).await.unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].expires_at, Some(1_714_500_000));
+        assert_eq!(entries[1].expires_at, None);
+    }
+
+    #[tokio::test]
     async fn test_tombstone_after_snapshot() {
         // M25: snapshot has u-snap; WAL tail tombstones it. Replay
         // snapshot first, then WAL tail → u-snap is gone.
@@ -816,6 +845,7 @@ mod tests {
             last_accessed_at: 1000,
             access_count: 0,
             tombstone: false,
+            expires_at: None,
         })
         .unwrap();
         assert!(idx.get_entry_by_uuid("u-snap").is_some());
@@ -937,6 +967,7 @@ mod tests {
             sequence: 0,
             inserted_at: 0,
             tombstone: false,
+            expires_at: None,
         }
     }
 

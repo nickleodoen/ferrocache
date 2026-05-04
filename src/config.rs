@@ -26,6 +26,11 @@ pub struct FerrocacheConfig {
     /// current batch after the first one arrives.
     #[serde(default = "default_wal_batch_timeout_ms")]
     pub wal_batch_timeout_ms: u64,
+    /// Seconds between TTL reaper scans (M26). The reaper sweeps every
+    /// namespace under the index write lock, evicts expired entries, and
+    /// writes tombstones. Default 60s; set to 0 to disable.
+    #[serde(default = "default_expire_scan_interval_secs")]
+    pub expire_scan_interval_secs: u64,
 }
 
 fn default_compact_interval_inserts() -> u64 {
@@ -38,6 +43,10 @@ fn default_wal_batch_size() -> usize {
 
 fn default_wal_batch_timeout_ms() -> u64 {
     1
+}
+
+fn default_expire_scan_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,6 +182,7 @@ impl Default for FerrocacheConfig {
             auth_token: None,
             wal_batch_size: default_wal_batch_size(),
             wal_batch_timeout_ms: default_wal_batch_timeout_ms(),
+            expire_scan_interval_secs: default_expire_scan_interval_secs(),
         }
     }
 }
@@ -248,6 +258,10 @@ impl FerrocacheConfig {
             )?
             .set_default("wal_batch_size", defaults.wal_batch_size as i64)?
             .set_default("wal_batch_timeout_ms", defaults.wal_batch_timeout_ms as i64)?
+            .set_default(
+                "expire_scan_interval_secs",
+                defaults.expire_scan_interval_secs as i64,
+            )?
             .add_source(File::with_name("ferrocache").required(false))
             .add_source(
                 // FERROCACHE_PORT → port; FERROCACHE_CLUSTER__ENABLED → cluster.enabled.
@@ -304,5 +318,6 @@ mod tests {
         assert!(c.cluster.read_repair_enabled);
         assert_eq!(c.wal_batch_size, 256);
         assert_eq!(c.wal_batch_timeout_ms, 1);
+        assert_eq!(c.expire_scan_interval_secs, 60);
     }
 }

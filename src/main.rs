@@ -7,14 +7,68 @@ use tracing_subscriber::EnvFilter;
 
 use ferrocache::cluster::ClusterState;
 use ferrocache::config::FerrocacheConfig;
-use ferrocache::index::SemanticIndex;
+use ferrocache::index::{SemanticIndex, now_unix_secs};
 use ferrocache::metrics::Metrics;
 use ferrocache::router::ClusterRouter;
 use ferrocache::server;
 use ferrocache::snapshot;
 use ferrocache::state::AppState;
 use ferrocache::tls;
-use ferrocache::wal::{DEFAULT_CHANNEL_CAPACITY, GroupCommitConfig, GroupCommitWal, Wal};
+use ferrocache::wal::{
+    DEFAULT_CHANNEL_CAPACITY, GroupCommitConfig, GroupCommitWal, InsertRequest as WalInsertRequest,
+    Wal, WalCommand, WalEntry,
+};
+
+/// Background TTL reaper (M26). Wakes every `interval`, takes the index
+/// write lock once, sweeps every namespace for entries past their
+/// `expires_at`, removes them in-memory, drops the lock, and writes a
+/// tombstone for each through the WAL channel (the flush task batches
+/// them). Failures (channel closed, flush task drop) are logged but never
+/// crash the loop — a missed reap just means the stale entries stay in the
+/// side-table until the next tick.
+async fn expiry_reaper_loop(
+    index: Arc<RwLock<SemanticIndex>>,
+    wal: GroupCommitWal,
+    metrics: Arc<Metrics>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // Skip the immediate first tick — startup already ran one expiry pass.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let now = now_unix_secs();
+        let expired: Vec<(String, String)> = {
+            let mut idx = index.write().await;
+            idx.collect_expired(now)
+        };
+        if expired.is_empty() {
+            continue;
+        }
+        tracing::info!(count = expired.len(), "TTL reaper: entries expired");
+        for (uuid, model_id) in expired {
+            let tomb = WalEntry::tombstone_entry(uuid.clone(), model_id.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if wal
+                .sender()
+                .send(WalCommand::Insert(WalInsertRequest {
+                    entry: tomb,
+                    respond: tx,
+                }))
+                .await
+                .is_err()
+            {
+                tracing::warn!(%uuid, "TTL reaper: WAL channel closed");
+                continue;
+            }
+            // Best-effort wait — the entry's already gone from the index.
+            // If the flush task drops the reply we still bump the metric;
+            // the next tombstone replay will idempotently succeed.
+            let _ = rx.await;
+            metrics.record_expiration(&model_id);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -111,6 +165,19 @@ async fn main() -> anyhow::Result<()> {
         snapshot_watermark = watermark,
         "startup replay complete"
     );
+
+    // M26: one-shot expiry pass on startup. Catches anything that expired
+    // while the process was down. Runs BEFORE the listener binds so we
+    // never serve a stale entry. Tombstones for these are written below
+    // after the flush task spawns.
+    let now_startup = now_unix_secs();
+    let startup_expired: Vec<(String, String)> = index.collect_expired(now_startup);
+    if !startup_expired.is_empty() {
+        tracing::info!(
+            count = startup_expired.len(),
+            "startup expiry pass evicted entries"
+        );
+    }
 
     let wal = Wal::open_with_sequence(&config.wal_path, max_seq)
         .await
@@ -224,6 +291,45 @@ async fn main() -> anyhow::Result<()> {
         group_commit_config,
         config.hnsw.clone(),
     );
+
+    // Now that the flush task is up, write tombstones for entries the
+    // startup expiry pass evicted (if any). Each goes through the WAL
+    // channel — the flush task batches them into one fsync.
+    for (uuid, model_id) in startup_expired {
+        let tomb = WalEntry::tombstone_entry(uuid, model_id.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if wal_handle
+            .sender()
+            .send(WalCommand::Insert(WalInsertRequest {
+                entry: tomb,
+                respond: tx,
+            }))
+            .await
+            .is_ok()
+        {
+            let _ = rx.await; // ignore — best-effort tombstone
+            metrics.record_expiration(&model_id);
+        }
+    }
+
+    // M26: background TTL reaper. Skipped when the interval is 0 (operator
+    // wants to disable expiry-driven eviction entirely — the inline
+    // expires_at check still applies on query, just no proactive cleanup).
+    if config.expire_scan_interval_secs > 0 {
+        let reaper_index = index_arc.clone();
+        let reaper_metrics = metrics.clone();
+        let reaper_wal = wal_handle.clone();
+        let interval = Duration::from_secs(config.expire_scan_interval_secs);
+        tokio::spawn(async move {
+            expiry_reaper_loop(reaper_index, reaper_wal, reaper_metrics, interval).await;
+        });
+        tracing::info!(
+            interval_secs = config.expire_scan_interval_secs,
+            "TTL reaper started"
+        );
+    } else {
+        tracing::info!("TTL reaper disabled (expire_scan_interval_secs=0)");
+    }
 
     let state = Arc::new(AppState::new(
         node_id,

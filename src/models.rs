@@ -37,6 +37,11 @@ pub struct InsertRequest {
     /// replicas store the same id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
+    /// Per-entry TTL in seconds (M26). When set, the entry expires
+    /// `ttl_seconds` after its `inserted_at` timestamp; query hits past
+    /// the deadline return miss and a background reaper writes a tombstone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +69,10 @@ pub struct FullEntryResponse {
     pub last_accessed_at: u64,
     #[serde(default)]
     pub access_count: u64,
+    /// TTL deadline (M26) — `None` means no expiry. Carried over the wire
+    /// so read-repair preserves expiry on the receiving node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 /// Wire format for `POST /internal/read-repair`. Same shape as a normal
@@ -82,6 +91,31 @@ pub struct ReadRepairRequest {
 pub struct ReadRepairResponse {
     pub status: String,
     pub repaired: bool,
+}
+
+/// `DELETE /entry/:uuid` response (M26). `deleted` is `true` for any 200
+/// OK; 404 carries an `ErrorResponse` instead.
+#[derive(Debug, Serialize)]
+pub struct DeleteEntryResponse {
+    pub deleted: bool,
+}
+
+/// `POST /admin/invalidate` request (M26). Same shape as a query — a
+/// vector + threshold + namespace — but evicts every entry whose cosine
+/// similarity is at or above the threshold instead of returning the best
+/// match.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvalidateRequest {
+    pub embedding: Vec<f32>,
+    pub threshold: f32,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvalidateResponse {
+    pub invalidated_count: usize,
+    pub uuids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +156,12 @@ pub struct CountersResponse {
     pub evictions_total: u64,
     /// HNSW rebuilds (M25).
     pub index_rebuilds: u64,
+    /// TTL expirations (M26).
+    pub expirations_total: u64,
+    /// Explicit deletions via `DELETE /entry/:uuid` (M26).
+    pub deletions_total: u64,
+    /// Semantic invalidations via `POST /admin/invalidate` (M26).
+    pub invalidations_total: u64,
 }
 
 #[derive(Debug, Serialize)]

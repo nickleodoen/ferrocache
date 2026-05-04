@@ -80,6 +80,12 @@ pub struct NamespaceMetrics {
     pub inserts: AtomicU64,
     /// LRU evictions per namespace (M25).
     pub evictions: AtomicU64,
+    /// TTL expirations per namespace (M26).
+    pub expirations: AtomicU64,
+    /// Explicit deletions per namespace (M26).
+    pub deletions: AtomicU64,
+    /// Semantic invalidations per namespace (M26).
+    pub invalidations: AtomicU64,
 }
 
 pub struct Metrics {
@@ -107,6 +113,12 @@ pub struct Metrics {
     /// HNSW rebuilds completed (M25). Each rebuild reclaims graph
     /// connectivity wasted by ghost (evicted) nodes.
     pub index_rebuilds_total: AtomicU64,
+    /// TTL expirations across all namespaces (M26).
+    pub expirations_total: AtomicU64,
+    /// Explicit deletions across all namespaces (M26).
+    pub deletions_total: AtomicU64,
+    /// Semantic invalidations across all namespaces (M26).
+    pub invalidations_total: AtomicU64,
     pub namespace_metrics: RwLock<HashMap<String, NamespaceMetrics>>,
     pub query_duration: LatencyHistogram,
     pub insert_duration: LatencyHistogram,
@@ -128,6 +140,9 @@ impl Metrics {
             read_repair_failures_total: AtomicU64::new(0),
             evictions_total: AtomicU64::new(0),
             index_rebuilds_total: AtomicU64::new(0),
+            expirations_total: AtomicU64::new(0),
+            deletions_total: AtomicU64::new(0),
+            invalidations_total: AtomicU64::new(0),
             namespace_metrics: RwLock::new(HashMap::new()),
             query_duration: LatencyHistogram::new(),
             insert_duration: LatencyHistogram::new(),
@@ -237,6 +252,45 @@ impl Metrics {
 
     pub fn record_rebuild(&self) {
         self.index_rebuilds_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_expiration(&self, namespace: &str) {
+        self.expirations_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_metrics.read().unwrap().get(namespace) {
+            ns.expirations.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut w = self.namespace_metrics.write().unwrap();
+        w.entry(namespace.to_string())
+            .or_default()
+            .expirations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_deletion(&self, namespace: &str) {
+        self.deletions_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_metrics.read().unwrap().get(namespace) {
+            ns.deletions.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut w = self.namespace_metrics.write().unwrap();
+        w.entry(namespace.to_string())
+            .or_default()
+            .deletions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_invalidation(&self, namespace: &str) {
+        self.invalidations_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_metrics.read().unwrap().get(namespace) {
+            ns.invalidations.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut w = self.namespace_metrics.write().unwrap();
+        w.entry(namespace.to_string())
+            .or_default()
+            .invalidations
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -360,6 +414,27 @@ impl Metrics {
             "ferrocache_index_rebuilds_total",
             "HNSW index rebuilds (one per namespace whose ghost ratio exceeded the trigger).",
             rebuilds,
+        );
+        let expirations = self.expirations_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_expirations_total",
+            "Total entries removed by TTL expiry across all namespaces.",
+            expirations,
+        );
+        let deletions = self.deletions_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_deletions_total",
+            "Total explicit deletions via DELETE /entry/:uuid.",
+            deletions,
+        );
+        let invalidations = self.invalidations_total.load(Ordering::Relaxed);
+        write_counter(
+            &mut out,
+            "ferrocache_invalidations_total",
+            "Total entries removed by semantic invalidation (POST /admin/invalidate).",
+            invalidations,
         );
 
         let total_entries: usize = index_stats.values().map(|s| s.entry_count).sum();
@@ -486,6 +561,63 @@ impl Metrics {
                 "ferrocache_namespace_evicted_ghosts{{namespace=\"{}\"}} {}",
                 escape_label(k),
                 stats.evicted_ghost_count
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_expirations TTL expirations per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_expirations counter");
+        for k in &all_ns {
+            let v = ns_metrics
+                .get(k)
+                .map(|n| n.expirations.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_expirations{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                v
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_deletions Explicit deletions per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_deletions counter");
+        for k in &all_ns {
+            let v = ns_metrics
+                .get(k)
+                .map(|n| n.deletions.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_deletions{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                v
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP ferrocache_namespace_invalidations Semantic invalidations per namespace."
+        );
+        let _ = writeln!(out, "# TYPE ferrocache_namespace_invalidations counter");
+        for k in &all_ns {
+            let v = ns_metrics
+                .get(k)
+                .map(|n| n.invalidations.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "ferrocache_namespace_invalidations{{namespace=\"{}\"}} {}",
+                escape_label(k),
+                v
             );
         }
         out.push('\n');

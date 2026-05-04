@@ -50,13 +50,36 @@ class FerrocacheClient:
         response: str,
         query_text: str,
         model_id: str,
+        ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "embedding": embedding,
+            "response": response,
+            "query_text": query_text,
+            "model_id": model_id,
+        }
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = int(ttl_seconds)
+        return self._post("/insert", payload)
+
+    def delete_entry(self, uuid: str) -> dict[str, Any]:
+        """Delete a specific cache entry by UUID (M26)."""
+        if not uuid:
+            raise ValueError("uuid is required")
+        return self._delete(f"/entry/{uuid}")
+
+    def invalidate(
+        self,
+        embedding: list[float],
+        threshold: float,
+        model_id: str,
+    ) -> dict[str, Any]:
+        """Evict all entries with cosine similarity >= threshold (M26)."""
         return self._post(
-            "/insert",
+            "/admin/invalidate",
             {
                 "embedding": embedding,
-                "response": response,
-                "query_text": query_text,
+                "threshold": threshold,
                 "model_id": model_id,
             },
         )
@@ -106,6 +129,14 @@ class FerrocacheClient:
             data=body,
             headers=self._headers("application/json"),
             method="POST",
+        )
+        return self._send(req)
+
+    def _delete(self, path: str) -> dict[str, Any]:
+        req = request.Request(
+            self.base_url + path,
+            headers=self._headers(),
+            method="DELETE",
         )
         return self._send(req)
 

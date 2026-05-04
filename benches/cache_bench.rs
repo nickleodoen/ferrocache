@@ -39,6 +39,7 @@ fn make_entry(seed: u64) -> WalEntry {
         sequence: 0,
         inserted_at: 0,
         tombstone: false,
+        expires_at: None,
     }
 }
 

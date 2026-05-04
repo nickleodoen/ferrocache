@@ -184,6 +184,19 @@ impl ClusterState {
         v.sort();
         v
     }
+
+    /// Snapshot of every peer (`(node_id, api_addr)`) currently in the
+    /// ring. Used by admin operations like `DELETE /entry/:uuid` and
+    /// `/admin/invalidate`, which fan out to all peers (no embedding to
+    /// hash against the ring).
+    pub async fn all_peer_addrs(&self) -> Vec<(String, String)> {
+        let addrs = self.addrs.read().await;
+        addrs
+            .iter()
+            .filter(|(id, _)| id.as_str() != self.self_node_id())
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect()
+    }
 }
 
 /// One pass of the ring/detector reconciliation. Extracted from the spawned

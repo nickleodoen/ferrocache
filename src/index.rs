@@ -42,6 +42,8 @@ pub struct CacheEntry {
     /// Monotonically incremented on every query hit. NOT in the WAL — same
     /// reasoning as `last_accessed_at`.
     pub access_count: u64,
+    /// TTL deadline (M26). `None` = no expiry. Persisted in WAL + snapshot.
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,7 @@ pub struct FullEntry {
     pub inserted_at: u64,
     pub last_accessed_at: u64,
     pub access_count: u64,
+    pub expires_at: Option<u64>,
 }
 
 impl NamespacedIndex {
@@ -154,6 +157,7 @@ impl NamespacedIndex {
         inserted_at: u64,
         last_accessed_at: u64,
         access_count: u64,
+        expires_at: Option<u64>,
     ) -> Result<()> {
         match self.dimension {
             None => self.dimension = Some(embedding.len()),
@@ -188,6 +192,7 @@ impl NamespacedIndex {
                 inserted_at,
                 last_accessed_at,
                 access_count,
+                expires_at,
             },
         );
         Ok(())
@@ -219,6 +224,7 @@ impl NamespacedIndex {
         let want = 1 + self.evicted_ids.len().min(MAX_EVICTION_OVERSCAN);
         let neighbours = self.hnsw.search(embedding, want, self.ef_search);
 
+        let now = now_unix_secs();
         for n in neighbours {
             let internal_id = n.get_origin_id();
             // Skip ghost nodes (evicted-but-still-in-graph).
@@ -234,6 +240,14 @@ impl NamespacedIndex {
                 .entries
                 .get(&internal_id)
                 .ok_or_else(|| anyhow!("neighbour id {} not in side-table", internal_id))?;
+            // M26: TTL check. Expired entries return miss without mutating
+            // state (the reaper handles cleanup); we move on to the next
+            // candidate so a still-live neighbour can match.
+            if let Some(exp) = entry.expires_at
+                && now > exp
+            {
+                continue;
+            }
             return Ok(Some(QueryHit {
                 id: entry.uuid.clone(),
                 response: entry.response.clone(),
@@ -263,6 +277,54 @@ impl NamespacedIndex {
 
     pub fn evicted_ghost_count(&self) -> usize {
         self.evicted_ids.len()
+    }
+
+    /// Return all live (non-evicted, non-expired) entries whose cosine
+    /// similarity to `embedding` is at or above `threshold`. O(n) scan
+    /// over the side-table — used by `/admin/invalidate`, which is an
+    /// infrequent admin path. Returns `(internal_id, uuid)` pairs.
+    pub fn find_similar(
+        &self,
+        embedding: &[f32],
+        threshold: f32,
+        now: u64,
+    ) -> Vec<(usize, String)> {
+        let mut matches: Vec<(usize, String)> = Vec::new();
+        for (&id, entry) in &self.entries {
+            if self.evicted_ids.contains(&id) {
+                continue;
+            }
+            if let Some(exp) = entry.expires_at
+                && now > exp
+            {
+                continue;
+            }
+            let sim = cosine_similarity(embedding, &entry.embedding);
+            if sim >= threshold {
+                matches.push((id, entry.uuid.clone()));
+            }
+        }
+        matches
+    }
+
+    /// Drop all entries with `expires_at < now`. Returns the evicted
+    /// `(uuid, internal_id)` pairs so the caller can write tombstones.
+    pub fn collect_expired_within(&mut self, now: u64) -> Vec<(String, usize)> {
+        let expired_ids: Vec<usize> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.expires_at.is_some_and(|exp| now > exp))
+            .map(|(&id, _)| id)
+            .collect();
+        let mut out: Vec<(String, usize)> = Vec::with_capacity(expired_ids.len());
+        for id in expired_ids {
+            if let Some(entry) = self.entries.remove(&id) {
+                self.uuid_to_internal.remove(&entry.uuid);
+                self.evicted_ids.insert(id);
+                out.push((entry.uuid, id));
+            }
+        }
+        out
     }
 
     /// Evict the entry with the smallest `last_accessed_at`. O(n) scan; fine
@@ -298,6 +360,15 @@ impl NamespacedIndex {
         self.entries.remove(&internal_id);
         self.evicted_ids.insert(internal_id);
         true
+    }
+
+    /// Remove a known internal id (M26). Used by `/admin/invalidate`,
+    /// which already has the id from `find_similar`.
+    pub fn remove_internal(&mut self, internal_id: usize) -> Option<String> {
+        let entry = self.entries.remove(&internal_id)?;
+        self.uuid_to_internal.remove(&entry.uuid);
+        self.evicted_ids.insert(internal_id);
+        Some(entry.uuid)
     }
 
     /// True when a HNSW rebuild would meaningfully reclaim space. Threshold
@@ -391,6 +462,7 @@ impl SemanticIndex {
             now,
             now,
             0,
+            None,
         )?;
         self.record_uuid(&uuid, model_id);
         Ok(uuid)
@@ -404,6 +476,7 @@ impl SemanticIndex {
             query_text,
             model_id,
             inserted_at,
+            expires_at,
             ..
         } = entry;
         // Pre-M24 WAL entries lack inserted_at and deserialize to 0; for the
@@ -418,6 +491,7 @@ impl SemanticIndex {
             inserted_at,
             inserted_at,
             0,
+            expires_at,
         )?;
         self.record_uuid(&uuid, &model_id);
         Ok(())
@@ -434,6 +508,7 @@ impl SemanticIndex {
             last_accessed_at,
             access_count,
             tombstone: _, // snapshots only carry live entries by construction
+            expires_at,
         } = entry;
         self.namespace_mut(&model_id).insert_with_uuid(
             uuid.clone(),
@@ -443,6 +518,7 @@ impl SemanticIndex {
             inserted_at,
             last_accessed_at,
             access_count,
+            expires_at,
         )?;
         self.record_uuid(&uuid, &model_id);
         Ok(())
@@ -464,6 +540,7 @@ impl SemanticIndex {
             inserted_at: entry.inserted_at,
             last_accessed_at: entry.last_accessed_at,
             access_count: entry.access_count,
+            expires_at: entry.expires_at,
         })
     }
 
@@ -522,6 +599,71 @@ impl SemanticIndex {
         rebuilt
     }
 
+    /// Sweep every namespace for entries with `expires_at < now` (M26).
+    /// Removes them from the side-table + reverse maps and returns
+    /// `(uuid, model_id)` pairs so the caller can write tombstones.
+    pub fn collect_expired(&mut self, now: u64) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (model_id, ns) in self.namespaces.iter_mut() {
+            for (uuid, _id) in ns.collect_expired_within(now) {
+                out.push((uuid, model_id.clone()));
+            }
+        }
+        for (uuid, _) in &out {
+            self.uuid_to_namespace.remove(uuid);
+        }
+        out
+    }
+
+    /// Find every live entry in the namespace whose cosine similarity to
+    /// `embedding` is at or above `threshold`. Used by `/admin/invalidate`.
+    /// Returns `(internal_id, uuid)` pairs.
+    pub fn find_similar(
+        &self,
+        embedding: &[f32],
+        threshold: f32,
+        model_id: &str,
+        now: u64,
+    ) -> Vec<(usize, String)> {
+        match self.namespaces.get(model_id) {
+            Some(ns) => ns.find_similar(embedding, threshold, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Look up a UUID's owning namespace without fetching the full entry.
+    /// Cheap O(1); used by the DELETE handler to find the model_id before
+    /// taking the index write lock.
+    pub fn namespace_for(&self, uuid: &str) -> Option<&str> {
+        self.uuid_to_namespace.get(uuid).map(String::as_str)
+    }
+
+    /// Find entries in `model_id` similar to `embedding` at or above
+    /// `threshold`, remove them, and return the evicted UUIDs (M26).
+    /// Used by `/admin/invalidate`. Skips entries already evicted or
+    /// expired. Single locked operation.
+    pub fn invalidate_similar(
+        &mut self,
+        embedding: &[f32],
+        threshold: f32,
+        model_id: &str,
+        now: u64,
+    ) -> Vec<String> {
+        let mut removed: Vec<String> = Vec::new();
+        if let Some(ns) = self.namespaces.get_mut(model_id) {
+            let matches = ns.find_similar(embedding, threshold, now);
+            for (id, _uuid) in matches {
+                if let Some(uuid) = ns.remove_internal(id) {
+                    removed.push(uuid);
+                }
+            }
+        }
+        for u in &removed {
+            self.uuid_to_namespace.remove(u);
+        }
+        removed
+    }
+
     /// Flatten every namespace into a `Vec<SnapshotEntry>`. Used by
     /// compaction; the result is a complete picture of in-memory state.
     pub fn snapshot_entries(&self) -> Vec<SnapshotEntry> {
@@ -538,6 +680,7 @@ impl SemanticIndex {
                     last_accessed_at: entry.last_accessed_at,
                     access_count: entry.access_count,
                     tombstone: false,
+                    expires_at: entry.expires_at,
                 });
             }
         }
@@ -632,6 +775,24 @@ fn preview_query_text(s: &str) -> String {
     format!("{truncated}...")
 }
 
+/// Standalone cosine similarity (M26). Used by `find_similar` for the
+/// admin invalidation path — kept separate from the HNSW distance metric
+/// so the sweep is explicit and easy to test. Returns 0 if either vector
+/// is the zero vector. Mismatched lengths yield 0 (caller should validate
+/// dimension first).
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +813,7 @@ mod tests {
             inserted_at: 0,
             sequence: 0,
             tombstone: false,
+            expires_at: None,
         }
     }
 
@@ -815,6 +977,7 @@ mod tests {
             inserted_at: 1234,
             sequence: 0,
             tombstone: false,
+            expires_at: None,
         };
         idx.replay_entry(entry).unwrap();
         let got = idx.get_entry_by_uuid("fixed-uuid").unwrap();
@@ -861,6 +1024,7 @@ mod tests {
             last_accessed_at: 0,
             access_count: 0,
             tombstone: false,
+            expires_at: None,
         })
         .unwrap();
         assert_eq!(
@@ -1052,6 +1216,7 @@ mod tests {
             last_accessed_at: 6000,
             access_count: 42,
             tombstone: false,
+            expires_at: None,
         })
         .unwrap();
         let entry = idx.get_entry_by_uuid("u1").unwrap();
@@ -1274,6 +1439,159 @@ mod tests {
         assert!(idx.get_entry_by_uuid(&u).is_none());
         // Idempotent — second call returns false.
         assert!(!idx.remove_by_uuid(&u));
+    }
+
+    // --- M26: TTL + invalidation -----------------------------------------
+
+    /// Helper: directly stamp `expires_at` on the entry under M.
+    fn set_expires_at(idx: &mut SemanticIndex, model_id: &str, uuid: &str, ts: Option<u64>) {
+        let ns = idx.namespaces.get_mut(model_id).unwrap();
+        let id = *ns.uuid_to_internal.get(uuid).unwrap();
+        ns.entries.get_mut(&id).unwrap().expires_at = ts;
+    }
+
+    #[test]
+    fn test_expired_entry_query_miss() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "ephemeral".into(), "q".into(), M)
+            .unwrap();
+        // Force-expire it 10s in the past.
+        let past = now_unix_secs().saturating_sub(10);
+        set_expires_at(&mut idx, M, &u, Some(past));
+        // Query at the entry's own vector, threshold 0.9 — would hit but
+        // for the expiry check, which converts it to a miss.
+        let res = idx.query(&v, 0.9, M).unwrap();
+        assert!(res.is_none(), "expired entry must miss: {res:?}");
+    }
+
+    #[test]
+    fn test_non_expired_entry_query_hit() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "fresh".into(), "q".into(), M)
+            .unwrap();
+        let future = now_unix_secs() + 3600;
+        set_expires_at(&mut idx, M, &u, Some(future));
+        let hit = idx.query(&v, 0.9, M).unwrap().expect("must hit");
+        assert_eq!(hit.response, "fresh");
+    }
+
+    #[test]
+    fn test_no_expiry_entry_never_expires() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        idx.insert(v.clone(), "forever".into(), "q".into(), M)
+            .unwrap();
+        // expires_at defaults to None on insert; querying always hits.
+        let hit = idx.query(&v, 0.9, M).unwrap().expect("must hit");
+        assert_eq!(hit.response, "forever");
+    }
+
+    #[test]
+    fn test_collect_expired() {
+        let mut idx = test_index();
+        let u_expired = idx
+            .insert(vec![1.0, 0.0, 0.0], "expired".into(), "q".into(), M)
+            .unwrap();
+        let u_future = idx
+            .insert(vec![0.0, 1.0, 0.0], "future".into(), "q".into(), M)
+            .unwrap();
+        let u_eternal = idx
+            .insert(vec![0.0, 0.0, 1.0], "eternal".into(), "q".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        set_expires_at(&mut idx, M, &u_expired, Some(now.saturating_sub(10)));
+        set_expires_at(&mut idx, M, &u_future, Some(now + 3600));
+        set_expires_at(&mut idx, M, &u_eternal, None);
+
+        let evicted = idx.collect_expired(now);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, u_expired);
+        assert_eq!(evicted[0].1, M);
+        // Survivors still queryable.
+        assert!(idx.get_entry_by_uuid(&u_future).is_some());
+        assert!(idx.get_entry_by_uuid(&u_eternal).is_some());
+        assert!(idx.get_entry_by_uuid(&u_expired).is_none());
+    }
+
+    #[test]
+    fn test_find_similar() {
+        let mut idx = test_index();
+        // Probe vector along +x. A is identical, B is nearby (~0.92 sim),
+        // C is orthogonal (sim 0).
+        idx.insert(vec![1.0_f32, 0.0, 0.0], "A".into(), "qa".into(), M)
+            .unwrap();
+        let r2 = std::f32::consts::FRAC_1_SQRT_2;
+        idx.insert(vec![r2, r2, 0.0], "B".into(), "qb".into(), M)
+            .unwrap();
+        idx.insert(vec![0.0_f32, 0.0, 1.0], "C".into(), "qc".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        let probe = vec![1.0_f32, 0.0, 0.0];
+        let matches = idx.find_similar(&probe, 0.70, M, now);
+        // A (1.0) and B (~0.707) — 0.70 picks both, C (0) is excluded.
+        let responses: Vec<String> = matches
+            .iter()
+            .map(|(_, uuid)| idx.get_entry_by_uuid(uuid).unwrap().response)
+            .collect();
+        assert_eq!(matches.len(), 2);
+        assert!(responses.contains(&"A".to_string()));
+        assert!(responses.contains(&"B".to_string()));
+    }
+
+    #[test]
+    fn test_find_similar_filters_evicted() {
+        let mut idx = test_index();
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let u = idx
+            .insert(v.clone(), "doomed".into(), "q".into(), M)
+            .unwrap();
+        idx.remove_by_uuid(&u);
+        let now = now_unix_secs();
+        let matches = idx.find_similar(&v, 0.5, M, now);
+        assert!(matches.is_empty(), "evicted entries must be skipped");
+    }
+
+    #[test]
+    fn test_cosine_similarity_known_values() {
+        // Identical → 1.0
+        let a = [1.0_f32, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6);
+        // Orthogonal → 0.0
+        let b = [0.0_f32, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+        // Mismatched lengths → 0
+        let c = [1.0_f32, 0.0];
+        assert_eq!(cosine_similarity(&a, &c), 0.0);
+        // Zero vector → 0
+        let z = [0.0_f32, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &z), 0.0);
+    }
+
+    #[test]
+    fn test_invalidate_similar() {
+        let mut idx = test_index();
+        let r2 = std::f32::consts::FRAC_1_SQRT_2;
+        let _a = idx
+            .insert(vec![1.0_f32, 0.0, 0.0], "A".into(), "qa".into(), M)
+            .unwrap();
+        let _b = idx
+            .insert(vec![r2, r2, 0.0], "B".into(), "qb".into(), M)
+            .unwrap();
+        let c = idx
+            .insert(vec![0.0_f32, 0.0, 1.0], "C".into(), "qc".into(), M)
+            .unwrap();
+        let now = now_unix_secs();
+        let removed = idx.invalidate_similar(&[1.0, 0.0, 0.0], 0.70, M, now);
+        assert_eq!(removed.len(), 2);
+        // C survives.
+        assert!(idx.get_entry_by_uuid(&c).is_some());
+        for u in &removed {
+            assert!(idx.get_entry_by_uuid(u).is_none());
+        }
     }
 
     #[test]
