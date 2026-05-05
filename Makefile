@@ -1,4 +1,4 @@
-.PHONY: build test cluster-up cluster-down cluster-test simulate simulate-no-ml simulate-cluster bench-concurrent bench-concurrent-cluster clean
+.PHONY: build test cluster-up cluster-down cluster-test simulate simulate-no-ml simulate-cluster bench-concurrent bench-concurrent-cluster benchmark-vs-gptcache clean
 
 build:
 	cargo build --release
@@ -38,6 +38,12 @@ bench-concurrent:
 bench-concurrent-cluster:
 	@echo "Running concurrent benchmarks against 3-node cluster..."
 	python3 tests/bench_concurrent.py --url http://localhost:3001
+
+benchmark-vs-gptcache:
+	@echo "Installing optional benchmark deps (best-effort)..."
+	-pip install -q sentence-transformers gptcache psutil
+	@echo "Running ferrocache vs GPTCache benchmark (requires localhost:3000)..."
+	python3 tests/benchmark_vs_gptcache.py
 
 clean:
 	cargo clean

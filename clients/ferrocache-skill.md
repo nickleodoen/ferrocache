@@ -1,383 +1,515 @@
-# ferrocache — Skill File
+# ferrocache-skill — LLM agent reference (v1.0)
+
+Reference card for LLM coding agents (Claude Code, etc.) that need to operate ferrocache. Describes the **complete v1.0 HTTP API**, configuration, runtime behaviour, and common operational tasks.
+
+This file is the source of truth for what ferrocache exposes today. If something here disagrees with older docs, this file wins.
+
+---
 
 ## What ferrocache is
 
-ferrocache is a distributed semantic cache for LLM applications, written in
-Rust. It intercepts a query *before* it reaches an expensive LLM/API call,
-returns the cached response when an embedding-similarity search finds a hit
-above a configurable threshold, and otherwise forwards the call and stores
-the result for next time. It runs as a single binary (or a multi-node cluster
-via consistent hashing + gossip), keeps a write-ahead log + periodic
-snapshots for durability, and ships HTTP, Python, MCP, LangChain, and
-LlamaIndex clients.
+A distributed semantic cache for LLM applications. Stores `(embedding, response)` pairs and serves them by cosine-similarity nearest-neighbour lookup, so a paraphrased prompt can hit a cached answer instead of re-calling the LLM.
 
-## Running ferrocache
+- Single-binary Rust server. Default port `3000`.
+- Embedding-model-agnostic: the **client** computes embeddings and sends float vectors. ferrocache never calls an LLM or embedding model.
+- Multi-namespace: each `model_id` (composed with optional `cache_scope` and `conversation_id`) is an isolated HNSW index + side-table.
+- WAL-durable with group-commit; restart-safe.
+- Optional clustering (consistent hashing + chitchat gossip + synchronous replication + read repair).
+- Optional bearer-token auth and cluster mTLS.
 
-### Single node (binary)
+---
 
-```bash
-cargo run --release
-# or
-docker run -p 3000:3000 ghcr.io/nickleodoen/ferrocache:latest
-```
+## Endpoints
 
-The server listens on `:3000` plain HTTP. No auth, no TLS by default —
-appropriate for local development only.
+| Method | Path                  | Description                                                                                       |
+|--------|-----------------------|---------------------------------------------------------------------------------------------------|
+| POST   | `/insert`             | Insert an entry into the cache.                                                                   |
+| POST   | `/query`              | Look up the nearest neighbour above a threshold.                                                  |
+| DELETE | `/entry/:uuid`        | Delete a specific entry by UUID; cluster fan-out to all live peers.                               |
+| GET    | `/health`             | Liveness + entry count.                                                                           |
+| GET    | `/stats`              | Per-namespace breakdown + counters JSON.                                                          |
+| GET    | `/metrics`            | Prometheus text exposition.                                                                       |
+| GET    | `/cluster/status`     | Cluster membership, peer phi, dead nodes.                                                         |
+| POST   | `/admin/compact`      | Trigger WAL compaction + snapshot.                                                                |
+| POST   | `/admin/invalidate`   | Radius-delete entries by cosine similarity ≥ threshold.                                           |
+| GET    | `/admin/entry-stats`  | Top-10 most-accessed entries per namespace.                                                       |
 
-### 3-node cluster
+`POST /insert`, `POST /query`, and `POST /admin/invalidate` accept `?local=true` to skip ring routing — the request is processed only on the receiving node. Forwarded requests use this internally; it's also useful for diagnostics.
 
-```bash
-docker compose up -d --build  # 3 nodes on :3001, :3002, :3003 (host)
-```
+`/health` and `/metrics` are auth-exempt (load balancers, Prometheus). Every other route requires `Authorization: Bearer <token>` when `FERROCACHE_AUTH_TOKEN` is set.
 
-Each node listens on `:3000` inside its container; the host ports are 3001/3002/3003.
-Ring + gossip + replication are wired by default. Cluster status:
-`curl http://localhost:3001/cluster/status`.
+---
 
-### With bearer token auth
+## Insert
 
-```bash
-export FERROCACHE_AUTH_TOKEN="$(openssl rand -hex 32)"
-cargo run --release
-```
-
-All `/query`, `/insert`, `/stats`, `/cluster/status`, `/admin/compact` calls
-require `Authorization: Bearer <token>`. `/health` and `/metrics` remain open.
-
-### With cluster mTLS
-
-```bash
-cargo run --bin gen_certs node1 node2 node3
-# Distribute ca.pem + each node's cert/key to each container, then:
-export FERROCACHE_CLUSTER__TLS__ENABLED=true
-export FERROCACHE_CLUSTER__TLS__CA_CERT_PATH=/certs/ca.pem
-export FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH=/certs/node1/cert.pem
-export FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH=/certs/node1/key.pem
-export FERROCACHE_CLUSTER__TLS__INTERNAL_PORT=4443
-```
-
-A second listener binds on `internal_port` (default `port + 1000`) and
-requires a client cert chained to the cluster CA. The public port stays
-plain HTTP. See `docs/security.md` for the deployment recipe.
-
-## API Reference
-
-All bodies are JSON. Routes that mutate or read cached data require
-`Authorization: Bearer <token>` when `FERROCACHE_AUTH_TOKEN` is set.
-
-### POST /insert
-
-Store a (query, embedding, response) tuple in the namespace identified by `model_id`.
-
-Request:
-```json
+```http
+POST /insert
+Content-Type: application/json
 {
-  "embedding": [0.1, 0.2, ...],
-  "response": "the answer to cache",
-  "query_text": "the original question",
-  "model_id": "all-MiniLM-L6-v2::384"
+  "embedding":        [0.1, 0.2, ...],     // required, 1..=4096 dims
+  "response":         "answer text",       // required, ≤ 102 400 bytes
+  "query_text":       "user prompt",       // required for the M27 exact-match index
+  "model_id":         "name::dim",         // required (e.g. "all-MiniLM-L6-v2::384")
+
+  "uuid":             "<optional>",        // forwarded inserts only — coordinator-stamped
+  "ttl_seconds":      3600,                // optional (M26)
+  "cache_scope":      "tenant_abc",        // optional (M28)
+  "conversation_id":  "conv_xyz"           // optional (M29)
 }
+
+→ 200 { "id": "<uuid>", "status": "ok" }
+→ 400 bad input  (dim out of range, missing model_id, etc.)
+→ 500 persistence/index failure
+→ 502 replica unreachable
 ```
 
-Response (200):
-```json
-{ "id": "uuid-v4-string", "status": "ok" }
-```
+### Field semantics
 
-Errors: `400` for missing `model_id`, empty/oversized embedding (>4096 dims), oversized response (>100 KB), or dimension mismatch within the namespace. `401` if auth is enabled and the token is wrong/missing. `502` if a peer fails to replicate (after retries are exhausted).
+- **`model_id`**: required since M14. Convention is `"<model_name>::<dim>"` (e.g. `"all-MiniLM-L6-v2::384"`). Cross-namespace queries are impossible by construction.
+- **`ttl_seconds`** (M26): per-entry TTL. `expires_at = inserted_at + ttl_seconds` is stored in WAL/snapshot. Expired entries return miss inline on query and are reaped in the background. Explicit `ttl_seconds` always wins over `conversation_ttl_seconds`.
+- **`cache_scope`** (M28): tenant/scope isolation. Effective namespace becomes `"{model_id}::{cache_scope}"`. Empty/whitespace is treated as absent.
+- **`conversation_id`** (M29): inserts go to the conversation namespace `"{base}::conv_{conversation_id}"` **only**. The base namespace is *not* dual-written. The application chooses: context-dependent answer → use a `conversation_id`; general factual answer → omit it.
+- **`uuid`**: only set by a coordinator forwarding to replicas with `?local=true` so all replicas store the same id. Clients should **not** set this.
 
-```bash
-curl -X POST http://localhost:3000/insert \
-  -H 'Authorization: Bearer my-token' \
-  -H 'Content-Type: application/json' \
-  -d '{"embedding":[0.1,0.2,0.3],"response":"hi","query_text":"q","model_id":"m::3"}'
-```
+### Auto-TTL for conversations
 
-### POST /query
+If `FERROCACHE_CONVERSATION_TTL_SECONDS` is set and the insert has a `conversation_id` but no explicit `ttl_seconds`, the server stamps the auto-TTL. Empty conversation namespaces are auto-pruned by the reaper.
 
-Look up the nearest entry in the namespace; return it if cosine similarity ≥ `threshold`.
+---
 
-Request:
-```json
+## Query
+
+```http
+POST /query
+Content-Type: application/json
 {
-  "embedding": [0.1, 0.2, ...],
-  "threshold": 0.92,
-  "model_id": "all-MiniLM-L6-v2::384"
+  "embedding":        [0.1, 0.2, ...],     // required, must match namespace dim
+  "threshold":        0.92,                // required, 0.0..=1.0 (cosine similarity)
+  "model_id":         "name::dim",         // required
+
+  "query_text":       "user prompt",       // optional — enables M27 exact-match pre-filter
+  "cache_scope":      "tenant_abc",        // optional (M28)
+  "conversation_id":  "conv_xyz"           // optional (M29) — triggers two-level lookup
 }
+
+→ 200 {
+  "hit":          true,
+  "id":           "<uuid>",
+  "response":     "...",
+  "similarity":   0.97,
+  "exact_match":  false,                   // true if M27 pre-filter fired
+  "scope":        "conversation"           // "conversation" | "global" — only when conversation_id is set
+}
+→ 200 { "hit": false }
+→ 400 bad input
+→ 502 owning peer unreachable
 ```
 
-Hit response (200):
-```json
-{ "hit": true, "id": "uuid", "response": "the cached answer", "similarity": 0.97 }
+### Exact-match pre-filter (M27)
+
+When `query_text` is present, ferrocache first does an **O(1) HashMap lookup** against the namespace's normalized `query_text → uuid` map. Hit reports `similarity: 1.0`, `exact_match: true`. Miss falls through silently to the HNSW ANN search; ANN hits report `exact_match: false`.
+
+Normalization is `lowercase + trim + whitespace-collapse` only — no stemming, no Unicode normalization. Two queries that differ only in casing/spacing match exactly; small typos go through HNSW.
+
+### Two-level lookup for conversations (M29)
+
+When `conversation_id` is present:
+
+1. **Level 1**: search the conversation namespace `"{base}::conv_{conversation_id}"`. On hit → return with `scope: "conversation"`.
+2. **Level 2** (only on level-1 miss): search the base namespace `"{model_id}::{cache_scope?}"`. On hit → return with `scope: "global"`.
+3. Both miss → `{"hit": false}`.
+
+Priority: **conversation > global**. Queries **without** `conversation_id` never see conversation entries; this preserves context safety.
+
+`scope` is omitted from the response when `conversation_id` was not provided (backward-compatible).
+
+---
+
+## Delete
+
+```http
+DELETE /entry/:uuid
+→ 200 { "deleted": true }
+→ 404 entry not found  (idempotent — already deleted)
+→ 400 empty UUID
 ```
 
-Miss response (200):
-```json
-{ "hit": false }
+Cluster fan-out: the receiving node fans out to **all live peers** (not ring-based — there's no embedding to hash from a UUID). Each peer's 404 is treated as success.
+
+A deleted entry's tombstone is durable in the WAL; restart never re-materialises it.
+
+---
+
+## Invalidate (radius delete)
+
+```http
+POST /admin/invalidate
+Content-Type: application/json
+{
+  "embedding":   [0.1, 0.2, ...],          // required
+  "threshold":   0.95,                     // required
+  "model_id":    "name::dim",              // required
+  "cache_scope": "tenant_abc"              // optional (M28)
+}
+
+→ 200 { "invalidated_count": 3, "uuids": ["...","...","..."] }
+→ 400 bad input
 ```
 
-Errors: same set as `/insert`, plus `400` if `threshold` is outside `[0.0, 1.0]`.
+Each replica computes its own match set against `(embedding, threshold)` — no UUID list shipped on the wire. The contract is "compute, not copy"; assuming replicas are in sync, they delete the same entries.
 
-```bash
-curl -X POST http://localhost:3000/query \
-  -H 'Authorization: Bearer my-token' \
-  -H 'Content-Type: application/json' \
-  -d '{"embedding":[0.1,0.2,0.3],"threshold":0.9,"model_id":"m::3"}'
-```
+`invalidated_count` reports **local** evictions on the receiving node. Cluster-wide impact is observable via `ferrocache_invalidations_total` per node.
 
-### GET /health
+---
 
-Always unauthenticated.
+## Stats and metrics
 
-```json
-{ "status": "ok", "node_id": "n1", "entry_count": 42 }
-```
-
-### GET /stats
-
-Returns entry counts, HNSW config, per-namespace stats, and the same counters surfaced via `/metrics`.
+### `GET /stats`
 
 ```json
 {
-  "entry_count": 42,
+  "entry_count": 850,
   "wal_path": "./ferrocache.wal",
   "hnsw": { "max_nb_connection": 16, "ef_construction": 200, "ef_search": 32, "dimension": 384 },
-  "namespaces": { "all-MiniLM-L6-v2::384": { "entry_count": 42, "dimension": 384 } },
+  "namespaces": {
+    "all-MiniLM-L6-v2::384": {
+      "entry_count": 500, "dimension": 384,
+      "oldest_entry_ts": 1714000000, "newest_entry_ts": 1714003600,
+      "total_accesses": 1234, "evicted_ghost_count": 12
+    },
+    "all-MiniLM-L6-v2::384::tenant_abc": { "...": "..." },
+    "all-MiniLM-L6-v2::384::conv_xyz":   { "...": "..." }
+  },
   "counters": {
-    "queries_total": 100, "queries_hit": 73, "queries_miss": 27, "hit_rate": 0.73,
-    "inserts_total": 50, "replication_forwards": 0, "replication_failures": 0,
-    "replication_retries": 0, "compactions": 0
+    "queries_total": 9001, "queries_hit": 8500, "queries_miss": 501,
+    "hit_rate": 0.944,
+    "inserts_total": 850,
+    "replication_forwards": 0, "replication_failures": 0, "replication_retries": 0,
+    "compactions": 0,
+    "read_repairs": 0, "read_repair_failures": 0,
+    "evictions_total": 0, "index_rebuilds": 0,
+    "expirations_total": 0, "deletions_total": 0, "invalidations_total": 0,
+    "exact_match_hits_total": 1421
   }
 }
 ```
 
-### GET /metrics
+### `GET /metrics`
 
-Prometheus text exposition. Always unauthenticated. Key metric families:
-`ferrocache_queries_total`, `ferrocache_queries_hit_total`, `ferrocache_queries_miss_total`,
-`ferrocache_hit_rate`, `ferrocache_inserts_total`, `ferrocache_query_duration_seconds_bucket`,
-`ferrocache_insert_duration_seconds_bucket`, `ferrocache_replication_{forwards,failures,retries}_total`,
-`ferrocache_compactions_total`, `ferrocache_namespace_entries{namespace="..."}`,
-`ferrocache_cluster_nodes`.
+Prometheus text exposition. Top-level counters are all `_total`-suffixed; per-namespace metrics carry a `namespace=` label. Notable series:
 
-### GET /cluster/status
+- `ferrocache_queries_total{namespace=...}`, `ferrocache_queries_hit{namespace=...}`, `ferrocache_queries_miss{namespace=...}`
+- `ferrocache_inserts_total{namespace=...}`
+- `ferrocache_evictions_total`, `ferrocache_expirations_total`, `ferrocache_deletions_total`, `ferrocache_invalidations_total` (all top-level + per-namespace)
+- `ferrocache_exact_match_hits_total` (M27 — additive subset of `ferrocache_queries_hit`)
+- `ferrocache_index_rebuilds_total` (M25)
+- `ferrocache_replication_forwards`, `ferrocache_replication_failures`, `ferrocache_replication_retries`
+- `ferrocache_read_repairs_total`, `ferrocache_read_repair_failures_total`
+- `ferrocache_query_latency_seconds_bucket{le="..."}`, `ferrocache_insert_latency_seconds_bucket{le="..."}` (16 fixed buckets, 100µs–10s)
+- `ferrocache_peer_phi{peer=...}`, `ferrocache_peers_suspected`, `ferrocache_peers_dead`
+- `ferrocache_ring_changes_total`, `ferrocache_ring_members`
+
+### `GET /admin/entry-stats`
 
 ```json
 {
-  "mode": "clustered",
-  "self_node_id": "node1",
-  "gossip_addr": "0.0.0.0:4000",
-  "nodes": ["node1", "node2", "node3"],
-  "node_count": 3
+  "namespaces": {
+    "all-MiniLM-L6-v2::384": {
+      "top_entries": [
+        { "uuid": "...", "access_count": 47, "last_accessed_at": 1714003500, "query_text_preview": "What is HNSW?" }
+      ]
+    }
+  }
 }
 ```
 
-`mode: "single"` when cluster is disabled.
+Top-10 per namespace, sorted by `access_count` desc. O(n log n) per namespace under the index read lock; admin-tier endpoint.
 
-### POST /admin/compact
-
-Forces a snapshot + WAL truncation. Useful before a planned restart so the next startup loads the snapshot instead of replaying the full WAL.
+### `GET /cluster/status`
 
 ```json
-{ "status": "ok", "entries_snapshotted": 12345, "wal_sequence": 12345 }
+{
+  "mode": "cluster",
+  "self_node_id": "<uuid>",
+  "gossip_addr": "0.0.0.0:4000",
+  "nodes": ["node-1", "node-2", "node-3"],
+  "node_count": 3,
+  "peer_health": {
+    "node-2": { "status": "Alive",     "phi": 0.7 },
+    "node-3": { "status": "Suspected", "phi": 9.1 }
+  },
+  "dead_nodes": [],
+  "read_repair_enabled": true
+}
 ```
 
-## Authentication
+`peer_health.status` is `Alive | Suspected | Dead` from the phi-accrual detector. `dead_nodes` lists peers the reconciler has removed from the ring.
 
-Set `FERROCACHE_AUTH_TOKEN` on the server side. With it set:
+---
 
-- All data routes require `Authorization: Bearer <token>` → 401 otherwise
-- `/health` and `/metrics` are exempt — load balancers and Prometheus don't need the token
-- Token comparison is constant-time (`subtle::ConstantTimeEq`)
-- The token value is never logged at any level
+## Cache lifecycle (eviction and expiry)
 
-When mTLS is also enabled in cluster mode, inter-node forwards carry the
-*same* bearer token in addition to the client cert. All nodes share one token.
+Entries die through four paths; **all of them write durable WAL tombstones** so a restart never re-materialises them.
 
-```bash
-# 401 without the header
-curl -X POST localhost:3000/query -H 'Content-Type: application/json' -d '...'
+| Path                              | Trigger                                                                       |
+|-----------------------------------|-------------------------------------------------------------------------------|
+| **LRU eviction (capacity)**       | `hnsw.max_entries_per_namespace`. Flush task evicts LRU after each batch.     |
+| **TTL expiry (age)**              | `ttl_seconds` per entry, or `conversation_ttl_seconds` for conv-scoped inserts. Reaper sweeps every `expire_scan_interval_secs`. |
+| **Explicit deletion**             | `DELETE /entry/:uuid`.                                                        |
+| **Semantic invalidation (radius)**| `POST /admin/invalidate`.                                                     |
 
-# 200 with it
-curl -X POST localhost:3000/query \
-  -H 'Authorization: Bearer my-token' \
-  -H 'Content-Type: application/json' -d '...'
+HNSW has no deletion API — removed entries become **ghosts** until rebuild. The query path filters ghost ids before applying the threshold; namespaces rebuild when the ghost ratio crosses 20%.
+
+The reaper sequence is `collect_expired → rebuild_dirty_namespaces → prune_empty_namespaces`. Conversation namespaces (key contains `::conv_`) whose entries map and ghost set are both empty are dropped from the namespace map to free memory.
+
+### LRU tie-break
+
+Eviction order is `(last_accessed_at ASC, inserted_at ASC, internal_id ASC)`. This gives deterministic FIFO-on-tie when a sub-second insert burst produces identical timestamps.
+
+### Access tracking fields
+
+- **`inserted_at`** — Unix seconds, set once on insert, **persisted in WAL**. Survives restart.
+- **`last_accessed_at`** — bumped on every query hit, **persisted only in snapshots** (in-memory soft state). Crash loses the last interval since the prior snapshot.
+- **`access_count`** — same persistence as `last_accessed_at`.
+
+A query hit takes a brief index write lock to bump `last_accessed_at` and `access_count`. Misses skip this entirely.
+
+---
+
+## Tenant isolation (`cache_scope`)
+
+`cache_scope` is an opaque user-defined string. It composes with `model_id`:
+
+```
+effective_namespace(model_id, cache_scope)
+  = "{model_id}::{cache_scope}"   if cache_scope is non-empty after trim
+  = "{model_id}"                  otherwise
 ```
 
-In Python, the client picks up `FERROCACHE_AUTH_TOKEN` from the environment
-automatically, or accepts an explicit `auth_token=` kwarg.
+Empty or whitespace-only `cache_scope` is treated as absent (defensive against `cache_scope: ""`).
 
-## Integration Patterns
+Common scope values: tenant ID, user ID, model temperature, system prompt version, or any combination thereof.
 
-### Pattern 1 — Direct HTTP client (Python, stdlib only)
+`max_entries_per_namespace` applies **per scoped namespace** — each tenant gets its own cap. Resource isolation comes free with the namespace partitioning.
+
+---
+
+## Conversation scoping (`conversation_id`)
+
+`conversation_id` adds a third namespace segment with a hardcoded `conv_` prefix:
+
+```
+conversation_namespace(model_id, cache_scope, conversation_id)
+  = "{effective_namespace(model_id, cache_scope)}::conv_{conversation_id}"
+```
+
+The `conv_` prefix prevents collision between conversation IDs and cache scopes — `cache_scope="abc"` is `"m::abc"`, but `conversation_id="abc"` is `"m::conv_abc"`. **Reserved**: applications must avoid `cache_scope` values starting with `conv_`.
+
+Inserts with `conversation_id` go to the conversation namespace **only**. Queries with `conversation_id` do a **two-level lookup** — conversation namespace first, base namespace fallback. Queries without `conversation_id` never see conversation entries.
+
+---
+
+## Configuration reference
+
+### Top-level
+
+| Env var                                 | Default              | Notes                                                  |
+|-----------------------------------------|----------------------|--------------------------------------------------------|
+| `FERROCACHE_PORT`                       | `3000`               | HTTP listen port                                       |
+| `FERROCACHE_NODE_ID`                    | random UUID          | Stable node identity for the ring                      |
+| `FERROCACHE_WAL_PATH`                   | `./ferrocache.wal`   | WAL file; mount a persistent volume for prod           |
+| `FERROCACHE_AUTH_TOKEN`                 | unset (auth off)     | Set to a 32-byte+ random hex string                    |
+| `FERROCACHE_WAL_BATCH_SIZE`             | `256`                | Group-commit batch size (1 = pre-M20 per-insert fsync) |
+| `FERROCACHE_WAL_BATCH_TIMEOUT_MS`       | `1`                  | Max wait for additional inserts to join a batch        |
+| `FERROCACHE_COMPACT_INTERVAL_INSERTS`   | `10000`              | Auto-compact every N inserts; `0` disables auto        |
+| `FERROCACHE_EXPIRE_SCAN_INTERVAL_SECS`  | `60`                 | TTL reaper interval; `0` disables                      |
+| `FERROCACHE_CONVERSATION_TTL_SECONDS`   | unset (no auto-TTL)  | Auto-TTL applied to conversation-scoped inserts        |
+
+### HNSW
+
+| Env var                                            | Default         | Notes                                       |
+|----------------------------------------------------|-----------------|---------------------------------------------|
+| `FERROCACHE_HNSW__MAX_NB_CONNECTION`               | `16`            | M parameter (graph connectivity)            |
+| `FERROCACHE_HNSW__MAX_ELEMENTS`                    | `100000`        | Pre-allocated capacity per index            |
+| `FERROCACHE_HNSW__EF_CONSTRUCTION`                 | `200`           | Build-time search depth                     |
+| `FERROCACHE_HNSW__EF_SEARCH`                       | `32`            | Query-time search depth                     |
+| `FERROCACHE_HNSW__DEFAULT_THRESHOLD`               | `0.92`          | Default cosine similarity threshold         |
+| `FERROCACHE_HNSW__MAX_ENTRIES_PER_NAMESPACE`       | unset           | LRU cap per namespace; unset = unlimited    |
+
+### Cluster
+
+| Env var                                                | Default          | Notes                                                |
+|--------------------------------------------------------|------------------|------------------------------------------------------|
+| `FERROCACHE_CLUSTER__ENABLED`                          | `false`          | Single-node mode when false                          |
+| `FERROCACHE_CLUSTER__GOSSIP_ADDR`                      | `0.0.0.0:4000`   | chitchat UDP bind                                    |
+| `FERROCACHE_CLUSTER__API_ADDR`                         | `0.0.0.0:3000`   | Advertised API address                               |
+| `FERROCACHE_CLUSTER__SEED_NODES`                       | `[]`             | Comma-separated `host:port` list                     |
+| `FERROCACHE_CLUSTER__VIRTUAL_NODES`                    | `64`             | Virtual nodes per physical node                      |
+| `FERROCACHE_CLUSTER__REPLICATION_FACTOR`               | `2`              | Replicas per key                                     |
+| `FERROCACHE_CLUSTER__MAX_REPLICATION_RETRIES`          | `3`              | Retries on connect/timeout/5xx (never 4xx)           |
+| `FERROCACHE_CLUSTER__PHI_THRESHOLD`                    | `8.0`            | `Suspected` at φ ≥ this; `Dead` at 2× this           |
+| `FERROCACHE_CLUSTER__DEAD_NODE_REMOVAL_ENABLED`        | `true`           | Set false for monitoring-only mode                   |
+| `FERROCACHE_CLUSTER__READ_REPAIR_ENABLED`              | `true`           | Replica fan-out on coordinator miss                  |
+| `FERROCACHE_CLUSTER__TLS__ENABLED`                     | `false`          | Inter-node mTLS                                      |
+| `FERROCACHE_CLUSTER__TLS__CA_CERT_PATH`                | unset            | Required when TLS enabled in production              |
+| `FERROCACHE_CLUSTER__TLS__NODE_CERT_PATH`              | unset            | Required when TLS enabled in production              |
+| `FERROCACHE_CLUSTER__TLS__NODE_KEY_PATH`               | unset            | Required when TLS enabled in production              |
+| `FERROCACHE_CLUSTER__TLS__INTERNAL_PORT`               | `port + 1000`    | Second listener for cluster traffic                  |
+
+---
+
+## Production checklist
+
+1. **Authentication**: set `FERROCACHE_AUTH_TOKEN` to a 32-byte hex string. `/health` and `/metrics` stay open; everything else requires `Authorization: Bearer <token>`.
+2. **Memory cap**: set `FERROCACHE_HNSW__MAX_ENTRIES_PER_NAMESPACE` to prevent unbounded growth. LRU eviction kicks in automatically.
+3. **Conversation TTL**: if you use `conversation_id`, set `FERROCACHE_CONVERSATION_TTL_SECONDS`. Without it, dead conversation namespaces accumulate forever.
+4. **Reaper interval**: `FERROCACHE_EXPIRE_SCAN_INTERVAL_SECS=60` is fine for most workloads. Lower for tight TTL deployments (cost: more lock contention); `0` disables the reaper (inline expiry check on query still runs).
+5. **Cluster**: enable mTLS (`FERROCACHE_CLUSTER__TLS__ENABLED=true` + cert paths) for any deployment whose nodes don't share a private network.
+6. **Persistence**: mount a volume at `wal_path`. The WAL + snapshot together restore full state on restart.
+7. **Monitoring**: scrape `/metrics`. Critical alerts:
+   - `ferrocache_replication_failures_total` increasing → peer connectivity issue.
+   - `ferrocache_peers_dead > 0` → ring is degraded.
+   - `ferrocache_evictions_total` rate climbing → consider raising the cap or reviewing access patterns.
+   - `ferrocache_expirations_total` rate aligning with insert rate → TTL is working as configured.
+   - `ferrocache_query_latency_seconds_bucket` p99 spike → likely an index rebuild under write lock; tune `max_entries_per_namespace`.
+
+---
+
+## Common operations
+
+### Insert + query (Python)
 
 ```python
+import os
 from ferrocache import FerrocacheClient
 
-client = FerrocacheClient("http://localhost:3000", auth_token="my-token")
-client.insert(
-    embedding=[0.1, 0.2, 0.3, ...],
-    response="The answer",
-    query_text="What is X?",
+c = FerrocacheClient("http://localhost:3000",
+                     auth_token=os.environ.get("FERROCACHE_AUTH_TOKEN"))
+
+c.insert(
+    embedding=embed("What is HNSW?"),
+    response="Hierarchical Navigable Small World — a graph-based ANN index.",
+    query_text="What is HNSW?",
     model_id="all-MiniLM-L6-v2::384",
+    ttl_seconds=86400,
 )
 
-hit = client.query(
-    embedding=[0.1, 0.2, 0.3, ...],
-    threshold=0.92,
+hit = c.query(
+    embedding=embed("Tell me about HNSW"),
+    threshold=0.85,
     model_id="all-MiniLM-L6-v2::384",
+    query_text="Tell me about HNSW",     # enables exact-match pre-filter
 )
 if hit["hit"]:
-    print(hit["response"], hit["similarity"])
+    print(hit["response"], "similarity:", hit["similarity"])
 ```
 
-### Pattern 2 — OpenAI middleware (one import swap)
+### Delete an entry
+
+```python
+c.delete_entry("<uuid>")  # 200 deleted, or 404 idempotent
+```
+
+### Semantic invalidation
+
+```python
+# Drop every entry in tenant_abc whose cosine similarity to v >= 0.95.
+c.invalidate(
+    embedding=v,
+    threshold=0.95,
+    model_id="all-MiniLM-L6-v2::384",
+    cache_scope="tenant_abc",
+)
+```
+
+### OpenAI middleware
 
 ```python
 from openai import OpenAI
 from ferrocache.middleware import wrap_openai
 
-client = wrap_openai(OpenAI(), auth_token="my-token")
 # All chat.completions.create calls now check ferrocache first.
-resp = client.chat.completions.create(
+oai = wrap_openai(OpenAI(),
+                  cache_scope="tenant_abc",
+                  conversation_id="conv_xyz")
+
+resp = oai.chat.completions.create(
     model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "What is the capital of France?"}],
+    messages=[{"role": "user", "content": "What's our Q3 plan?"}],
 )
-# resp._ferrocache_hit is True / False / None (None = ferrocache was unreachable; fail-open)
+print(resp._ferrocache_hit, resp.choices[0].message.content)
 ```
 
-### Pattern 3 — Anthropic middleware
-
-```python
-from anthropic import Anthropic
-from ferrocache.middleware import wrap_anthropic
-
-client = wrap_anthropic(Anthropic(), auth_token="my-token")
-resp = client.messages.create(
-    model="claude-haiku-4-5",
-    max_tokens=512,
-    messages=[{"role": "user", "content": "Summarize this..."}],
-)
-```
-
-### Pattern 4 — LangChain cache backend
-
-```python
-from langchain.globals import set_llm_cache
-from ferrocache.langchain import FerrocacheCache
-
-set_llm_cache(FerrocacheCache(auth_token="my-token"))
-# Every LLM call in any LangChain chain now consults ferrocache.
-```
-
-### Pattern 5 — LlamaIndex LLM wrapper
-
-```python
-from llama_index.llms.openai import OpenAI
-from ferrocache.llamaindex import FerrocacheLLM
-
-llm = FerrocacheLLM(inner=OpenAI(model="gpt-4o-mini"), auth_token="my-token")
-# Use `llm` anywhere LlamaIndex expects an LLM.
-```
-
-### Pattern 6 — MCP server (Claude Desktop / Claude Code)
-
-```bash
-pip install ferrocache[mcp]
-python -m ferrocache.mcp_server  # speaks JSON-RPC over stdio
-```
-
-Three tools: `semantic_cache_lookup`, `semantic_cache_store`, `cache_status`.
-The server reads `FERROCACHE_URL`, `FERROCACHE_THRESHOLD`, `FERROCACHE_EMBED_MODEL`,
-and `FERROCACHE_AUTH_TOKEN` from the environment. See `docs/mcp-setup.md` for
-the Claude Desktop / Claude Code config JSON.
-
-## Threshold Selection Guide
-
-Cosine similarity 0.0–1.0; higher = stricter match. The right threshold
-depends on how much paraphrasing your inputs tolerate:
-
-| Use Case                | Threshold   | Why |
-|-------------------------|-------------|-----|
-| FAQ / knowledge base    | 0.88–0.92   | High variation in phrasing; moderate false-hit risk |
-| Code documentation      | 0.92–0.95   | Technical queries need precise matching |
-| Customer support        | 0.90–0.93   | Balance hit rate vs. accuracy |
-| Translation cache       | 0.95–0.98   | Slight wording changes can change meaning |
-| Exact-dedup only        | 0.99+       | Only near-identical queries hit |
-
-If you can run an offline simulation, `tests/simulate.py` (in the repo)
-shows a 100% hit / 0 false-positive workload at threshold 0.90 on an FAQ corpus.
-
-## Namespace / model_id Rules
-
-- `model_id` is **required** on every `/insert` and `/query` (since M14)
-- Format convention: `model_name::dimension`, e.g. `all-MiniLM-L6-v2::384`, `text-embedding-3-small::1536`
-- Vectors from different `model_id`s are **never** compared — each namespace has its own HNSW index. Cross-model false hits are impossible by construction.
-- The Python middleware (default `embed_fn`) auto-derives `model_id` from the embed model name + dimension. Custom `embed_fn`s require an explicit `model_id` argument — ferrocache will refuse to guess.
-- Switching embedding models means a new `model_id`. Old entries stay in their old namespace but become unreachable until you query with their original `model_id`.
-- Pre-M14 entries (no `model_id` in the WAL) load into the `legacy::unknown` namespace.
-
-## Production Checklist
-
-- [ ] `FERROCACHE_AUTH_TOKEN` set to a long random string (`openssl rand -hex 32`)
-- [ ] Cluster deployments: `FERROCACHE_CLUSTER__TLS__ENABLED=true` with certs from your PKI
-- [ ] Public-port TLS terminated at a reverse proxy (nginx, caddy, ALB)
-- [ ] Firewall: public port open; internal port + gossip UDP cluster-only
-- [ ] Disk encryption on the WAL volume (LUKS, FileVault, EBS)
-- [ ] Prometheus scraping `/metrics`; Grafana dashboard imported from `monitoring/grafana/dashboards/ferrocache.json`
-- [ ] Alerts on `ferrocache_replication_failures_total > 0` (peer issues)
-- [ ] Alerts on `ferrocache_replication_retries_total` rate (flapping peers)
-- [ ] Alerts on `ferrocache_hit_rate < 0.5` (cache not helping — wrong threshold or wrong `model_id`)
-- [ ] `compact_interval_inserts` reviewed (default 10K is fine for most workloads)
-- [ ] `max_replication_retries` reviewed (default 3 is fine; raise for noisy networks)
-- [ ] Cert rotation runbook documented (rolling restart with new PEMs)
+---
 
 ## Troubleshooting
 
-### "model_id is required" — 400
+### Entries returning after restart
 
-Every `/insert` and `/query` must include `model_id`. With the Python
-middleware it's auto-derived; with raw HTTP, add `"model_id": "your-model::dim"`
-to the body.
+- Check the WAL has tombstone entries for the deleted UUIDs (look for `"tombstone":true` in the NDJSON file).
+- Pre-M30 versions had a latent bug where the runtime tombstone path through the WAL channel re-materialised phantom entries on flush. Fixed in M29 — `replay_entry` now branches on `tombstone`. If you see this on v1.0+, file a bug.
+- Verify `FERROCACHE_WAL_PATH` is consistent across restarts.
 
-### Cache hit rate is 0%
+### High eviction rate (`ferrocache_evictions_total` climbing fast)
 
-Check that insert and query use the **same** `model_id`. Different model_ids
-have separate HNSW indexes — no entries are visible across them. Also
-double-check the embedding is not all zeros (cosine on a zero vector is
-undefined; HNSW will return weird results).
+- Increase `FERROCACHE_HNSW__MAX_ENTRIES_PER_NAMESPACE`.
+- Investigate access patterns via `/admin/entry-stats` — top entries should be high-traffic; if everything has access_count=1, the LRU is just churning through cold inserts.
+- Consider sharding via `cache_scope` so noisy workloads don't evict quiet ones.
 
-### 502 on `/insert` in cluster mode
+### Conversation namespace memory growth
 
-A peer node is unreachable. Check `ferrocache_replication_retries_total` — if
-it's climbing, peers are flaky and retries are kicking in. If a forward fails
-*after* `max_replication_retries`, ferrocache returns 502. Verify gossip
-connectivity via `/cluster/status` (every node should see the same
-`node_count`).
+- Set `FERROCACHE_CONVERSATION_TTL_SECONDS`. Without it, every `conversation_id` accumulates forever.
+- Check `/stats` for namespaces matching `*::conv_*`. The reaper auto-prunes empty conv namespaces; if dead conversations linger, the reaper interval might be too long for your insert rate.
 
-### Slow startup (full WAL replay)
+### Exact-match pre-filter not firing
 
-Each insert appends a line to the WAL. On restart, the WAL replays from the
-start unless a snapshot is present. Run `POST /admin/compact` to write a
-snapshot and truncate the WAL — next restart will be near-instant. Or set
-`compact_interval_inserts` to a sensible value so auto-compaction triggers
-periodically.
+- Confirm the client is sending `query_text` on `/query` (not just `/insert`).
+- The match is normalized: lowercase + trim + whitespace-collapse. Two queries with the same content but different unicode (NFC vs NFD, smart quotes vs ASCII) will NOT match — pre-normalize on the client if you need it.
+- The pre-filter is logged at `INFO` with `exact_match=true` on hit. Check the `ferrocache_exact_match_hits_total` counter.
 
-### "unauthorized" — 401
+### `502 upstream replica unavailable`
 
-`FERROCACHE_AUTH_TOKEN` is set on the server but the request didn't carry a
-matching `Authorization: Bearer <token>` header. Either include the header or
-unset the env var on the server.
+- Replica forward failed after `cluster.max_replication_retries` attempts.
+- Check `/cluster/status.peer_health` — the failing peer's `phi` value indicates connectivity. If `Dead`, the reconciler will remove it from the ring within ~2s; subsequent inserts degrade gracefully (warn log naming `effective_replicas`).
+- For chronic failures: check the gossip seed list, firewall rules on the gossip UDP port, and (if mTLS is on) certificate expiry.
 
-### TLS handshake failures in cluster mode
+### `400 dimension mismatch` on insert
 
-All nodes must share the same cluster CA. If a node is configured against a
-different CA, peers will reject its cert and the handshake fails before any
-HTTP framing. Verify with `openssl x509 -in node.pem -noout -issuer` — the
-issuer DN must match the cluster CA's subject DN on every node.
+- Each namespace locks to the dimension of its first inserted vector. Subsequent inserts with a different dim are rejected.
+- Fix: check the embedding model is consistent across callers, or send to a different `model_id` namespace.
 
-### `/metrics` shows `ferrocache_replication_retries_total` climbing
+### Tenant data leaking across `cache_scope`
 
-A peer is flaky (intermittent connection refused, timeouts, or 5xx). Check
-the peer's logs and `/health`. The retry budget is `max_replication_retries`
-(default 3) per forward; retries that succeed don't count as failures.
+- Should be impossible by construction; namespaces are isolated HashMap entries. If you see it: confirm `cache_scope` is being sent on **both** insert and query (omitting it routes to the unscoped base namespace, which is a separate scope).
+- The unscoped namespace IS a distinct scope. Inserting without scope and querying with scope is a miss; this is correct behaviour.
+
+### Conversation answers leaking to non-conversation queries
+
+- Should be impossible. Queries without `conversation_id` never search conversation namespaces.
+- If you see it: verify the application code path correctly threads `conversation_id` through the cache call. The two-level lookup is opt-in via `conversation_id` on the query.
+
+---
+
+## Quickstart for a new agent
+
+```bash
+# 1. Start a single-node ferrocache.
+cargo run --release          # or: docker run -p 3000:3000 ghcr.io/.../ferrocache
+
+# 2. Smoke test.
+curl localhost:3000/health
+# → {"status":"ok","node_id":"...","entry_count":0}
+
+# 3. Insert + query.
+curl -s -X POST localhost:3000/insert -H 'Content-Type: application/json' \
+  -d '{"embedding":[1,0,0,0],"response":"42","query_text":"meaning","model_id":"demo::4"}'
+curl -s -X POST localhost:3000/query -H 'Content-Type: application/json' \
+  -d '{"embedding":[1,0,0,0],"threshold":0.9,"model_id":"demo::4"}'
+# → {"hit":true,"id":"...","response":"42","similarity":1.0,"exact_match":false}
+
+# 4. Inspect.
+curl localhost:3000/stats | jq '.namespaces'
+curl localhost:3000/metrics | grep ferrocache_queries_total
+```
+
+For cluster mode, scope/conversation features, and security: see the README and the per-mission decision log in `Claude.md`.

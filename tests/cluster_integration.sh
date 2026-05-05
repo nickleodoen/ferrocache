@@ -221,6 +221,112 @@ RR_FLAG=$(curl -s "$BASE1/cluster/status" | jq -r '.read_repair_enabled')
 assert_eq "/cluster/status reports read_repair_enabled" "true" "$RR_FLAG"
 
 echo ""
+echo "=== Test 9: Phase 7 feature integration (M24-M29) ==="
+
+PHASE7_MODEL="m30::4"
+
+# 1. Insert with TTL (3s deadline)
+TTL_INSERT=$(curl -s -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.1, 0.2, 0.3, 0.4], \"response\": \"ttl-entry\", \"query_text\": \"ttl test\", \"model_id\": \"$PHASE7_MODEL\", \"ttl_seconds\": 3}")
+TTL_STATUS=$(echo "$TTL_INSERT" | jq -r '.status')
+TTL_UUID=$(echo "$TTL_INSERT" | jq -r '.id')
+assert_eq "TTL insert returns ok" "ok" "$TTL_STATUS"
+TTL_UUID_NONEMPTY="no"
+if [ -n "$TTL_UUID" ] && [ "$TTL_UUID" != "null" ]; then TTL_UUID_NONEMPTY="yes"; fi
+assert_eq "TTL insert returns non-empty UUID" "yes" "$TTL_UUID_NONEMPTY"
+
+# 2. Insert with cache_scope=tenant_a
+curl -s -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.5, 0.5, 0.5, 0.5], \"response\": \"tenant-a-answer\", \"query_text\": \"scoped question\", \"model_id\": \"$PHASE7_MODEL\", \"cache_scope\": \"tenant_a\"}" > /dev/null
+
+# 3. Cross-tenant query must miss (different cache_scope)
+SCOPE_MISS=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.5, 0.5, 0.5, 0.5], \"threshold\": 0.90, \"model_id\": \"$PHASE7_MODEL\", \"cache_scope\": \"tenant_b\"}" \
+    | jq -r '.hit')
+assert_eq "different cache_scope -> miss" "false" "$SCOPE_MISS"
+
+# 4. Same-tenant query must hit
+SCOPE_HIT=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.5, 0.5, 0.5, 0.5], \"threshold\": 0.90, \"model_id\": \"$PHASE7_MODEL\", \"cache_scope\": \"tenant_a\"}" \
+    | jq -r '.hit')
+assert_eq "same cache_scope -> hit" "true" "$SCOPE_HIT"
+
+# 5. Insert with conversation_id
+curl -s -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.9, 0.1, 0.0, 0.0], \"response\": \"conv-answer\", \"query_text\": \"conv question\", \"model_id\": \"$PHASE7_MODEL\", \"conversation_id\": \"conv_test_1\"}" > /dev/null
+
+# 6. Two-level lookup: conversation hit (scope=conversation)
+CONV_SCOPE=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.9, 0.1, 0.0, 0.0], \"threshold\": 0.90, \"model_id\": \"$PHASE7_MODEL\", \"conversation_id\": \"conv_test_1\"}" \
+    | jq -r '.scope')
+assert_eq "conversation hit reports scope=conversation" "conversation" "$CONV_SCOPE"
+
+# 7. Two-level lookup: global fallback (different conversation, hit base namespace via tenant scope)
+GLOBAL_SCOPE=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.5, 0.5, 0.5, 0.5], \"threshold\": 0.90, \"model_id\": \"$PHASE7_MODEL\", \"conversation_id\": \"conv_test_other\", \"cache_scope\": \"tenant_a\"}" \
+    | jq -r '.scope')
+assert_eq "fallback hit reports scope=global" "global" "$GLOBAL_SCOPE"
+
+# 8. DELETE /entry/:uuid
+DEL_UUID=$(curl -s -X POST "$BASE1/insert" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.0, 0.0, 0.0, 1.0], \"response\": \"delete-me\", \"query_text\": \"deletable\", \"model_id\": \"$PHASE7_MODEL\"}" \
+    | jq -r '.id')
+DEL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE1/entry/$DEL_UUID")
+assert_eq "DELETE /entry/:uuid returns 200" "200" "$DEL_STATUS"
+DEL_MISS=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.0, 0.0, 0.0, 1.0], \"threshold\": 0.90, \"model_id\": \"$PHASE7_MODEL\"}" \
+    | jq -r '.hit')
+assert_eq "deleted entry -> miss across cluster" "false" "$DEL_MISS"
+
+# 9. Semantic invalidation. Use `?local=true` on insert so the entry is
+#    deterministically on node1; otherwise ring routing might land it on
+#    node2/node3 only and node1's local invalidate sweep would find 0.
+curl -s -X POST "$BASE1/insert?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [1.0, 0.0, 0.0, 0.0], \"response\": \"inv-1\", \"query_text\": \"inv one\", \"model_id\": \"$PHASE7_MODEL\", \"uuid\": \"inv-uuid-1\"}" > /dev/null
+INV_COUNT=$(curl -s -X POST "$BASE1/admin/invalidate?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [1.0, 0.0, 0.0, 0.0], \"threshold\": 0.95, \"model_id\": \"$PHASE7_MODEL\"}" \
+    | jq -r '.invalidated_count')
+assert_eq "invalidate found radius match" "1" "$INV_COUNT"
+
+# 10. Exact-match pre-filter. Insert + query both `?local=true` on the same
+#     node so the test doesn't depend on which replicas got the entry.
+curl -s -X POST "$BASE1/insert?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.3, 0.3, 0.3, 0.3], \"response\": \"exact-answer\", \"query_text\": \"Exact Match Test\", \"model_id\": \"$PHASE7_MODEL\", \"uuid\": \"em-uuid-1\"}" > /dev/null
+EM_FLAG=$(curl -s -X POST "$BASE1/query?local=true" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.0, 0.0, 0.0, 1.0], \"threshold\": 0.99, \"model_id\": \"$PHASE7_MODEL\", \"query_text\": \"exact match test\"}" \
+    | jq -r '.exact_match')
+assert_eq "exact match pre-filter fires (case/space-insensitive)" "true" "$EM_FLAG"
+
+# 11. TTL expiry. Sleep past the 3s TTL; the inline expiry check on /query
+#     filters expired neighbours regardless of reaper-tick interval. Use a
+#     tight threshold (0.99) so the assertion isn't accidentally satisfied
+#     by another entry from earlier in this test block.
+echo "  Waiting 8s for TTL expiry..."
+sleep 8
+TTL_MISS=$(curl -s -X POST "$BASE2/query" \
+    -H "Content-Type: application/json" \
+    -d "{\"embedding\": [0.1, 0.2, 0.3, 0.4], \"threshold\": 0.99, \"model_id\": \"$PHASE7_MODEL\"}" \
+    | jq -r '.hit')
+assert_eq "TTL-expired entry -> miss" "false" "$TTL_MISS"
+
+# 12. /admin/entry-stats responds with the namespace breakdown
+ENTRY_STATS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE1/admin/entry-stats")
+assert_eq "GET /admin/entry-stats returns 200" "200" "$ENTRY_STATS_CODE"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

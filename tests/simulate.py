@@ -153,6 +153,17 @@ def main() -> int:
     parser.add_argument("--url", default="http://localhost:3000")
     parser.add_argument("--threshold", type=float, default=0.90)
     parser.add_argument("--model", default="all-MiniLM-L6-v2")
+    parser.add_argument(
+        "--ttl",
+        type=int,
+        default=None,
+        help=(
+            "Optional TTL in seconds (M26). When set, every Phase 1 insert is "
+            "stamped with `ttl_seconds=<ttl>`. Phase 2/3 queries should still "
+            "land within the TTL window; querying again after the TTL expires "
+            "returns misses, exercising the inline expires_at check."
+        ),
+    )
     args = parser.parse_args()
 
     client = FerrocacheClient(args.url)
@@ -184,7 +195,11 @@ def main() -> int:
     for (question, answer), vec in zip(SEED_QUESTIONS, seed_vecs, strict=True):
         t0 = time.perf_counter()
         client.insert(
-            embedding=vec, response=answer, query_text=question, model_id=model_id
+            embedding=vec,
+            response=answer,
+            query_text=question,
+            model_id=model_id,
+            ttl_seconds=args.ttl,
         )
         insert_latencies.append((time.perf_counter() - t0) * 1000)
 
@@ -249,6 +264,8 @@ def main() -> int:
     print(f"Model:           {args.model} (384-dim)")
     print(f"Target:          {args.url}")
     print(f"Threshold:       {args.threshold}")
+    if args.ttl is not None:
+        print(f"TTL:             {args.ttl}s (per-insert ttl_seconds, M26)")
     print()
     print("Workload")
     print(f"  Seed questions:     {len(SEED_QUESTIONS)}")
