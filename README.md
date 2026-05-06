@@ -149,26 +149,7 @@ result = client.query(embedding=emb, threshold=0.92, model_id="gpt-4o-mini::1536
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Client["Your Application"]
-    Client -->|"POST /query, /insert"| LB["Any FerroCache Node"]
-    LB --> Ring["Consistent Hash Ring"]
-
-    Ring -->|"route query"| N1
-    Ring ==>|"replicate write"| N1
-    Ring -.->|"replica write"| N2
-
-    subgraph cluster["FerroCache Cluster"]
-        direction LR
-        N1["Node 1"]
-        N2["Node 2"]
-        N3["Node 3"]
-        N1 <-->|"gossip"| N2
-        N2 <-->|"gossip"| N3
-        N3 <-->|"gossip"| N1
-    end
-```
+![FerroCache Architecture](docs/assets/architecture.png)
 
 - Your app hits any node. Queries route to the correct shard via consistent hashing on the embedding vector. Writes replicate synchronously to N nodes.
 - Nodes discover each other via gossip (chitchat). Ring membership updates propagate in ~2 seconds. No Zookeeper, no etcd, no coordinator.

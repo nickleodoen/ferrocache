@@ -14,26 +14,7 @@ FerroCache is a standalone service that sits in front of your LLM calls and retu
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Client["Your Application"]
-    Client -->|"POST /query, /insert"| LB["Any FerroCache Node"]
-    LB --> Ring["Consistent Hash Ring"]
-
-    Ring -->|"route query"| N1
-    Ring ==>|"replicate write"| N1
-    Ring -.->|"replica write"| N2
-
-    subgraph cluster["FerroCache Cluster"]
-        direction LR
-        N1["Node 1"]
-        N2["Node 2"]
-        N3["Node 3"]
-        N1 <-->|"gossip"| N2
-        N2 <-->|"gossip"| N3
-        N3 <-->|"gossip"| N1
-    end
-```
+![FerroCache Architecture](assets/architecture.png)
 
 ## Where to start
 
