@@ -1,4 +1,4 @@
-# ferrocache Security Guide
+# FerroCache Security Guide
 
 This document describes ferrocache's threat model, the defenses
 currently implemented, deployment recipes for various scenarios, and the
