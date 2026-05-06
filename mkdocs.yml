@@ -1,0 +1,85 @@
+site_name: FerroCache
+site_description: A Distributed Semantic Cache Service for LLM Applications
+site_url: https://nickleodoen.github.io/ferrocache
+repo_url: https://github.com/nickleodoen/ferrocache
+repo_name: nickleodoen/ferrocache
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+
+plugins:
+  - search
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - admonition
+  - attr_list
+  - tables
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Install: getting-started/install.md
+    - Configuration: getting-started/configuration.md
+    - Your First Cache: getting-started/first-cache.md
+  - Integrations:
+    - Python Client: integrations/python.md
+    - OpenAI: integrations/openai.md
+    - Anthropic: integrations/anthropic.md
+    - LangChain: integrations/langchain.md
+    - LlamaIndex: integrations/llamaindex.md
+    - MCP Server: integrations/mcp.md
+    - HTTP API: integrations/http-api.md
+  - Features:
+    - Namespaces & Isolation: features/namespaces.md
+    - Eviction & TTL: features/eviction-ttl.md
+    - Conversation Scoping: features/conversations.md
+    - Exact-Match Pre-filter: features/exact-match.md
+  - Production:
+    - Cluster Setup: production/cluster.md
+    - Security: production/security.md
+    - Observability: production/observability.md
+    - Benchmarks: production/benchmarks.md
+  - API Reference: api-reference.md
+  - Contributing: contributing.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/nickleodoen/ferrocache
