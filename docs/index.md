@@ -16,20 +16,19 @@ FerroCache is a standalone service that sits in front of your LLM calls and retu
 
 ```mermaid
 flowchart TD
-    Client(["Your Application<br/>(Python · Go · Node · any language)"])
-    Client -->|"POST /query<br/>POST /insert"| LB["Any FerroCache Node<br/>(HTTP API)"]
-
-    LB --> Ring["Consistent Hash Ring<br/>(FNV-1a · 64 virtual nodes)"]
+    Client["Your Application"]
+    Client -->|"POST /query, /insert"| LB["Any FerroCache Node"]
+    LB --> Ring["Consistent Hash Ring"]
 
     Ring -->|"route query"| N1
-    Ring -->|"replicate write"| N1
+    Ring ==>|"replicate write"| N1
     Ring -.->|"replica write"| N2
 
-    subgraph cluster["FerroCache Cluster  ·  add nodes without downtime"]
+    subgraph cluster["FerroCache Cluster"]
         direction LR
-        N1["Node 1<br/>HNSW index + WAL"]
-        N2["Node 2<br/>HNSW index + WAL"]
-        N3["Node 3<br/>HNSW index + WAL"]
+        N1["Node 1"]
+        N2["Node 2"]
+        N3["Node 3"]
         N1 <-->|"gossip"| N2
         N2 <-->|"gossip"| N3
         N3 <-->|"gossip"| N1

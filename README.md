@@ -11,49 +11,49 @@ FerroCache is a standalone service that sits in front of your LLM calls and retu
 ## Features
 
 **Cache core**
-- ✅ Semantic similarity search via HNSW (approximate nearest neighbor)
-- ✅ Exact-match pre-filter — verbatim queries return in <0.4ms
-- ✅ Configurable cosine similarity threshold (default: 0.92)
-- ✅ Embedding-model agnostic — bring your own vectors
-- ✅ Per-entry TTL with background expiry reaper
-- ✅ LRU eviction with configurable max entries per namespace
-- ✅ `DELETE /entry/:uuid` — targeted cache invalidation
-- ✅ `POST /admin/invalidate` — semantic radius invalidation
+- [x] Semantic similarity search via HNSW (approximate nearest neighbor)
+- [x] Exact-match pre-filter — verbatim queries return in <0.4ms
+- [x] Configurable cosine similarity threshold (default: 0.92)
+- [x] Embedding-model agnostic — bring your own vectors
+- [x] Per-entry TTL with background expiry reaper
+- [x] LRU eviction with configurable max entries per namespace
+- [x] `DELETE /entry/:uuid` — targeted cache invalidation
+- [x] `POST /admin/invalidate` — semantic radius invalidation
 
 **Namespace isolation**
-- ✅ Model namespace partitioning — vectors from different models never compare
-- ✅ Tenant isolation via `cache_scope` — one cache, many tenants
-- ✅ Conversation scoping with two-level fallback (conversation → global)
-- ✅ Auto-TTL on conversation namespaces
+- [x] Model namespace partitioning — vectors from different models never compare
+- [x] Tenant isolation via `cache_scope` — one cache, many tenants
+- [x] Conversation scoping with two-level fallback (conversation → global)
+- [x] Auto-TTL on conversation namespaces
 
 **Durability & operations**
-- ✅ Write-ahead log (WAL) with fsync — survives process crashes
-- ✅ Atomic snapshots with WAL compaction
-- ✅ Group-commit WAL batching — 2,600+ inserts/sec at concurrency 50
-- ✅ Prometheus `/metrics` endpoint
-- ✅ Grafana dashboard (docker-compose overlay)
-- ✅ `/admin/entry-stats` — per-namespace access analytics
+- [x] Write-ahead log (WAL) with fsync — survives process crashes
+- [x] Atomic snapshots with WAL compaction
+- [x] Group-commit WAL batching — 2,600+ inserts/sec at concurrency 50
+- [x] Prometheus `/metrics` endpoint
+- [x] Grafana dashboard (docker-compose overlay)
+- [x] `/admin/entry-stats` — per-namespace access analytics
 
 **Distribution**
-- ✅ Multi-node cluster via consistent hashing + chitchat gossip
-- ✅ Synchronous write replication (configurable replication factor)
-- ✅ Phi accrual failure detection (Cassandra-style)
-- ✅ Automatic ring reassignment on node failure (zero data movement)
-- ✅ Read repair — stale nodes heal through traffic
+- [x] Multi-node cluster via consistent hashing + chitchat gossip
+- [x] Synchronous write replication (configurable replication factor)
+- [x] Phi accrual failure detection (Cassandra-style)
+- [x] Automatic ring reassignment on node failure (zero data movement)
+- [x] Read repair — stale nodes heal through traffic
 
 **Security**
-- 🔧 Bearer token auth on HTTP API (`FERROCACHE_AUTH_TOKEN`)
-- 🔧 Mutual TLS between cluster nodes (`cluster.tls.enabled`)
-- ✅ Constant-time token comparison (timing-attack safe)
+- [x] Bearer token auth on HTTP API — opt-in via `FERROCACHE_AUTH_TOKEN`
+- [x] Mutual TLS between cluster nodes — opt-in via `cluster.tls.enabled`
+- [x] Constant-time token comparison (timing-attack safe)
 
 **Integrations**
-- ✅ Python client (zero dependencies, stdlib only)
-- ✅ OpenAI SDK drop-in wrapper (`wrap_openai`)
-- ✅ Anthropic SDK drop-in wrapper (`wrap_anthropic`)
-- ✅ LangChain cache backend (`FerrocacheCache`)
-- ✅ LlamaIndex LLM wrapper (`FerrocacheLLM`)
-- ✅ MCP server for Claude Desktop / Claude Code
-- ✅ Any language via HTTP — Go, Node.js, Java, Ruby, etc.
+- [x] Python client (zero dependencies, stdlib only)
+- [x] OpenAI SDK drop-in wrapper (`wrap_openai`)
+- [x] Anthropic SDK drop-in wrapper (`wrap_anthropic`)
+- [x] LangChain cache backend (`FerrocacheCache`)
+- [x] LlamaIndex LLM wrapper (`FerrocacheLLM`)
+- [x] MCP server for Claude Desktop / Claude Code
+- [x] Any language via HTTP — Go, Node.js, Java, Ruby, etc.
 
 ---
 
@@ -151,20 +151,19 @@ result = client.query(embedding=emb, threshold=0.92, model_id="gpt-4o-mini::1536
 
 ```mermaid
 flowchart TD
-    Client(["Your Application<br/>(Python · Go · Node · any language)"])
-    Client -->|"POST /query<br/>POST /insert"| LB["Any FerroCache Node<br/>(HTTP API)"]
-
-    LB --> Ring["Consistent Hash Ring<br/>(FNV-1a · 64 virtual nodes)"]
+    Client["Your Application"]
+    Client -->|"POST /query, /insert"| LB["Any FerroCache Node"]
+    LB --> Ring["Consistent Hash Ring"]
 
     Ring -->|"route query"| N1
-    Ring -->|"replicate write"| N1
+    Ring ==>|"replicate write"| N1
     Ring -.->|"replica write"| N2
 
-    subgraph cluster["FerroCache Cluster  ·  add nodes without downtime"]
+    subgraph cluster["FerroCache Cluster"]
         direction LR
-        N1["Node 1<br/>HNSW index + WAL"]
-        N2["Node 2<br/>HNSW index + WAL"]
-        N3["Node 3<br/>HNSW index + WAL"]
+        N1["Node 1"]
+        N2["Node 2"]
+        N3["Node 3"]
         N1 <-->|"gossip"| N2
         N2 <-->|"gossip"| N3
         N3 <-->|"gossip"| N1
