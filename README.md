@@ -4,7 +4,7 @@
 
 FerroCache is a standalone service that sits in front of your LLM calls and returns cached responses for semantically similar queries. Because it's a compiled Rust binary with an HTTP API, **any language can use it** — Python, Go, Node.js, Java, Ruby, anything that can make an HTTP request. LLM API calls are expensive; semantically similar queries should reuse cached answers instead of paying for a new completion. Unlike GPTCache, FerroCache is a service, not an in-process library — deploy it once, share the cache across your entire fleet, and the cache survives application restarts.
 
-[Documentation](#) · [PyPI](https://pypi.org/project/ferrocache) · [Docker](https://ghcr.io/nickleodoen/ferrocache) · [Changelog](#) · [Contributing](#)
+[Documentation](https://nickleodoen.github.io/ferrocache) · [PyPI](https://pypi.org/project/ferrocache) · [Docker](https://github.com/nickleodoen/ferrocache/pkgs/container/ferrocache) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 ---
 
@@ -141,7 +141,7 @@ result = client.query(embedding=emb, threshold=0.92, model_id="gpt-4o-mini::1536
 result = client.query(embedding=emb, threshold=0.92, model_id="gpt-4o-mini::1536", cache_scope="tenant_xyz")  # miss
 ```
 
-→ Full documentation with examples for all integrations: [docs.ferrocache.dev](#)
+→ Full documentation with examples for all integrations: [nickleodoen.github.io/ferrocache](https://nickleodoen.github.io/ferrocache)
 
 </details>
 
@@ -249,7 +249,7 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 | `wal_batch_size` | usize | `256` | `FERROCACHE_WAL_BATCH_SIZE` |
 | `wal_batch_timeout_ms` | u64 | `1` | `FERROCACHE_WAL_BATCH_TIMEOUT_MS` |
 
-Full reference at [docs.ferrocache.dev/getting-started/configuration](#).
+Full reference at [Getting Started Docs](https://nickleodoen.github.io/ferrocache/getting-started/configuration).
 
 ---
 
@@ -284,7 +284,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content, resp._ferrocache_hit)
 ```
 
-→ [Full docs](#)
+→ [OpenAI Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/openai/)
 
 **Anthropic** — same pattern for the Anthropic SDK.
 
@@ -300,7 +300,7 @@ resp = client.messages.create(
 )
 ```
 
-→ [Full docs](#)
+→ [Anthropic Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/anthropic/)
 
 **LangChain** — register as the global LLM cache.
 
@@ -311,7 +311,7 @@ from ferrocache.langchain import FerrocacheCache
 set_llm_cache(FerrocacheCache(cache_scope="tenant_abc"))
 ```
 
-→ [Full docs](#)
+→ [LangChain Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/langchain/)
 
 **LlamaIndex** — wrap any LlamaIndex-compatible LLM.
 
@@ -322,7 +322,7 @@ from ferrocache.llamaindex import FerrocacheLLM
 llm = FerrocacheLLM(inner=OpenAI(model="gpt-4o-mini"), cache_scope="tenant_abc")
 ```
 
-→ [Full docs](#)
+→ [LlamaIndex Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/llamaindex/)
 
 **MCP server** — exposes semantic caching as tools for Claude Desktop / Claude Code.
 
@@ -331,7 +331,7 @@ pip install -r clients/python/mcp_requirements.txt
 python3 -m ferrocache.mcp_server      # speaks JSON-RPC over stdio
 ```
 
-→ [Full docs](#)
+→ [MCP Server Docs](https://nickleodoen.github.io/ferrocache/integrations/mcp/)
 
 ---
 
@@ -351,7 +351,7 @@ Good first issue: implement `AsyncFerrocacheClient` mirroring the sync client's 
 The current benchmarks run on synthetic FAQ workloads. Real-world hit rate data on production query distributions (MS MARCO, customer support logs, coding assistant queries) would help users calibrate their threshold and make the project more credible to evaluators.
 Good first issue: publish a benchmark notebook using the MS MARCO dataset.
 
-→ See [CONTRIBUTING.md](#) for setup instructions, code style, and the PR process.
+→ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, code style, and the PR process.
 → Open issues are labeled [`good first issue`](https://github.com/nickleodoen/ferrocache/issues).
 
 ---
