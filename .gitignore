@@ -3,3 +3,9 @@
 ferrocache.wal
 __pycache__/
 *.pyc
+
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+.DS_Store
