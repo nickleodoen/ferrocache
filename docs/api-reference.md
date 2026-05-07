@@ -114,7 +114,7 @@ Delete a specific entry. In cluster mode, fans out to every live peer; 404 from 
 
 ```bash
 curl -X DELETE http://localhost:3000/entry/3a7b...
-# {"status": "deleted"}
+# {"deleted": true}
 ```
 
 ## `POST /admin/invalidate`
@@ -136,7 +136,7 @@ curl -X POST http://localhost:3000/admin/invalidate \
     "threshold": 0.95,
     "model_id": "all-MiniLM-L6-v2::384"
   }'
-# {"deleted_count": 3}
+# {"invalidated_count": 3, "uuids": ["...", "...", "..."]}
 ```
 
 ## `POST /admin/compact`

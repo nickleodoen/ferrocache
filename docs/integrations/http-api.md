@@ -113,7 +113,7 @@ Delete a specific entry. In cluster mode the request fans out to every live peer
 **Response (200):**
 
 ```json
-{ "status": "deleted" }
+{ "deleted": true }
 ```
 
 ## `POST /admin/invalidate`
@@ -136,7 +136,7 @@ Each replica computes its own match set against the same `(embedding, threshold)
 **Response (200):**
 
 ```json
-{ "deleted_count": 3 }
+{ "invalidated_count": 3, "uuids": ["...", "...", "..."] }
 ```
 
 ## `GET /health`

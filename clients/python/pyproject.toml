@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ferrocache"
-version = "0.2.0"
+version = "1.0.0"
 description = "Python client, SDK middleware, and framework integrations for ferrocache — a distributed semantic cache for LLM applications"
 readme = "README.md"
 license = { text = "MIT" }
