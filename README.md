@@ -249,7 +249,7 @@ All keys default to single-node mode. Override via `ferrocache.toml` in the work
 | `wal_batch_size` | usize | `256` | `FERROCACHE_WAL_BATCH_SIZE` |
 | `wal_batch_timeout_ms` | u64 | `1` | `FERROCACHE_WAL_BATCH_TIMEOUT_MS` |
 
-Full reference at [nickleodoen.github.io/ferrocache/getting-started/configuration](https://nickleodoen.github.io/ferrocache/getting-started/configuration).
+Full reference at [Getting Started Docs](https://nickleodoen.github.io/ferrocache/getting-started/configuration).
 
 ---
 
@@ -284,7 +284,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content, resp._ferrocache_hit)
 ```
 
-→ [Full docs](https://nickleodoen.github.io/ferrocache)
+→ [OpenAI Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/openai/)
 
 **Anthropic** — same pattern for the Anthropic SDK.
 
@@ -300,7 +300,7 @@ resp = client.messages.create(
 )
 ```
 
-→ [Full docs](https://nickleodoen.github.io/ferrocache)
+→ [Anthropic Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/anthropic/)
 
 **LangChain** — register as the global LLM cache.
 
@@ -311,7 +311,7 @@ from ferrocache.langchain import FerrocacheCache
 set_llm_cache(FerrocacheCache(cache_scope="tenant_abc"))
 ```
 
-→ [Full docs](https://nickleodoen.github.io/ferrocache)
+→ [LangChain Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/langchain/)
 
 **LlamaIndex** — wrap any LlamaIndex-compatible LLM.
 
@@ -322,7 +322,7 @@ from ferrocache.llamaindex import FerrocacheLLM
 llm = FerrocacheLLM(inner=OpenAI(model="gpt-4o-mini"), cache_scope="tenant_abc")
 ```
 
-→ [Full docs](https://nickleodoen.github.io/ferrocache)
+→ [LlamaIndex Integration Docs](https://nickleodoen.github.io/ferrocache/integrations/llamaindex/)
 
 **MCP server** — exposes semantic caching as tools for Claude Desktop / Claude Code.
 
@@ -331,7 +331,7 @@ pip install -r clients/python/mcp_requirements.txt
 python3 -m ferrocache.mcp_server      # speaks JSON-RPC over stdio
 ```
 
-→ [Full docs](https://nickleodoen.github.io/ferrocache)
+→ [MCP Server Docs](https://nickleodoen.github.io/ferrocache/integrations/mcp/)
 
 ---
 
