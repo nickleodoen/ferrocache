@@ -231,54 +231,43 @@ async fn process_query_locally(
     let conv_ns =
         conv_id.map(|cid| conversation_namespace(model_id, req.cache_scope.as_deref(), cid));
 
-    // First-level lookup: conversation namespace if present, else base.
-    let primary_ns: &str = conv_ns.as_deref().unwrap_or(&base);
-    let primary_result = {
-        let index = state.index.read().await;
-        index.query_with_text(
-            &req.embedding,
-            req.threshold,
-            primary_ns,
-            req.query_text.as_deref(),
-            now,
-        )
-    };
-
-    // Fallback (only when we had a conversation_id and the conversation
-    // namespace missed). Errors from the primary still propagate as 400.
+    // Acquire the index read lock exactly once — a single consistent snapshot
+    // covers both the conversation namespace check and the base fallback.
+    // The previous double-lock pattern released and re-acquired between the
+    // two lookups, opening a TOCTOU window where a concurrent WAL flush could
+    // insert into the conversation namespace and be missed, or where an
+    // expiry/eviction between the two acquisitions could yield an inconsistent
+    // result. query_two_level runs both lookups under the same &self borrow,
+    // eliminating the window and halving the lock-acquire count on the hot path.
     let (final_result, hit_ns_owned, hit_scope): (
         Result<Option<crate::index::QueryHit>, anyhow::Error>,
         String,
         Option<&'static str>,
-    ) = match primary_result {
-        Ok(Some(hit)) => {
-            let scope = if conv_ns.is_some() {
-                Some("conversation")
-            } else {
-                None
-            };
-            (Ok(Some(hit)), primary_ns.to_string(), scope)
+    ) = if let Some(ref cns) = conv_ns {
+        let index = state.index.read().await;
+        match index.query_two_level(
+            &req.embedding,
+            req.threshold,
+            cns,
+            &base,
+            req.query_text.as_deref(),
+            now,
+        ) {
+            Ok((hit, ns, scope)) => (Ok(hit), ns, scope),
+            Err(e) => (Err(e), base.clone(), None),
         }
-        Ok(None) if conv_ns.is_some() => {
-            // Two-level fallback: try the base namespace.
-            let fallback = {
-                let index = state.index.read().await;
-                index.query_with_text(
-                    &req.embedding,
-                    req.threshold,
-                    &base,
-                    req.query_text.as_deref(),
-                    now,
-                )
-            };
-            match fallback {
-                Ok(Some(hit)) => (Ok(Some(hit)), base.clone(), Some("global")),
-                Ok(None) => (Ok(None), base.clone(), None),
-                Err(e) => (Err(e), base.clone(), None),
-            }
+    } else {
+        let index = state.index.read().await;
+        match index.query_with_text(
+            &req.embedding,
+            req.threshold,
+            &base,
+            req.query_text.as_deref(),
+            now,
+        ) {
+            Ok(hit) => (Ok(hit), base.clone(), None),
+            Err(e) => (Err(e), base.clone(), None),
         }
-        Ok(None) => (Ok(None), primary_ns.to_string(), None),
-        Err(e) => (Err(e), primary_ns.to_string(), None),
     };
 
     let elapsed = start.elapsed().as_secs_f64();
