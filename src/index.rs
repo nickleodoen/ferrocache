@@ -2348,10 +2348,20 @@ mod tests {
         let mut idx = test_index();
         let base = base_namespace("m::3", None);
         let conv = conversation_namespace("m::3", None, "s1");
-        idx.insert(vec![1.0_f32, 0.0, 0.0], "from-base".into(), "q".into(), &base)
-            .unwrap();
-        idx.insert(vec![0.8_f32, 0.6, 0.0], "from-conv".into(), "q2".into(), &conv)
-            .unwrap();
+        idx.insert(
+            vec![1.0_f32, 0.0, 0.0],
+            "from-base".into(),
+            "q".into(),
+            &base,
+        )
+        .unwrap();
+        idx.insert(
+            vec![0.8_f32, 0.6, 0.0],
+            "from-conv".into(),
+            "q2".into(),
+            &conv,
+        )
+        .unwrap();
         let now = now_unix_secs();
         let (hit, _, scope) = idx
             .query_two_level(&[1.0_f32, 0.0, 0.0], 0.5, &conv, &base, None, now)
@@ -2405,8 +2415,7 @@ mod tests {
             .unwrap();
         let now = now_unix_secs();
         // Query with a 4-d vector — dimension mismatch inside conv namespace.
-        let result =
-            idx.query_two_level(&[1.0_f32, 0.0, 0.0, 0.0], 0.9, &conv, &base, None, now);
+        let result = idx.query_two_level(&[1.0_f32, 0.0, 0.0, 0.0], 0.9, &conv, &base, None, now);
         assert!(
             result.is_err(),
             "dimension mismatch must propagate as Err, not fall through to base"
