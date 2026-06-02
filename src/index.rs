@@ -899,10 +899,10 @@ impl SemanticIndex {
         now: u64,
     ) -> Result<(Option<QueryHit>, String, Option<&'static str>)> {
         // Conversation namespace has priority.
-        if let Some(ns) = self.namespaces.get(conv_ns) {
-            if let Some(hit) = ns.query_with_text(embedding, threshold, query_text, now)? {
-                return Ok((Some(hit), conv_ns.to_string(), Some("conversation")));
-            }
+        if let Some(ns) = self.namespaces.get(conv_ns)
+            && let Some(hit) = ns.query_with_text(embedding, threshold, query_text, now)?
+        {
+            return Ok((Some(hit), conv_ns.to_string(), Some("conversation")));
         }
         // Fallback: base namespace.
         match self.namespaces.get(base_ns) {
